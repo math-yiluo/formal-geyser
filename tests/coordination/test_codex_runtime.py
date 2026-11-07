@@ -156,8 +156,7 @@ def test_tool_schemas_resolve_nested_model_definitions():
     assert all(tool["type"] == "function" for tool in tools.values())
     Draft202012Validator(tools["taskhub_pause"]["inputSchema"]).validate({
         "reason": "Wait for the exact source input.",
-        "predicate": {"mode": "all", "requirements": [{
-            "key": "x", "task_id": "t", "task_revision": 1, "policy": "general.json@1"}]},
+        "predicate": {"mode": "all", "subscriptions": [{"task_id": "t", "need": "the exact source input"}]},
         "checkpoint": {"summary": "Waiting for input", "next_action": "Use the result"},
     })
 
@@ -485,9 +484,8 @@ async def test_wait_helper_validation_and_original_thread_resume(tmp_path):
                     },
                 })}, uuid4().hex)
                 result = await on_tool("taskhub_call", {"operation": 'pause', "arguments": file_arguments(self.workspaces[-1], 'pause', {"reason": "Preserve progress until actionable work is available.", **({
-                    "predicate": {"mode": "all", "requirements": [{
-                        "key": "source", "task_id": helper_task["id"],
-                        "task_revision": helper_task["revision"], "policy": "general.json@1",
+                    "predicate": {"subscriptions": [{
+                        "task_id": helper_task["id"], "need": "The extracted JSON source record.",
                     }]},
                     "checkpoint": {"summary": "Prepared record assembly",
                                    "next_action": "Read the source artifact and finish assembly"},
@@ -576,7 +574,9 @@ async def test_wait_helper_validation_and_original_thread_resume(tmp_path):
         assert (await hub.task(helper_task["id"]))["state"] != "done"
         await publish_and_finish(helper_task, second)
         assert (await hub.task(helper_task["id"]))["state"] == "done"
-        assert any(c["state"] == "eligible" for c in await hub.list_continuations())
+        # The helper is done and publishes nothing more: the subscription to it ends.
+        assert any((c["state"], c["wake_reason"]) == ("reconsider", "subscribed_task_done")
+                   for c in await hub.list_continuations())
         third = await runner.run_once(run["id"])
         assert third["directive"] == "verify"
         assert (await hub.task(parent["id"]))["state"] != "done"
@@ -706,7 +706,7 @@ async def test_driver_runs_two_independent_tasks_concurrently(tmp_path):
                 await asyncio.wait_for(both_running.wait(), 2)
                 await on_usage({"totalTokens": 5})
                 result = await on_tool(
-                    "taskhub_call", {"operation": 'pause', "arguments": file_arguments(self.workspaces[-1], 'pause', {"reason": "Preserve progress until actionable work is available.", **({"reason": "The concurrent activation check finished.",
+                    "taskhub_call", {"operation": 'pause', "arguments": file_arguments(self.workspaces[-1], 'pause', {"predicate": {"external_response_id": "unanswered-request"}, "reason": "Preserve progress until actionable work is available.", **({"reason": "The concurrent activation check finished.",
                         "checkpoint": {"summary": "Both independent tasks ran concurrently.",
                                        "next_action": "Await further work."}})})}, uuid4().hex)
                 await self.close()
@@ -839,7 +839,7 @@ async def test_compaction_refreshes_context_before_mutation_without_resetting_us
             await on_usage({"totalTokens": 10})
             await self.compacted()
             blocked = await on_tool(
-                "taskhub_call", {"operation": 'pause', "arguments": file_arguments(self.workspaces[-1], 'pause', {"reason": "Preserve progress until actionable work is available.", **({"reason": "Retain refreshed progress.",
+                "taskhub_call", {"operation": 'pause', "arguments": file_arguments(self.workspaces[-1], 'pause', {"predicate": {"external_response_id": "unanswered-request"}, "reason": "Preserve progress until actionable work is available.", **({"reason": "Retain refreshed progress.",
                     "checkpoint": {"summary": "Read refreshed context.",
                                    "next_action": "Await useful work."}})})}, uuid4().hex)
             assert isinstance(blocked, ToolResult)
@@ -1033,10 +1033,7 @@ async def test_oversized_tool_result_is_immutable_retrievable_and_keeps_routing(
             offset = page["next_offset"]
         assert json.loads("".join(pieces)) == expected
         waiting = await runner._tool(attempt, "thread", "taskhub_call", {"operation": 'pause', "arguments": file_arguments(runner.hub.workspace(attempt["worker_id"]), 'pause', {"reason": "Preserve progress until actionable work is available.", **({
-            "predicate": {"mode": "all", "requirements": [{
-                "key": "source", "task_id": provider["id"], "task_revision": 1,
-                "policy": "general.manual@1",
-            }]},
+            "predicate": {"subscriptions": [{"task_id": provider["id"], "need": "The source record."}]},
             "checkpoint": {"summary": "Material read completely", "next_action": "Await source"},
         })})}, "wait")
         large_wait_report = {**waiting, "report": report}
@@ -1512,9 +1509,10 @@ async def test_pause_after_tool_commit_preserves_durable_coordination(tmp_path, 
     checkpoint = {"summary": "Saved progress.", "next_action": "Continue from the saved result.", "input_refs": []}
     payloads = {
         "submit": {"kind": "software.result", "data": {"saved": True}},
-        "wait": {"checkpoint": checkpoint, "predicate": {"mode": "all", "requirements": [{
-            "key": "input", "task_id": provider["id"], "task_revision": 1, "policy": "general.manual@1"}]}},
-        "pause": {"checkpoint": checkpoint, "reason": "Preserve committed progress until useful work resumes."},
+        "wait": {"checkpoint": checkpoint, "predicate": {"subscriptions": [{
+            "task_id": provider["id"], "need": "The later software input."}]}},
+        "pause": {"checkpoint": checkpoint, "reason": "Preserve committed progress until useful work resumes.",
+                  "predicate": {"external_response_id": "unanswered-request"}},
     }
 
     async def delayed_tool(attempt, thread_id, name, args, call_id):

@@ -24,6 +24,8 @@ from tests.coordination.lifecycle_helpers import (
 )
 from tests.coordination.publication_helpers import approve, file_payload, new_hub
 
+from .wait_helpers import legacy_wait
+
 OP = Actor(role=Role.OPERATOR)
 RUNNER = Actor(role=Role.RUNNER)
 
@@ -119,7 +121,7 @@ async def test_no_and_pause_before_choice_never_reopen(case):
     await recruitment(hub, first, False)
     continued = await hub.next_assignment(run["id"])
     assert continued["worker_id"] == first["worker_id"]
-    await command(hub, "task.pause", {"reason": "No useful immediate work"}, actor(continued))
+    await legacy_wait(hub, {"reason": "No useful immediate work"}, actor(continued))
     await quiet(hub, continued)
     lifecycle = (await hub.task(task["id"]))["collaboration"]["recruitment"]
     assert lifecycle["recruitment_decision"] == "no"
@@ -132,7 +134,7 @@ async def test_no_and_pause_before_choice_never_reopen(case):
 async def test_pause_cancels_pending_first_choice(case):
     hub, task, run, _ = case
     first = await hub.next_assignment(run["id"])
-    await command(hub, "task.pause", {"reason": "Waiting for a new approach"}, actor(first))
+    await legacy_wait(hub, {"reason": "Waiting for a new approach"}, actor(first))
     await quiet(hub, first)
     assert await hub.record_first_turn(first["worker_id"], task["id"]) is None
     assert (await hub.task(task["id"]))["collaboration"]["recruitment"]["recruitment_decision"] == "cancelled"
@@ -142,7 +144,7 @@ async def test_pause_cancels_pending_first_choice(case):
 async def test_paused_worker_takes_no_new_task_and_an_empty_pool_needs_no_decision(case):
     hub, _, run, clock = case
     first = await hub.next_assignment(run["id"])
-    await command(hub, "task.pause", {"reason": "No useful progress"}, actor(first))
+    await legacy_wait(hub, {"reason": "No useful progress"}, actor(first))
     await quiet(hub, first)
     other = await publish(hub, "Independent task")
     # A worker that paused mid-task is waiting, not idle: a new worker takes the task
@@ -264,7 +266,7 @@ async def test_shared_maintenance_cas_preserves_original_objective(case):
 async def test_message_wake_preserves_wait_and_explicit_resume(case):
     hub, _, run, _ = case
     author = await hub.next_assignment(run["id"])
-    await command(hub, "task.pause", {"reason": "Blocked"}, actor(author))
+    await legacy_wait(hub, {"reason": "Blocked"}, actor(author))
     await quiet(hub, author)
     await hub.db.call(lambda c: hub._wake_for_message(c, author["worker_id"], "message-1"), write=True)
     wake = await hub.next_assignment(run["id"])

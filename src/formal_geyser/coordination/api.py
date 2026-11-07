@@ -405,6 +405,10 @@ def create_app(
     async def task_outline():
         return await app.state.hub.task_outline()
 
+    @app.get("/v1/task-graph", dependencies=[Depends(operator)])
+    async def task_graph(include_met: bool = False):
+        return await app.state.hub.task_graph(include_met=include_met)
+
     async def catalog():
         loader = model_catalog_loader
         if loader is None:
@@ -577,8 +581,16 @@ def create_app(
         view: Literal["all", "running", "pool", "history"] = "all",
         query: str = Query(default="", max_length=1000),
         offset: int = Query(default=0, ge=0), limit: int = Query(default=25, ge=1, le=100),
+        kind: Literal["work", "review", "both"] = "both",
+        sort: Literal["newest", "oldest", "title"] = "newest",
+        until: int | None = Query(default=None, ge=0),
     ):
-        return await app.state.hub.task_page(view=view, query=query, offset=offset, limit=limit)
+        return await app.state.hub.task_page(view=view, query=query, offset=offset, limit=limit,
+                                             kind=kind, sort=sort, until=until)
+
+    @app.get("/v1/tasks/{task_id}/relations", dependencies=[Depends(operator)])
+    async def task_relations(task_id: str):
+        return await app.state.hub.task_relations(task_id)
 
     @app.get("/v1/tasks/{task_id}/revisions", dependencies=[Depends(operator)])
     async def task_revisions(

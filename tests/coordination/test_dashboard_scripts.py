@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 
-@pytest.mark.parametrize("script", ["dashboard_refresh", "dashboard_setup", "dashboard_tasks", "dashboard_status", "dashboard_stream"])
+@pytest.mark.parametrize("script", ["dashboard_refresh", "dashboard_setup", "dashboard_tasks", "dashboard_status",
+                                    "dashboard_stream", "dashboard_task_center"])
 def test_dashboard_script(script):
     executable = shutil.which("node")
     if executable is None:

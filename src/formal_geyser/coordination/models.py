@@ -35,13 +35,16 @@ AUDITED_CODEX_VERSION = "0.160.0"
 
 
 class RoleEfforts(StrictModel):
-    """A reviewer's and the Integrator's effort where it differs from the backend's `effort`."""
+    """A reviewer's and the Integrator's effort as a project chose it before the [reviewers] and
+    [integrator] sections, which take precedence. Neither takes the workers' `effort` any more."""
     review_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
     integrator_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
 
-    def effort_for(self, kind: str) -> str:
-        role = {"review": self.review_effort, "integrator": self.integrator_effort}.get(kind)
-        return role or getattr(self, "effort")
+    def effort_for(self, kind: str) -> str | None:
+        """This section's effort for a role: a reviewer's or the Integrator's own, else the workers'."""
+        if kind in ("review", "integrator"):
+            return self.review_effort if kind == "review" else self.integrator_effort
+        return getattr(self, "effort")
 
 
 def profile_entries(value: list[str], label: str) -> list[str]:
@@ -58,8 +61,10 @@ class CodexConfig(RoleEfforts):
     home: str | None = Field(default=None, min_length=1)
     executable: str = "codex"
     version: str = AUDITED_CODEX_VERSION
+    # The workers' model and effort on Codex. No default: each is chosen when the project is
+    # initialized (or in Project setup), and a run starts only once every role has both.
     model: str | None = None
-    effort: str = "high"
+    effort: str | None = None
     stop_grace_seconds: float = Field(default=10.0, gt=0)
     max_frame_bytes: int = Field(default=67108864, ge=1024)
     # Accounts used one at a time, in order of preference (see codex_profiles): the first is
@@ -89,8 +94,9 @@ class ClaudeConfig(RoleEfforts):
     executable: str | None = Field(default=None, min_length=1)
     sdk_version: str = "0.2.163"
     cli_version: str = "2.1.286"
+    # The workers' model and effort on Claude; no default, as for Codex.
     model: str | None = None
-    effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
     # Hosts sandboxed commands may reach; "*" allows every non-local host.
     allowed_domains: list[str] = Field(default_factory=lambda: ["*"])
     stop_grace_seconds: float = Field(default=10.0, gt=0)
@@ -160,6 +166,19 @@ class LeanServiceConfig(StrictModel):
     aging_minutes: float = Field(default=20, gt=0, allow_inf_nan=False)
     # Blocking validations that may run at once ahead of interactive checks.
     validation_slots: int = Field(default=4, ge=0, le=64)
+    # The most threads a validation starts with. Its build restores the Library from Lake's cache
+    # and compiles the few modules a candidate changes: in the Linux pilot, of 5,236 validations
+    # in three days, the median used 0.43 cores, the 99th percentile 0.93, the most 7.3, yet each
+    # was given threads for all 18,000 modules, so one or two held the machine at a time.
+    validation_threads: int = Field(default=4, ge=1, le=1024)
+    # The most Lake builds at once, of every lane. Each holds a build slot with a full copy of the
+    # Library's build: in the Linux pilot 9.6 GB a slot, and 13 builds at once filled the disk.
+    # A build past it waits, first come first served, for a slot to free; 0: no limit.
+    build_slots: int = Field(default=8, ge=0, le=1024)
+    # Worker processes for each check's reading, syncing and hashing of the Library sources and
+    # build outputs; 0 runs that work in the service's own threads, which share one interpreter:
+    # in the Linux pilot it held the service at one core while the machine was 80% idle.
+    bookkeeping_processes: int = Field(default=8, ge=0, le=64)
     sandbox: Literal["codex", "none"] = "codex"
     warm_gib: float = Field(default=6, ge=0, allow_inf_nan=False)  # Library .olean pages kept resident.
     sessions: int = Field(default=6, ge=0, le=64)  # Resident development-check sessions; 0 turns them off.
@@ -186,10 +205,17 @@ Effort = Literal["low", "medium", "high", "xhigh", "max"]
 
 
 class DecisionConfig(StrictModel):
-    """The cheap model that decides task assignment and recruitment, each decision in a new,
-    small conversation without tools. The operator's recorded choice overrides it."""
-    model: str = Field(default="gpt-6.1-sol", min_length=1, max_length=200)
-    effort: Effort = "high"
+    """The Dispatcher's model, which decides task assignment and recruitment, each decision in a
+    new, small conversation without tools. No default; the operator's recorded choice overrides it."""
+    model: str | None = Field(default=None, min_length=1, max_length=200)
+    effort: Effort | None = None
+
+
+class RoleModelConfig(StrictModel):
+    """The model and effort of a Codex role's new conversations: the reviewers', the Integrator's.
+    No default; the operator's recorded choice overrides it."""
+    model: str | None = Field(default=None, min_length=1, max_length=200)
+    effort: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 RotationMode = Literal["conservative", "aggressive"]
@@ -244,6 +270,20 @@ class ConcurrencyConfig(StrictModel):
     launch_ramp_minutes: float = Field(default=10, ge=0, le=24 * 60, allow_inf_nan=False)
 
 
+class WaitConfig(StrictModel):
+    """How long a wait for a person's answer (a worker's or the operator's) lasts before its worker
+    reconsiders. No default; the operator's recorded choice overrides it."""
+    answer_deadline_minutes: int | None = Field(default=None, ge=1, le=30 * 24 * 60)
+
+
+class WakerConfig(StrictModel):
+    """The model and effort of the waker (waker.py), which judges whether a subscribed task's newly
+    published results meet a waiting worker's need. Chosen when the project is initialized; the
+    operator's recorded choice overrides it. While neither chose one, wake decisions wait."""
+    model: str | None = Field(default=None, min_length=1, max_length=200)
+    effort: Effort | None = None
+
+
 class ProjectConfig(StrictModel):
     schema_version: Literal[1] = 1
     name: str = "FormalGeyser"
@@ -263,6 +303,10 @@ class ProjectConfig(StrictModel):
     lean_service: LeanServiceConfig = Field(default_factory=LeanServiceConfig)
     decisions: DecisionConfig = Field(default_factory=DecisionConfig)
     rotation: RotationConfig = Field(default_factory=RotationConfig)
+    waits: WaitConfig = Field(default_factory=WaitConfig)
+    waker: WakerConfig = Field(default_factory=WakerConfig)
+    reviewers: RoleModelConfig = Field(default_factory=RoleModelConfig)
+    integrator: RoleModelConfig = Field(default_factory=RoleModelConfig)
 
     @model_validator(mode="after")
     def sync_repository(self):
@@ -284,12 +328,30 @@ class ProjectConfig(StrictModel):
         return self.backend_config(backend).model_dump(mode="json")
 
 
+def _ignored_policy(schema: dict[str, Any]) -> None:
+    # A call that still names the former field validates; the field is dropped before use.
+    schema.setdefault("properties", {})["policy"] = {
+        "type": "string", "description": "Ignored: a requirement no longer names a policy."}
+
+
 class Requirement(StrictModel):
+    """A dependency on an artifact or on a task revision. It holds once the artifact's newest version
+    (or, for a task, an output of the completed task) is accepted, whatever kind it is: the kind is
+    the provider's own (lean.definition, lean.statement, lean.proof), never chosen by the one who
+    waits. Until 2026-11-07 a requirement named a policy too, and a wrong one never held."""
+    model_config = ConfigDict(extra="forbid", strict=True, json_schema_extra=_ignored_policy)
     key: str = Field(min_length=1, max_length=128)
     task_id: str | None = None
     task_revision: int | None = Field(default=None, ge=1)
     artifact_id: str | None = None
-    policy: str = Field(min_length=1, max_length=128)
+
+    @model_validator(mode="before")
+    @classmethod
+    def legacy_policy(cls, value):
+        # Stored contracts and predicates, and habits, still carry the former field.
+        if isinstance(value, dict) and "policy" in value:
+            value = {key: item for key, item in value.items() if key != "policy"}
+        return value
 
     @model_validator(mode="after")
     def one_provider(self):
@@ -329,13 +391,34 @@ class TaskContract(StrictModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class Subscription(StrictModel):
+    """A wait on another existing task: the waker, after each integration that publishes Lean from
+    it, judges whether what the task published meets `need`, and then ends the wait."""
+    task_id: str = Field(min_length=1, max_length=64)
+    need: str = Field(min_length=1, max_length=2000)  # The results awaited, in words.
+
+
 class Predicate(StrictModel):
+    """What ends a pause. A task subscription (W1) is judged by the waker and ends the wait whatever
+    `mode` says; the own-submission results (W2: validations, completion_declaration_id) and a
+    person's answer (W3: answers from workers, external_response_id from the operator) combine by
+    `mode`. A wait for an answer also ends at the project's answer deadline. Since 2026-11-07 a
+    pause takes no `requirements`: stored waits keep theirs."""
     mode: Literal["all", "any"] = "all"
-    requirements: list[Requirement] = Field(default_factory=list, max_length=128)
+    subscriptions: list[Subscription] = Field(default_factory=list, max_length=20)
     # Staged candidates whose machine validation result, whatever its verdict, is awaited.
     validations: list[str] = Field(default_factory=list, max_length=20)
+    # Questions this worker sent with talk_send (their message ids), each awaiting its answer.
+    answers: list[str] = Field(default_factory=list, max_length=20)
     external_response_id: str | None = Field(default=None, min_length=1)
     completion_declaration_id: str | None = Field(default=None, min_length=1)
+
+    def has_condition(self) -> bool:
+        return bool(self.subscriptions or self.validations or self.answers or self.external_response_id
+                    or self.completion_declaration_id)
+
+    def awaits_answer(self) -> bool:
+        return bool(self.answers or self.external_response_id)
 
 
 class Checkpoint(StrictModel):

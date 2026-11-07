@@ -74,6 +74,14 @@ CREATE TABLE IF NOT EXISTS continuations(
 CREATE INDEX IF NOT EXISTS continuation_state_idx ON continuations(state);
 -- A worker's open continuations, which admission asks about for each idle worker on every pass.
 CREATE INDEX IF NOT EXISTS continuation_worker_idx ON continuations(preferred_worker,state);
+-- When a wait for a person's answer ends unanswered (waits.answer_deadline_minutes).
+CREATE TABLE IF NOT EXISTS wait_deadlines(
+ continuation_id TEXT PRIMARY KEY REFERENCES continuations(id),due_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS wait_deadline_due_idx ON wait_deadlines(due_at);
+-- The operator's choice of waits.answer_deadline_minutes, which overrides project.toml.
+CREATE TABLE IF NOT EXISTS answer_deadline_preferences(
+ id INTEGER PRIMARY KEY CHECK(id=1),minutes INTEGER NOT NULL CHECK(minutes BETWEEN 1 AND 43200),
+ updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS interruption_checkpoints(
  id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),task_revision INTEGER NOT NULL,
  worker_id TEXT NOT NULL REFERENCES workers(id),origin_attempt TEXT NOT NULL UNIQUE REFERENCES attempts(id),
@@ -157,6 +165,14 @@ CREATE TABLE IF NOT EXISTS task_members(
 CREATE TABLE IF NOT EXISTS task_publishers(
  task_id TEXT NOT NULL REFERENCES tasks(id),worker_id TEXT NOT NULL REFERENCES workers(id),
  created_at INTEGER NOT NULL,PRIMARY KEY(task_id,worker_id));
+-- Where a published task came from: the task whose attempt published it (NULL: the operator or
+-- the system published it). Display only; it grants no authority over the task.
+CREATE TABLE IF NOT EXISTS task_origins(
+ task_id TEXT PRIMARY KEY REFERENCES tasks(id),source_task_id TEXT REFERENCES tasks(id),
+ worker_id TEXT,attempt_id TEXT,recorded_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS task_origin_source ON task_origins(source_task_id);
+-- One-time fills of records added after a project began, each run once at startup.
+CREATE TABLE IF NOT EXISTS ledger_backfills(name TEXT PRIMARY KEY,completed_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS task_subscriptions(
  task_id TEXT NOT NULL REFERENCES tasks(id),worker_id TEXT NOT NULL REFERENCES workers(id),
  task_revision INTEGER,reason TEXT NOT NULL,created_at INTEGER NOT NULL,

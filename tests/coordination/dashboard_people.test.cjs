@@ -61,8 +61,11 @@ const backendStatus = () => ({new_worker_backend: 'codex', new_worker_source: 'p
   next_worker: {number: 9, backend: 'codex'},
   role_models: {worker: {codex: {model: 'gpt-6-astra', effort: 'xhigh', source: 'config'},
     claude: {model: 'claude-opus-5-5', effort: 'xhigh', source: 'config'}},
-  review: {codex: {model: 'gpt-6-astra', effort: 'max', source: 'config'}}},
+  review: {codex: {model: 'gpt-6-astra', effort: 'max', source: 'config'}},
+  integrator: {codex: {model: 'gpt-6-astra', effort: 'max', source: 'config'}}},
   decision_model: {model: 'gpt-6.1-sol', effort: 'high', source: 'config'},
+  waker_model: {model: 'gpt-6.1-sol', effort: 'low', source: 'config'},
+  answer_deadline: {minutes: 60, source: 'config'}, missing_choices: [],
   sessions: {codex: {live: 3, limit: 60, source: 'config'}, claude: {live: 0, limit: 12, source: 'config'}},
   rotation: {mode: 'aggressive', idle_by_backend: {codex: {minutes: 40, source: 'config'}, claude: {minutes: 40, source: 'config'}}}});
 const catalog = () => ({models: [
@@ -70,7 +73,7 @@ const catalog = () => ({models: [
   {id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', efforts: [{id: 'low'}, {id: 'high'}], default_effort: 'high'}],
 authentication_required: false});
 
-function harness(workers) {
+function harness(workers, {setup = false} = {}) {
   const elements = new Map();
   for (const [, tag, attributes, id] of markup.matchAll(/<([a-z]+)([^>]*\bid="([^"]+)"[^>]*)>/g)) {
     const element = new Element(tag);
@@ -79,7 +82,7 @@ function harness(workers) {
   }
   const el = id => { assert.ok(elements.has(id), 'Missing markup element: ' + id); return elements.get(id); };
   const state = {overview: {name: 'Synthetic project', task_count: 0, tasks: [], workers, requests: [],
-    runs: [{id: 'run', state: 'running'}], drivers: {}, delivery_holds: []}, backend: backendStatus()};
+    runs: setup ? [] : [{id: 'run', state: 'running'}], drivers: {}, delivery_holds: []}, backend: backendStatus(), starts: []};
   const commands = []; let refresh;
   const context = vm.createContext({document: {getElementById: el,
     createElement: tag => new Element(tag), querySelectorAll: () => [], body: new Element('body'),
@@ -89,7 +92,10 @@ function harness(workers) {
     setInterval(callback) { refresh = callback; }, setTimeout, clearTimeout, location: {reload() {}}, confirm: () => true,
     async fetch(url, options) {
       let result;
-      if (options.method === 'POST') {
+      if (options.method === 'POST' && url === '/v1/setup/start') {
+        state.starts.push(JSON.parse(options.body));
+        result = {task_id: 't0', run_id: 'run', replayed: false, armed: true, driving: true};
+      } else if (options.method === 'POST') {
         assert.equal(url, '/v1/commands');
         const body = JSON.parse(options.body);
         commands.push([body.name, body.payload]);
@@ -101,6 +107,9 @@ function harness(workers) {
       else if (url === '/v1/retired-workers') { state.retiredReads = (state.retiredReads || 0) + 1; result = state.retired; }
       else if (state.details?.[url]) result = state.details[url];
       else if (url === '/v1/setup/models') result = catalog();
+      else if (url === '/v1/setup' && setup) result = {project_id: 'p', can_configure: true, reason: null, task: null,
+        settings: {model: 'gpt-6-astra', effort: 'xhigh'}, repository: {enabled: true, initialized: false}, run: null,
+        can_drive: false, receipt: null};
       else if (url === '/v1/setup') result = {project_id: 'p', can_configure: false, reason: 'This project already has a run.',
         task: {id: 't0', objective: 'Goal', revision: 1}, settings: {model: 'gpt-6-astra', effort: 'xhigh'},
         repository: {enabled: true, initialized: true}, run: {id: 'run', state: 'running'}, can_drive: false, receipt: null};
@@ -134,17 +143,28 @@ test('saving sends only what changed and refuses an invalid session limit', () =
   draft.nextBackend = 'claude';
   draft.models.worker_claude = {model: ' claude-sonnet-5-5 ', effort: 'high'};
   draft.models.review_codex.effort = 'xhigh';
+  draft.models.integrator_codex.model = 'gpt-6.1-sol';
   draft.dispatcher = {model: 'gpt-6-astra', effort: 'high'};
+  draft.waker = {model: 'gpt-6-astra', effort: 'high'};
+  draft.deadline = ' 45 ';
   draft.sessions = {codex: '40', claude: '12'};
   draft.idle = {codex: '0', claude: '40'};
   assert.deepEqual(agentSettingCommands(status, draft), [
     ['runtime.select_backend', {backend: 'claude'}],
     ['runtime.set_role_model', {role: 'worker', backend: 'claude', model: 'claude-sonnet-5-5', effort: 'high', apply_to_existing: false}],
     ['runtime.set_role_model', {role: 'review', backend: 'codex', model: 'gpt-6-astra', effort: 'xhigh', apply_to_existing: false}],
+    ['runtime.set_role_model', {role: 'integrator', backend: 'codex', model: 'gpt-6.1-sol', effort: 'max', apply_to_existing: false}],
     ['runtime.set_decision_model', {model: 'gpt-6-astra', effort: 'high'}],
+    ['runtime.set_waker_model', {model: 'gpt-6-astra', effort: 'high'}],
+    ['runtime.set_answer_deadline', {minutes: 45}],
     ['runtime.set_concurrency', {backend: 'codex', sessions: 40}],
     ['runtime.set_rotation_idle', {backend: 'codex', minutes: 0}]]);
-  // An emptied Claude model returns to Claude Code's default; no limit is -1, and 0 starts no worker.
+  // The Waker needs both choices, and the deadline whole minutes.
+  assert.throws(() => agentSettingCommands(status, {...agentDraft(status), waker: {model: 'gpt-6-astra', effort: ''}}), /Waker/);
+  for (const deadline of ['', '0', '1.5', '43201']) {
+    assert.throws(() => agentSettingCommands(status, {...agentDraft(status), deadline}), /answer deadline/);
+  }
+  // An emptied Claude model leaves the choice to project.toml; no limit is -1, and 0 starts no worker.
   const cleared = agentDraft(status);
   cleared.models.worker_claude.model = '';
   cleared.sessions = {codex: '0', claude: '-1'};
@@ -267,6 +287,54 @@ test('project settings save choices for new conversations and session limits', a
   await app.el('agent-settings-save').onclick(); await settle();
   assert.match(app.el('agent-settings-error').textContent, /whole number/);
   assert.equal(app.commands.length, 4);
+});
+
+test('before the first run, setup chooses every role in Agents and sessions and Start saves them', async () => {
+  const app = harness([], {setup: true});
+  app.state.backend.missing_choices = ['The Waker: model', 'The answer deadline'];
+  await app.load();
+  app.el('show-setup').onclick(); for (let i = 0; i < 6; i += 1) await settle();
+  assert.equal(app.el('agent-settings').classList.contains('hidden'), false);
+  assert.equal(app.el('agent-settings-setup').classList.contains('hidden'), false);
+  assert.equal(app.el('agent-worker-codex-existing-row').classList.contains('hidden'), true);
+  assert.equal(app.el('agent-settings-missing').textContent,
+    'Still to choose before a run starts: The Waker: model; The answer deadline.');
+  // Worker · Codex is the project's own model and effort; every other role has its own choice.
+  assert.equal(app.el('agent-worker-codex-model').value, 'gpt-6-astra');
+  assert.equal(app.el('agent-worker-codex-effort').value, 'xhigh');
+  assert.equal(app.el('agent-review-codex-model').value, 'gpt-6-astra');
+  assert.equal(app.el('agent-review-codex-effort').value, 'max');
+  app.el('agent-worker-codex-model').value = 'gpt-6.1-sol'; app.el('agent-worker-codex-model').onchange();
+  assert.equal(app.el('agent-worker-codex-effort').value, 'high');  // The model's default effort.
+  assert.equal(app.el('agent-review-codex-model').value, 'gpt-6-astra');  // Reviewers do not follow it.
+  app.el('agent-review-codex-effort').value = 'high'; app.el('agent-review-codex-effort').onchange();
+  app.el('agent-integrator-codex-model').value = 'gpt-6.1-sol'; app.el('agent-integrator-codex-model').onchange();
+  assert.equal(app.el('agent-integrator-codex-effort').value, 'high');
+  app.el('agent-waker-effort').value = 'high'; app.el('agent-waker-effort').onchange();
+  app.el('agent-answer-deadline').value = '45'; app.el('agent-answer-deadline').oninput();
+  app.el('agent-sessions-claude').value = '7'; app.el('agent-sessions-claude').oninput();
+  assert.deepEqual(app.commands, []);  // Nothing is sent before Start.
+  app.el('setup-goal').value = 'Prove it.'; app.el('setup-goal').oninput();
+  app.el('setup-form').onsubmit({preventDefault() {}}); for (let i = 0; i < 8; i += 1) await settle();
+  assert.deepEqual(app.commands, [
+    ['runtime.set_role_model', {role: 'review', backend: 'codex', model: 'gpt-6-astra', effort: 'high', apply_to_existing: false}],
+    ['runtime.set_role_model', {role: 'integrator', backend: 'codex', model: 'gpt-6.1-sol', effort: 'high', apply_to_existing: false}],
+    ['runtime.set_waker_model', {model: 'gpt-6.1-sol', effort: 'high'}],
+    ['runtime.set_answer_deadline', {minutes: 45}],
+    ['runtime.set_concurrency', {backend: 'claude', sessions: 7}]]);
+  assert.equal(app.state.starts.length, 1);
+  assert.deepEqual([app.state.starts[0].goal, app.state.starts[0].model, app.state.starts[0].effort], ['Prove it.', 'gpt-6.1-sol', 'high']);
+});
+
+test('a setup save that fails starts nothing', async () => {
+  const app = harness([], {setup: true});
+  await app.load();
+  app.el('show-setup').onclick(); for (let i = 0; i < 6; i += 1) await settle();
+  app.el('agent-sessions-codex').value = 'many'; app.el('agent-sessions-codex').oninput();
+  app.el('setup-goal').value = 'Prove it.'; app.el('setup-goal').oninput();
+  app.el('setup-form').onsubmit({preventDefault() {}}); for (let i = 0; i < 6; i += 1) await settle();
+  assert.match(app.el('agent-settings-error').textContent, /whole number/);
+  assert.deepEqual(app.commands, []); assert.equal(app.state.starts.length, 0);
 });
 
 const HOUR = 3600000, NOW = Date.UTC(2026, 9, 25, 18, 0);

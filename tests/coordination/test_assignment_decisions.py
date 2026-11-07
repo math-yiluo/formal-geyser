@@ -16,6 +16,8 @@ from formal_geyser.coordination.runtime import (
 from formal_geyser.coordination.runtime import claude as claude_runtime
 from tests.coordination.publication_helpers import new_hub
 
+from .wait_helpers import legacy_wait
+
 OPERATOR, RUNNER = Actor(role=Role.OPERATOR), Actor(role=Role.RUNNER)
 
 
@@ -190,7 +192,7 @@ async def test_a_paused_worker_is_not_idle_and_one_decision_runs_at_a_time(hub):
     waiting = await command(hub, "worker.register")
     attempt = await command(hub, "task.claim", {"task_id": waiting_task["id"], "revision": 1,
                                                 "run_id": run["id"], "worker_id": waiting["id"]})
-    await command(hub, "task.pause", {"reason": "Waiting for an answer"}, Actor(
+    await legacy_wait(hub, {"reason": "Waiting for an answer"}, Actor(
         role=Role.WORKER, worker_id=waiting["id"], attempt_id=attempt["id"], fencing_token=attempt["fencing_token"]))
     await command(hub, "runtime.quiescent", {"worker_id": waiting["id"],
                   "snapshot": hub.blobs.snapshot(hub.workspace(waiting["id"]))}, RUNNER)

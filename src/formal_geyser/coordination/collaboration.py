@@ -21,9 +21,16 @@ def new_id():
 
 # A revision that changes only these keeps the task's candidates and their reviews.
 CONTEXT_FIELDS = frozenset({"title", "context", "priority"})
+# A requirement's substance in SQL: a stored one may carry the former `policy`, which asks nothing.
+_REQUIREMENT_SQL = "json_remove({v},'$.policy')"
 # The same comparison in SQL, between two task_revisions rows {a} and {b}.
-SAME_SUBSTANCE_SQL = ("json_remove({a}.contract_json,'$.title','$.context','$.priority')="
-                      "json_remove({b}.contract_json,'$.title','$.context','$.priority')")
+SAME_SUBSTANCE_SQL = (
+    "json_remove({a}.contract_json,'$.title','$.context','$.priority','$.requirements')="
+    "json_remove({b}.contract_json,'$.title','$.context','$.priority','$.requirements') "
+    "AND (SELECT json_group_array(json(" + _REQUIREMENT_SQL.format(v="value") + ")) "
+    "FROM json_each({a}.contract_json,'$.requirements'))="
+    "(SELECT json_group_array(json(" + _REQUIREMENT_SQL.format(v="value") + ")) "
+    "FROM json_each({b}.contract_json,'$.requirements'))")
 # Whether revision {a} asks for at least what {b} asks: the same apart from those keys, with every
 # requirement of {b} and perhaps more. Its accepted evidence then meets a requirement naming {b}. In
 # the Linux pilot a revision only added a requirement, and a task whose original revision required
@@ -32,12 +39,23 @@ AT_LEAST_SUBSTANCE_SQL = (
     "json_remove({a}.contract_json,'$.title','$.context','$.priority','$.requirements')="
     "json_remove({b}.contract_json,'$.title','$.context','$.priority','$.requirements') "
     "AND NOT EXISTS(SELECT 1 FROM json_each({b}.contract_json,'$.requirements') asked "
-    "WHERE asked.value NOT IN (SELECT value FROM json_each({a}.contract_json,'$.requirements')))")
+    "WHERE " + _REQUIREMENT_SQL.format(v="asked.value") + " NOT IN (SELECT "
+    + _REQUIREMENT_SQL.format(v="value") + " FROM json_each({a}.contract_json,'$.requirements')))")
+
+
+def requirement_substance(requirement: Any) -> Any:
+    """What a requirement asks for: a stored one's former `policy` asks nothing."""
+    if isinstance(requirement, dict) and "policy" in requirement:
+        return {key: value for key, value in requirement.items() if key != "policy"}
+    return requirement
 
 
 def contract_substance(contract: dict) -> dict:
     """What a task contract asks for: everything but its title, context and priority."""
-    return {key: value for key, value in contract.items() if key not in CONTEXT_FIELDS}
+    substance = {key: value for key, value in contract.items() if key not in CONTEXT_FIELDS}
+    if isinstance(substance.get("requirements"), list):
+        substance["requirements"] = [requirement_substance(item) for item in substance["requirements"]]
+    return substance
 
 
 class Collaboration:
@@ -164,8 +182,11 @@ class Collaboration:
                   (int(runnable), reason, task_id, worker_id))
 
     def _preserve_member(self, c, attempt, snapshot, *, runnable=False, reason=None):
+        # A member that left keeps the reason it gave (shown to whoever may invite it back),
+        # not the stop reason of the turn that ended after it left.
         c.execute("UPDATE task_members SET checkpoint_json=COALESCE(?,checkpoint_json),snapshot=?,"
-                  "runnable=?,work_reason=? WHERE task_id=? AND worker_id=?",
+                  "runnable=CASE WHEN membership_state='left' THEN 0 ELSE ? END,"
+                  "work_reason=CASE WHEN membership_state='left' THEN work_reason ELSE ? END WHERE task_id=? AND worker_id=?",
                   (attempt["checkpoint_json"], snapshot, int(runnable), reason,
                    attempt["task_id"], attempt["worker_id"]))
 

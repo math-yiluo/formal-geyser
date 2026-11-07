@@ -77,8 +77,9 @@ uv run taskctl --project ~/project serve --port 8765
    `http://127.0.0.1:8765/` that holds the project's operator token; open it once. Every
    operator request needs that token, which sandboxed commands cannot read; a browser keeps
    it in an HTTP-only cookie. From Windows or macOS, the VM's forwarded `localhost` works.
-2. For the first run, use **Project setup**: enter the Task 0 goal, choose model and
-   effort, and click **Start**. See [project setup](docs/project-setup.md).
+2. For the first run, use **Project setup**: enter the Task 0 goal, choose the agents'
+   models and sessions under **Agents and sessions**, and click **Start**. See
+   [project setup](docs/project-setup.md).
 
 What the dashboard shows:
 

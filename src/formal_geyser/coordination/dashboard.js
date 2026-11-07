@@ -222,8 +222,11 @@ class TaskBrowserStore {
     this.onChange = onChange;
     this.open = false;
     this.view = 'all'; this.query = ''; this.offset = 0; this.limit = 25;
+    // Work tasks by default; reviews are counted on their task. `until` holds the list still:
+    // tasks published after the first page of a view was read wait behind "newer".
+    this.kind = 'work'; this.sort = 'newest'; this.until = null;
     this.page = null; this.pageLoad = null; this.error = '';
-    this.counts = {all: 0, running: 0, pool: 0, history: 0};
+    this.counts = {all: null, running: null, pool: null, history: null};
     this.selectedTask = null;
     this.details = new Map();
     this.titles = new Map();
@@ -241,7 +244,8 @@ class TaskBrowserStore {
     if (!this.details.has(id)) this.details.set(id, {
       current: null, selectedRevision: null, history: new Map(),
       currentLoad: null, historicalLoad: null, currentError: '', historicalError: '',
-      revisions: null, revisionOffset: 0, revisionsLoad: null, revisionsError: ''
+      revisions: null, revisionOffset: 0, revisionsLoad: null, revisionsError: '',
+      relations: null, relationsLoad: null, relationsError: '', relationsAt: 0
     });
     return this.details.get(id);
   }
@@ -251,21 +255,31 @@ class TaskBrowserStore {
     if (!open) {
       this.pageLoad = null;
       for (const detail of this.details.values()) {
-        detail.currentLoad = detail.historicalLoad = detail.revisionsLoad = null;
+        detail.currentLoad = detail.historicalLoad = detail.revisionsLoad = detail.relationsLoad = null;
       }
     }
   }
 
-  async browse({view = this.view, query = this.query, offset = 0, limit = this.limit} = {}) {
+  async browse({view = this.view, query = this.query, offset = 0, limit = this.limit, kind = this.kind, sort = this.sort} = {}) {
     if (!['all', 'running', 'pool', 'history'].includes(view)) throw Error('Unknown task view.');
+    if (!['work', 'review', 'both'].includes(kind) || !['newest', 'oldest', 'title'].includes(sort)) throw Error('Unknown task filter.');
     if (!Number.isInteger(limit) || limit < 1 || limit > 100 || !Number.isInteger(offset) || offset < 0) {
       throw Error('Invalid task page.');
     }
     query = query.trim();
-    if (view !== this.view || query !== this.query || offset !== this.offset || limit !== this.limit) {
-      this.view = view; this.query = query; this.offset = offset; this.limit = limit;
+    // Another view, search, filter or order starts from what exists now; another page keeps it.
+    if (view !== this.view || query !== this.query || kind !== this.kind || sort !== this.sort) this.until = null;
+    if (view !== this.view || query !== this.query || offset !== this.offset || limit !== this.limit
+        || kind !== this.kind || sort !== this.sort) {
+      this.view = view; this.query = query; this.offset = offset; this.limit = limit; this.kind = kind; this.sort = sort;
       this.page = null; this.pageLoad = null; this.error = '';
     }
+    return this.loadPage();
+  }
+
+  // Show the tasks published since the list was held still, from its first page.
+  async showNewer() {
+    this.until = null; this.offset = 0; this.pageLoad = null;
     return this.loadPage();
   }
 
@@ -277,10 +291,13 @@ class TaskBrowserStore {
     this.onChange('page');
     operation.promise = (async () => {
       try {
-        const params = new URLSearchParams({view: this.view, query: this.query, offset: this.offset, limit: this.limit});
+        const params = new URLSearchParams({view: this.view, query: this.query, offset: this.offset, limit: this.limit,
+          kind: this.kind, sort: this.sort});
+        if (this.until !== null) params.set('until', this.until);
         const result = await this.request('/v1/task-browser?' + params);
         if (!this.open || this.pageLoad !== operation) return;
         this.page = result; this.counts = result.counts; this.offset = result.offset; this.error = '';
+        if (this.until === null && Number.isInteger(result.now)) this.until = result.now;
         this.rememberTasks(result.items);
         // A shrinking result set can leave the last page empty.
         if (!result.items.length && result.total > 0 && this.offset >= result.total) {
@@ -306,8 +323,34 @@ class TaskBrowserStore {
       this.onChange('detail', id);
     }
     const detail = this.detail(id);
-    return Promise.allSettled([this.loadCurrent(id), this.loadRevisions(id),
+    return Promise.allSettled([this.loadCurrent(id), this.loadRevisions(id), this.loadRelations(id, {force: true}),
       ...(detail.selectedRevision === null ? [] : [this.loadHistorical(id)])]);
+  }
+
+  // What the task relates to: its origin, what it published, its reviews, needs and dependents.
+  // They change slowly and cost more to read, so a refresh reads them at most every 15 s.
+  async loadRelations(id = this.selectedTask, {force = false, now = Date.now()} = {}) {
+    if (!this.open || !id || id !== this.selectedTask) return;
+    const detail = this.detail(id);
+    if (detail.relationsLoad) return detail.relationsLoad.promise;
+    if (!force && detail.relations && now - detail.relationsAt < 15000) return;
+    const operation = {promise: null}; detail.relationsLoad = operation;
+    this.onChange('detail', id);
+    operation.promise = (async () => {
+      try {
+        const result = await this.request('/v1/tasks/' + encodeURIComponent(id) + '/relations');
+        if (!this.open || id !== this.selectedTask || detail.relationsLoad !== operation) return;
+        detail.relations = result; detail.relationsError = ''; detail.relationsAt = now;
+        const tasks = Object.values(result.tasks || {}).concat(result.children?.items || []);
+        this.rememberTasks(tasks.map(task => ({id: task.id, title: task.title})));
+      } catch (error) {
+        if (this.open && id === this.selectedTask && detail.relationsLoad === operation) detail.relationsError = error.message;
+        throw error;
+      } finally {
+        if (detail.relationsLoad === operation) { detail.relationsLoad = null; this.onChange('detail', id); }
+      }
+    })();
+    return operation.promise;
   }
 
   async loadCurrent(id = this.selectedTask) {
@@ -397,9 +440,10 @@ class TaskBrowserStore {
     return this.refresh();
   }
 
-  async refresh() {
+  // `page`: whether the list is shown, so its page is read again too.
+  async refresh({page = true} = {}) {
     if (!this.open) return;
-    await Promise.allSettled([this.loadPage(), this.loadCurrent(),
+    await Promise.allSettled([...(page ? [this.loadPage()] : []), this.loadCurrent(), this.loadRelations(),
       ...(this.detail()?.selectedRevision === null ? [] : [this.loadHistorical()])]);
     const detail = this.detail();
     if (this.open && detail && (!detail.revisions || detail.revisions.current_revision !== detail.current?.current_revision)) {
@@ -794,6 +838,7 @@ function workerActivity(value, {asking = [], awaitingReview = false, now = Date.
     return asking.every(kind => kind === 'literature') ? 'Waiting for a source from you' : 'Waiting for your answer';
   }
   if (value.kind === 'dispatcher') return 'Assigns open tasks';
+  if (value.kind === 'waker') return 'Ends waits on published tasks';
   if (base === 'Retired') return value.kind === 'review' ? 'Review finished' : 'Finished';
   if (awaitingReview) return base + ' · submission in review';
   return base;
@@ -933,18 +978,25 @@ function turnStream(turn, {messageText = () => null} = {}) {
   return stream;
 }
 
+// A task's current executors: the outline's compact list, or a summary's members.
+function taskExecutors(task) {
+  if (Array.isArray(task.executors)) return task.executors;
+  return (task.collaboration?.members || []).filter(m => m.executor && (!m.membership_state || m.membership_state === 'member'));
+}
+function openReviews(task) { return task.reviews ? task.reviews.open || 0 : task.reviews_pending || 0; }
+
 // Plain status for the task overview; review tasks keep their verdict wording.
 function taskOutlineState(task) {
   if (task.state === 'done') return {text: 'Done', tone: 'done'};
   if (task.state === 'retired') return {text: 'Retired', tone: 'done'};
-  const executors = (task.collaboration?.members || []).filter(m => m.executor && (!m.membership_state || m.membership_state === 'member'));
+  const executors = taskExecutors(task);
   if (task.contract?.kind === 'review') {
     const review = task.collaboration?.review || {};
     if (['reject', 'rejected', 'request_changes'].includes(review.feedback?.verdict)) return {text: 'Changes requested', tone: 'attention'};
     if (review.state === 'integrating' || review.acceptance) return {text: 'Accepted · integrating', tone: 'active'};
     return task.running || executors.length ? {text: 'Being reviewed', tone: 'active'} : {text: 'Waiting for a reviewer', tone: 'waiting'};
   }
-  if (task.reviews_pending) return {text: 'Submitted · awaiting review', tone: 'waiting'};
+  if (openReviews(task)) return {text: 'Submitted · awaiting review', tone: 'waiting'};
   if (task.running) return {text: 'In progress', tone: 'active'};
   if (!executors.length) return {text: 'Waiting for a worker', tone: 'waiting'};
   if (executors.some(m => m.execution_status === 'Recovering')) return {text: 'Recovering', tone: 'attention'};
@@ -956,13 +1008,236 @@ function taskOutlineState(task) {
 function outlineProgress(items) {
   const work = (items || []).filter(item => item.contract?.kind !== 'review' && item.state !== 'retired');
   return {total: work.length, done: work.filter(item => item.state === 'done').length,
-    review: work.filter(item => item.state !== 'done' && item.reviews_pending).length,
-    active: work.filter(item => item.state !== 'done' && item.running && !item.reviews_pending).length};
+    review: work.filter(item => item.state !== 'done' && openReviews(item)).length,
+    active: work.filter(item => item.state !== 'done' && item.running && !openReviews(item)).length};
+}
+
+// Reviews of a task in a few words: "3 reviews · 1 open · 1 changes requested".
+function reviewSummary(counts) {
+  if (!counts?.total) return '';
+  const parts = [counts.total + (counts.total === 1 ? ' review' : ' reviews')];
+  if (counts.open) parts.push(counts.open + ' open');
+  if (counts.changes) parts.push(counts.changes + ' changes requested');
+  return parts.join(' · ');
+}
+
+// The publication tree: each work task under the task it came from (`parent`), Task 0 first,
+// then in publication order. A parent that is missing, or that would close a cycle, makes a root.
+// `below` counts each task's descendants (retired ones left out) and how many are done.
+function publicationTree(items, rootId = null) {
+  const byId = new Map((items || []).map(item => [item.id, item]));
+  const parentOf = id => { const parent = byId.get(id)?.parent; return parent && byId.has(parent) ? parent : null; };
+  const children = new Map(), roots = [];
+  for (const item of byId.values()) {
+    let parent = parentOf(item.id);
+    // A cycle in recorded origins never hides a task: walk up, and cut where it repeats.
+    for (let seen = new Set([item.id]), up = parent; up; up = parentOf(up)) {
+      if (seen.has(up)) { parent = null; break; }
+      seen.add(up);
+    }
+    if (parent) { if (!children.has(parent)) children.set(parent, []); children.get(parent).push(item.id); }
+    else roots.push(item.id);
+  }
+  roots.sort((a, b) => (b === rootId) - (a === rootId));
+  const below = new Map(), order = [], stack = [...roots];
+  while (stack.length) { const id = stack.pop(); order.push(id); stack.push(...(children.get(id) || [])); }
+  for (const id of order.reverse()) {
+    const counts = {total: 0, done: 0};
+    for (const child of children.get(id) || []) {
+      const task = byId.get(child), inner = below.get(child);
+      counts.total += inner.total + (task.state === 'retired' ? 0 : 1);
+      counts.done += inner.done + (task.state === 'done' ? 1 : 0);
+    }
+    below.set(id, counts);
+  }
+  return {byId, roots, children, below};
+}
+
+// The ancestors of a task in the publication tree, nearest first.
+function treeAncestors(tree, id) {
+  const found = [], seen = new Set([id]);
+  for (let up = tree.byId.get(id)?.parent; up && tree.byId.has(up) && !seen.has(up); up = tree.byId.get(up).parent) {
+    found.push(up); seen.add(up);
+  }
+  return found;
+}
+
+// A small, safe Markdown reading for task texts: headings, lists, quotes, fenced code, rules and
+// paragraphs, with inline code, bold, italics and http(s) links. It returns plain data; the page
+// builds nodes from it as text, never as HTML.
+function markdownInline(text) {
+  const spans = [], pattern = /(`+)([\s\S]*?)\1|\*\*([^*]+)\*\*|__([^_]+)__|\*([^*\s][^*]*)\*|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
+  let last = 0;
+  for (const match of String(text).matchAll(pattern)) {
+    if (match.index > last) spans.push({type: 'text', text: text.slice(last, match.index)});
+    if (match[1]) spans.push({type: 'code', text: match[2].trim() || match[2]});
+    else if (match[3] || match[4]) spans.push({type: 'strong', text: match[3] || match[4]});
+    else if (match[5]) spans.push({type: 'em', text: match[5]});
+    else spans.push({type: 'link', text: match[6], href: match[7]});
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) spans.push({type: 'text', text: text.slice(last)});
+  return spans;
+}
+function markdownBlocks(text) {
+  const lines = String(text || '').replace(/\r\n?/g, '\n').split('\n'), blocks = [];
+  let paragraph = [];
+  const flush = () => { if (paragraph.length) blocks.push({type: 'paragraph', inline: markdownInline(paragraph.join(' '))}); paragraph = []; };
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const fence = line.match(/^\s*(```|~~~)/);
+    if (fence) {
+      flush();
+      const code = [];
+      for (index += 1; index < lines.length && !lines[index].trimStart().startsWith(fence[1]); index += 1) code.push(lines[index]);
+      blocks.push({type: 'code', text: code.join('\n')});
+      continue;
+    }
+    const heading = line.match(/^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/);
+    if (heading) { flush(); blocks.push({type: 'heading', level: heading[1].length, inline: markdownInline(heading[2])}); continue; }
+    if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(line)) { flush(); blocks.push({type: 'rule'}); continue; }
+    const item = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+    if (item) {
+      flush();
+      const ordered = /\d/.test(item[2]), list = {type: 'list', ordered, items: []};
+      for (; index < lines.length; index += 1) {
+        const next = lines[index].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+        if (next && /\d/.test(next[2]) === ordered) list.items.push(markdownInline(next[3]));
+        else if (list.items.length && /^\s{2,}\S/.test(lines[index])) {
+          list.items[list.items.length - 1].push({type: 'text', text: ' '}, ...markdownInline(lines[index].trim()));
+        } else break;
+      }
+      index -= 1;
+      blocks.push(list);
+      continue;
+    }
+    const quote = line.match(/^\s{0,3}>\s?(.*)$/);
+    if (quote) { flush(); blocks.push({type: 'quote', inline: markdownInline(quote[1])}); continue; }
+    if (!line.trim()) { flush(); continue; }
+    paragraph.push(line.trim());
+  }
+  flush();
+  return blocks;
+}
+
+// ---- The dependency graph (after Geyser's task graph): what is needed stands left of what
+// needs it. One edge per pair of tasks, styled by its most pressing unmet link.
+const GRAPH = {nodeWidth: 210, nodeHeight: 58, gapX: 72, gapY: 16, pad: 12};
+function graphEdges(links, deadlocks = []) {
+  const cycle = new Map(deadlocks.flatMap((group, index) => group.map(id => [id, index])));
+  const pairs = new Map();
+  for (const link of links || []) {
+    if (link.source === link.target) continue;
+    const key = link.source + '>' + link.target;
+    if (!pairs.has(key)) pairs.set(key, []);
+    pairs.get(key).push(link);
+  }
+  return [...pairs.values()].map(group => {
+    const {source, target} = group[0], unmet = group.filter(link => !link.met);
+    const deadlock = unmet.length > 0 && cycle.has(source) && cycle.get(source) === cycle.get(target);
+    const kind = deadlock ? 'deadlock' : !unmet.length ? 'met'
+      : unmet.some(link => link.kind === 'subscription') ? 'subscription'
+      : unmet.some(link => link.kind === 'wait') ? 'wait' : 'requirement';
+    return {source, target, links: group, kind};
+  });
+}
+// Columns by the longest chain of needs; an edge across several columns passes an empty slot in
+// each, so none runs behind a node; edges closing a cycle are drawn as loops back. `ids` give the
+// order within a column when nothing else decides it.
+function layeredLayout(ids, edges, size = GRAPH) {
+  const rank = new Map(ids.map((id, index) => [id, id === 'operator' ? -1 : index]));
+  const order = id => rank.get(id) ?? Number.MAX_SAFE_INTEGER;
+  const nodes = [...ids].sort((a, b) => order(a) - order(b));
+  const outgoing = new Map();
+  for (const edge of edges) { if (!outgoing.has(edge.source)) outgoing.set(edge.source, []); outgoing.get(edge.source).push(edge); }
+  const back = new Set(), visiting = new Map();
+  for (const start of nodes) {
+    if (visiting.has(start)) continue;
+    // Iterative depth-first search: a long chain never exhausts the stack.
+    const stack = [[start, 0]]; visiting.set(start, true);
+    while (stack.length) {
+      const top = stack[stack.length - 1], out = outgoing.get(top[0]) || [];
+      if (top[1] >= out.length) { visiting.set(top[0], false); stack.pop(); continue; }
+      const edge = out[top[1]++];
+      if (visiting.get(edge.target) === true) back.add(edge);
+      else if (!visiting.has(edge.target)) { visiting.set(edge.target, true); stack.push([edge.target, 0]); }
+    }
+  }
+  const forward = edges.filter(edge => !back.has(edge));
+  const column = new Map(nodes.map(id => [id, 0])), pending = new Map(nodes.map(id => [id, 0]));
+  for (const edge of forward) pending.set(edge.target, pending.get(edge.target) + 1);
+  const ready = nodes.filter(id => pending.get(id) === 0), forwardOut = new Map();
+  for (const edge of forward) { if (!forwardOut.has(edge.source)) forwardOut.set(edge.source, []); forwardOut.get(edge.source).push(edge); }
+  while (ready.length) {
+    const id = ready.shift();
+    for (const edge of forwardOut.get(id) || []) {
+      column.set(edge.target, Math.max(column.get(edge.target), column.get(id) + 1));
+      pending.set(edge.target, pending.get(edge.target) - 1);
+      if (pending.get(edge.target) === 0) ready.push(edge.target);
+    }
+  }
+  const columns = [], chains = new Map(), before = new Map();
+  const place = (id, index) => { column.set(id, index); (columns[index] ||= []).push(id); };
+  for (const id of nodes) place(id, column.get(id));
+  for (const edge of forward) {
+    const chain = [edge.source];
+    for (let index = column.get(edge.source) + 1; index < column.get(edge.target); index += 1) {
+      const waypoint = edge.source + '>' + edge.target + '@' + index;
+      place(waypoint, index); chain.push(waypoint);
+    }
+    chain.push(edge.target);
+    chains.set(edge, chain);
+    chain.slice(1).forEach((point, index) => { if (!before.has(point)) before.set(point, []); before.get(point).push(chain[index]); });
+  }
+  const row = new Map();
+  const meanRow = id => {
+    const rows = (before.get(id) || []).map(point => row.get(point)).filter(value => value !== undefined);
+    return rows.length ? rows.reduce((sum, value) => sum + value, 0) / rows.length : Number.MAX_SAFE_INTEGER;
+  };
+  columns.forEach((members, index) => {
+    if (index > 0) members.sort((a, b) => meanRow(a) - meanRow(b) || order(a) - order(b));
+    members.forEach((id, position) => row.set(id, position));
+  });
+  const position = new Map([...column.keys()].map(id => [id, {
+    x: size.pad + column.get(id) * (size.nodeWidth + size.gapX), y: size.pad + row.get(id) * (size.nodeHeight + size.gapY)}]));
+  const tallest = Math.max(1, ...columns.filter(Boolean).map(members => members.length));
+  return {position, back, chains, width: size.pad * 2 + Math.max(1, columns.length) * (size.nodeWidth + size.gapX) - size.gapX,
+    height: size.pad * 2 + tallest * (size.nodeHeight + size.gapY) - size.gapY};
+}
+// An edge's path: curves between columns, straight across each empty slot; a loop back runs from
+// the left of its source to the right of its target, below the nodes' middles.
+function edgeRoute(edge, layout, size = GRAPH) {
+  if (layout.back.has(edge)) {
+    const from = layout.position.get(edge.source), to = layout.position.get(edge.target);
+    const x1 = from.x, y1 = from.y + size.nodeHeight / 2 + 14, x2 = to.x + size.nodeWidth, y2 = to.y + size.nodeHeight / 2 + 14;
+    const bend = Math.max(30, (x1 - x2) / 2);
+    return {d: `M${x1},${y1} C${x1 - bend},${y1} ${x2 + bend},${y2} ${x2},${y2}`, mid: {x: (x1 + x2) / 2, y: (y1 + y2) / 2 + 17}};
+  }
+  const points = layout.chains.get(edge).map(id => layout.position.get(id));
+  let x = points[0].x + size.nodeWidth, y = points[0].y + size.nodeHeight / 2, d = `M${x},${y}`, mid = null;
+  points.slice(1).forEach((point, index) => {
+    const tx = point.x, ty = point.y + size.nodeHeight / 2, bend = Math.max(30, (tx - x) / 2);
+    d += ` C${x + bend},${y} ${tx - bend},${ty} ${tx},${ty}`;
+    mid ??= {x: (x + tx) / 2, y: (y + ty) / 2};
+    x = tx; y = ty;
+    if (index < points.length - 2) { x = point.x + size.nodeWidth; d += ` L${x},${y}`; }
+  });
+  return {d, mid};
+}
+// The tasks one step from `id` along these edges, and `id` itself.
+function graphNeighbours(edges, id) {
+  const found = new Set([id]);
+  for (const edge of edges) {
+    if (edge.source === id) found.add(edge.target);
+    if (edge.target === id) found.add(edge.source);
+  }
+  return found;
 }
 
 function principalName(value, reference = '') {
   if (value?.kind === 'integrator' || reference === 'Integrator') return 'Integrator';
   if (value?.kind === 'dispatcher' || reference === 'Dispatcher') return 'Dispatcher';
+  if (value?.kind === 'waker' || reference === 'Waker') return 'Waker';
   const reviewer = value?.kind === 'review';
   const pattern = value ? reviewer ? /^Reviewer [1-9]\d*$/ : /^Worker \d+$/ : /^(?:Worker \d+|Reviewer [1-9]\d*)$/;
   const recorded = value?.display_name || reference;
@@ -1016,7 +1291,7 @@ function arrangeMembers(members, {query = '', state = '', backend = '', descendi
     .sort((a, b) => order * (principalNumber(a) - principalNumber(b) || principalName(a).localeCompare(principalName(b))));
 }
 
-const AGENT_ROWS = [['worker', 'codex'], ['worker', 'claude'], ['review', 'codex']];
+const AGENT_ROWS = [['worker', 'codex'], ['worker', 'claude'], ['review', 'codex'], ['integrator', 'codex']];
 const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 // The page's editable copy of the choices for new conversations and the session limits.
@@ -1029,6 +1304,8 @@ function agentDraft(status) {
   }
   return {nextBackend: status?.next_worker?.backend || status?.new_worker_backend || 'codex', models,
     dispatcher: {model: status?.decision_model?.model || '', effort: status?.decision_model?.effort || ''},
+    waker: {model: status?.waker_model?.model || '', effort: status?.waker_model?.effort || ''},
+    deadline: String(status?.answer_deadline?.minutes ?? ''),
     // No limit (null) reads as -1; 0 starts no worker session.
     sessions: Object.fromEntries(['codex', 'claude'].map(backend => [backend, String(status?.sessions?.[backend]?.limit ?? -1)])),
     idle: Object.fromEntries(['codex', 'claude'].map(backend => [backend,
@@ -1130,6 +1407,17 @@ function agentSettingCommands(status, draft) {
   if (draft.dispatcher.model !== saved.dispatcher.model || draft.dispatcher.effort !== saved.dispatcher.effort) {
     commands.push(['runtime.set_decision_model', {model: draft.dispatcher.model, effort: draft.dispatcher.effort}]);
   }
+  if (draft.waker.model !== saved.waker.model || draft.waker.effort !== saved.waker.effort) {
+    if (!draft.waker.model || !draft.waker.effort) throw Error("Choose both the Waker's model and its effort.");
+    commands.push(['runtime.set_waker_model', {model: draft.waker.model, effort: draft.waker.effort}]);
+  }
+  const deadline = String(draft.deadline).trim();
+  if (deadline !== saved.deadline) {
+    if (!/^\d+$/.test(deadline) || Number(deadline) < 1 || Number(deadline) > 43200) {
+      throw Error('The answer deadline must be a whole number of minutes from 1 to 43200.');
+    }
+    commands.push(['runtime.set_answer_deadline', {minutes: Number(deadline)}]);
+  }
   for (const backend of ['codex', 'claude']) {
     const text = String(draft.sessions[backend]).trim();
     if (text === saved.sessions[backend]) continue;
@@ -1172,8 +1460,9 @@ if (typeof module !== 'undefined' && module.exports) module.exports = {
   WorkerHistoryStore, TaskBrowserStore, ProjectSetupStore, correspondencePresentation, requestResolutionPayload,
   workerStateLabel, workerTaskPrefix, principalName, principalNumber, preserveDisclosures,
   selectedRun, projectStatus, personControl, controlConsole, CONTROL_GROUPS, elapsedLabel, workerActivity, actionSummary, taskOutlineState, outlineProgress,
-  turnStream, arrangeMembers, agentDraft, agentSettingCommands, PEOPLE_STATES, profileRows, profileBadge,
-  profileHistoryRows, durationLabel, pollsToSkip, admissionLabel
+  turnStream, arrangeMembers, agentDraft, agentSettingCommands, AGENT_ROWS, PEOPLE_STATES, profileRows, profileBadge,
+  profileHistoryRows, durationLabel, pollsToSkip, admissionLabel, taskExecutors, reviewSummary, publicationTree,
+  treeAncestors, markdownInline, markdownBlocks, GRAPH, graphEdges, layeredLayout, edgeRoute, graphNeighbours
 };
 
 if (typeof document !== 'undefined') {
@@ -1351,8 +1640,8 @@ if (typeof document !== 'undefined') {
     for (const [kind, prefix] of [['ordinary', 'worker'], ['review', 'reviewer'], ['integrator', 'integrator']]) {
       const list = el(prefix + '-list');
       list.replaceChildren();
-      // The Dispatcher, which owns assignment decisions, is listed with the Integrator.
-      const kinds = kind === 'integrator' ? ['integrator', 'dispatcher'] : [kind];
+      // The Dispatcher and the Waker, which own assignment and wake decisions, are listed with the Integrator.
+      const kinds = kind === 'integrator' ? ['integrator', 'dispatcher', 'waker'] : [kind];
       // Retired people are listed only when that state is chosen: thousands of reviewers retire.
       const pool = peopleView.state === 'Retired' ? [...new Set(workerIndex.values())] : data.workers;
       const members = pool.filter(item => kinds.includes(item.kind || 'ordinary')
@@ -1436,7 +1725,7 @@ if (typeof document !== 'undefined') {
   function renderBackendControl(current) {
     const line = el('worker-backend'), button = el('worker-backend-button');
     const now = current.backend || 'codex', requested = current.requested_backend, own = current.session_settings;
-    line.classList.toggle('hidden', current.kind === 'dispatcher');
+    line.classList.toggle('hidden', current.kind === 'dispatcher' || current.kind === 'waker');
     el('worker-backend-text').textContent = 'Backend: ' + backendName(now)
       + (own ? ' · ' + (own.model || 'default model') + ' · ' + own.effort + ' effort' : '')
       + (requested ? ' · moves to ' + backendName(requested) + ' at its next new conversation' : '');
@@ -1459,8 +1748,8 @@ if (typeof document !== 'undefined') {
     const current = worker(selected);
     if (!current) return;
     el('conversation-title').textContent = name(selected);
-    el('history-heading').textContent = current.kind === 'integrator' ? 'INTEGRATOR HISTORY' : current.kind === 'dispatcher' ? 'DISPATCHER HISTORY' : current.kind === 'review' ? 'REVIEWER HISTORY' : 'WORKER HISTORY';
-    el('worker-kind').textContent = current.kind === 'integrator' ? 'Integrator' : current.kind === 'dispatcher' ? 'Dispatcher' : current.kind === 'review' ? 'Reviewer' : 'Worker';
+    el('history-heading').textContent = current.kind === 'integrator' ? 'INTEGRATOR HISTORY' : current.kind === 'dispatcher' ? 'DISPATCHER HISTORY' : current.kind === 'waker' ? 'WAKER HISTORY' : current.kind === 'review' ? 'REVIEWER HISTORY' : 'WORKER HISTORY';
+    el('worker-kind').textContent = current.kind === 'integrator' ? 'Integrator' : current.kind === 'dispatcher' ? 'Dispatcher' : current.kind === 'waker' ? 'Waker' : current.kind === 'review' ? 'Reviewer' : 'Worker';
     el('worker-status').textContent = stateLabel(current);
     el('worker-kind').classList.remove('hidden');
     el('worker-status').classList.remove('hidden');
@@ -1481,7 +1770,7 @@ if (typeof document !== 'undefined') {
     el('worker-technical').classList.remove('hidden');
     el('worker-ids').textContent = 'Internal ' + (current.kind === 'review' ? 'reviewer' : 'worker') + ' ID: ' + current.id + '\nNative thread ID: ' + (current.thread_id || 'Not started') + '\nCreated: ' + time(current.created_at)
       + '\nBackend: ' + (current.backend === 'claude' ? 'Claude' : 'Codex')
-      + (current.kind === 'dispatcher' ? '' : '\nConversation rotation: ' + (current.rotation_mode ? current.rotation_mode + ' (set for this person)' : 'project mode'));
+      + (current.kind === 'dispatcher' || current.kind === 'waker' ? '' : '\nConversation rotation: ' + (current.rotation_mode ? current.rotation_mode + ' (set for this person)' : 'project mode'));
     renderPersonControl(current);
     renderBackendControl(current);
     renderComposer(); renderPinnedRequests();
@@ -1922,16 +2211,46 @@ if (typeof document !== 'undefined') {
     if (review.acceptance) return 'Accepted · integrating';
     return label(task.state);
   }
+  // ---- Task center: the overview (publication tree), the dependency graph, the paged lists, and
+  // the selected task beside them.
+  const outlineView = {expanded: new Set(), touched: false, filter: '', hideDone: false, loadedAt: 0, shown: new Map()};
+  const graphView = {data: null, load: null, error: '', loadedAt: 0, includeMet: false, scrolledTo: null, signature: ''};
+  let outlineTree = null, outlineFilterTimer = null;
+  const OUTLINE_CHILDREN = 150;
+  function plural(count, word, many = word + 's') { return count.toLocaleString() + ' ' + (count === 1 ? word : many); }
+  function shortId(id) { return String(id).slice(0, 8); }
+  function chip(text, tone = '') { return node('span', text, 'chip' + (tone ? ' ' + tone : '')); }
+  function stateChip(task) {
+    if (task.contract?.kind === 'review') {
+      const text = reviewResult(task);
+      return chip(text, /changes|Rejected|attention|invalid/i.test(text) ? 'attention' : /Accepted|done/i.test(text) ? 'done' : 'active');
+    }
+    const state = taskOutlineState(task);
+    return chip(state.text, state.tone);
+  }
+  function dateLabel(value) {
+    if (!value) return '';
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? '' : date.toLocaleString(undefined, {dateStyle: 'medium', timeStyle: 'short'});
+  }
+  function shortDate(value) {
+    if (!value) return '';
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? '' : date.toLocaleString(undefined, {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+  }
   function taskChanged(area, id) {
     if (!el('tasks-dialog').open) return;
     if (area === 'page') renderTasks();
-    if (area === 'detail' && taskMode === 'outline') { outlineSignature = ''; renderOutline(); }
-    if (area === 'detail' && id === taskStore.selectedTask) { renderTasks(); renderTaskDetail(); }
+    if (area === 'detail' && id === taskStore.selectedTask) {
+      renderTasks(); renderTaskDetail();
+      if (taskMode === 'outline') renderOutline();
+      if (taskMode === 'graph') renderGraph();
+    }
   }
   function taskMembers(task) {
     const members = node('div', undefined, 'task-members'), seen = new Set();
-    for (const member of task.collaboration?.members || []) {
-      if (!member.executor || seen.has(member.worker_id)) continue;
+    for (const member of taskExecutors(task)) {
+      if (seen.has(member.worker_id)) continue;
       seen.add(member.worker_id);
       const line = node('span');
       line.append(workerButton(member.worker_id), node('span', ' · ' + (member.execution_status || 'Retained'), 'muted'));
@@ -1940,142 +2259,396 @@ if (typeof document !== 'undefined') {
     if (!members.children.length) members.append(node('span', 'No executors', 'muted'));
     return members;
   }
-  async function loadOutline() {
+  function executorText(executors) {
+    return executors.map(member => name(member.worker_id) + ' ' + String(member.execution_status || 'retained').toLowerCase()).join(' · ');
+  }
+  function renderTotals() {
+    const target = el('tasks-totals');
+    if (outline) {
+      const progress = outlineProgress(outline.items);
+      target.textContent = plural(progress.total, 'work task') + ' · ' + progress.done.toLocaleString() + ' done · '
+        + plural(outline.review_count || 0, 'review');
+    } else if (taskStore.counts.all !== null && taskStore.kind === 'work') {
+      target.textContent = plural(taskStore.counts.all, 'work task') + ' · ' + taskStore.counts.history.toLocaleString() + ' finished';
+    }
+  }
+
+  // The overview reads every work task (compactly): at most every 30 s while it is shown.
+  async function loadOutline({force = false} = {}) {
     if (!el('tasks-dialog').open || taskMode !== 'outline') return;
     if (outlineLoad) return outlineLoad;
+    if (!force && outline && Date.now() - outlineView.loadedAt < 30000) return;
     outlineLoad = (async () => {
-      try { outline = await api('/v1/task-outline'); outlineError = ''; taskStore.rememberTasks(outline.items); }
-      catch (error) { outlineError = error.message; }
-      finally { outlineLoad = null; renderOutline(); }
+      try {
+        outline = await api('/v1/task-outline'); outlineError = ''; outlineView.loadedAt = Date.now();
+        taskStore.rememberTasks(outline.items);
+        outlineTree = publicationTree(outline.items, outline.root_task_id);
+        if (!outlineView.touched && outline.root_task_id) outlineView.expanded.add(outline.root_task_id);
+      } catch (error) { outlineError = error.message; }
+      finally { outlineLoad = null; renderOutline(); renderTotals(); }
     })();
     return outlineLoad;
   }
-  function outlineItem(task, reviews, root = false) {
-    const item = node('li', undefined, 'outline-item' + (root ? ' outline-root' : ''));
-    const head = node('div', undefined, 'row'), state = taskOutlineState(task);
-    if (root) head.append(node('span', 'Task 0', 'badge'));
-    const open = taskButton(task.id, task.contract?.title || 'Untitled task');
-    open.setAttribute('aria-pressed', String(task.id === taskStore.selectedTask));
-    head.append(open, node('span', state.text, 'badge' + (state.tone === 'attention' || state.tone === 'waiting' ? ' attention' : '')));
-    item.append(head);
-    const members = (task.collaboration?.members || []).filter(m => m.executor && (!m.membership_state || m.membership_state === 'member'));
-    if (members.length) {
-      const meta = node('div', undefined, 'outline-meta');
-      members.forEach((member, index) => {
-        if (index) meta.append(' · ');
-        meta.append(workerButton(member.worker_id), ' ' + String(member.execution_status || 'retained').toLowerCase());
-      });
-      item.append(meta);
-    }
-    const nested = reviews.get(task.id) || [];
-    if (nested.length) {
-      const list = node('ul', undefined, 'outline-list');
-      for (const review of nested) list.append(outlineItem(review, reviews));
-      item.append(list);
-    }
+  function finished(tree, id) {
+    const task = tree.byId.get(id), below = tree.below.get(id);
+    return ['done', 'retired'].includes(task.state) && below.done >= below.total;
+  }
+  function outlineRow(task, tree, open, forced) {
+    const item = node('li'), row = node('div', undefined, 'tree-row' + (task.id === taskStore.selectedTask ? ' selected' : ''));
+    const children = tree.children.get(task.id) || [], below = tree.below.get(task.id);
+    const toggle = node('button', open ? '▾' : '▸', 'tree-toggle');
+    toggle.disabled = !children.length || forced;
+    toggle.setAttribute('aria-expanded', String(open));
+    toggle.setAttribute('aria-label', (open ? 'Collapse ' : 'Expand ') + (task.contract?.title || 'task'));
+    toggle.onclick = () => {
+      outlineView.touched = true;
+      if (outlineView.expanded.has(task.id)) outlineView.expanded.delete(task.id); else outlineView.expanded.add(task.id);
+      renderOutline();
+    };
+    const main = node('div', undefined, 'tree-main'), marks = node('span', undefined, 'tree-marks');
+    const link = taskButton(task.id, task.contract?.title || 'Untitled task');
+    link.setAttribute('aria-current', String(task.id === taskStore.selectedTask));
+    marks.append(stateChip(task));
+    if (task.id === outline.root_task_id) marks.prepend(chip('Task 0', 'active'));
+    if (task.relation === 'repair') marks.append(chip('Repair', 'bad'));
+    const meta = [];
+    const executors = taskExecutors(task);
+    if (executors.length) meta.push(executorText(executors));
+    if (children.length) meta.push(below.done + '/' + below.total + ' below done');
+    const reviews = reviewSummary(task.reviews);
+    if (reviews) meta.push(reviews);
+    main.append(link, marks);
+    if (meta.length) main.append(node('span', meta.join(' · '), 'tree-meta'));
+    row.append(toggle, main);
+    item.append(row);
     return item;
+  }
+  function outlineLevel(ids, tree, visible, forced, parentKey) {
+    const list = node('ul', undefined, 'tree');
+    const shown = ids.filter(id => (!visible || visible.has(id)) && !(outlineView.hideDone && !forced.has(id) && finished(tree, id)));
+    const limit = outlineView.shown.get(parentKey) || OUTLINE_CHILDREN;
+    for (const id of shown.slice(0, limit)) {
+      const task = tree.byId.get(id), children = tree.children.get(id) || [];
+      const open = children.length > 0 && (forced.has(id) || outlineView.expanded.has(id));
+      const item = outlineRow(task, tree, open, forced.has(id));
+      if (open) item.append(outlineLevel(children, tree, visible, forced, id));
+      list.append(item);
+    }
+    if (shown.length > limit) {
+      const rest = shown.length - limit, next = Math.min(OUTLINE_CHILDREN, rest);
+      const more = node('button', 'Show ' + next + ' more' + (rest > next ? ' of ' + rest.toLocaleString() : ''), 'small tree-more');
+      more.onclick = () => { outlineView.shown.set(parentKey, limit + OUTLINE_CHILDREN); renderOutline(); };
+      const item = node('li'); item.append(more); list.append(item);
+    }
+    return list;
   }
   function renderOutline() {
     const target = el('task-outline');
-    const signature = JSON.stringify([outline, outlineError, taskStore.selectedTask, data?.workers.map(w => [w.id, w.display_name]), retired.records.length]);
+    const signature = JSON.stringify([outlineView.loadedAt, outlineError, taskStore.selectedTask, [...outlineView.expanded],
+      outlineView.filter, outlineView.hideDone, [...outlineView.shown], data?.workers.map(w => [w.id, w.display_name]), retired.records.length]);
     if (signature === outlineSignature) return;
     outlineSignature = signature;
+    const pane = el('task-list-pane'), top = pane.scrollTop;
     target.replaceChildren();
-    if (!outline) {
+    if (!outline || !outlineTree) {
       target.append(node('p', outlineError ? 'Tasks could not be loaded: ' + outlineError : 'Loading tasks…', outlineError ? 'request-error' : 'muted'));
       return;
     }
     if (outlineError) target.append(node('p', 'Showing the last loaded overview. ' + outlineError, 'request-error'));
     const progress = outlineProgress(outline.items), line = node('p', undefined, 'task-progress');
-    line.append(node('strong', progress.done + ' of ' + progress.total), ' tasks done'
+    line.append(node('strong', progress.done.toLocaleString() + ' of ' + progress.total.toLocaleString()), ' work tasks done'
       + (progress.review ? ' · ' + progress.review + ' awaiting review' : '') + (progress.active ? ' · ' + progress.active + ' in progress' : ''));
     const track = node('div', undefined, 'progress-track'), fill = node('span');
     fill.style.width = (progress.total ? Math.round(100 * progress.done / progress.total) : 0) + '%';
     track.append(fill);
     target.append(line, track);
-    const ids = new Set(outline.items.map(item => item.id)), reviews = new Map();
-    for (const item of outline.items) {
-      if (!item.host_task_id || !ids.has(item.host_task_id)) continue;
-      if (!reviews.has(item.host_task_id)) reviews.set(item.host_task_id, []);
-      reviews.get(item.host_task_id).push(item);
+    const tree = outlineTree;
+    let visible = null, forced = new Set();
+    const query = outlineView.filter.trim().toLowerCase();
+    if (query) {
+      const matches = outline.items.filter(item => item.id.toLowerCase().startsWith(query)
+        || (item.contract?.title || '').toLowerCase().includes(query));
+      visible = new Set();
+      for (const item of matches.slice(0, 300)) {
+        visible.add(item.id);
+        for (const up of treeAncestors(tree, item.id)) { visible.add(up); forced.add(up); }
+      }
+      target.append(node('p', matches.length ? plural(matches.length, 'task') + ' match' + (matches.length === 1 ? 'es, shown with the tasks above it.' : '')
+        + (matches.length > 300 ? '; the first 300 are shown with the tasks above them.' : matches.length > 1 ? ', shown with the tasks above them.' : '')
+        : 'No task matches “' + outlineView.filter.trim() + '”.', 'muted outline-head'));
     }
-    const tops = outline.items.filter(item => !item.host_task_id || !ids.has(item.host_task_id));
-    const root = tops.find(item => item.id === outline.root_task_id);
-    const list = node('ul', undefined, 'outline-list');
-    for (const item of [...(root ? [root] : []), ...tops.filter(item => item !== root)]) list.append(outlineItem(item, reviews, item === root));
-    if (!tops.length) list.append(node('li', 'No tasks yet.', 'muted'));
-    target.append(list);
+    if (!tree.roots.length) { target.append(node('p', 'No tasks yet.', 'muted')); return; }
+    target.append(outlineLevel(tree.roots, tree, visible, forced, ''));
+    pane.scrollTop = top;
   }
+
+  // The dependency graph reads every open task's needs: at most every 30 s while it is shown.
+  async function loadGraph({force = false} = {}) {
+    if (!el('tasks-dialog').open || taskMode !== 'graph') return;
+    if (graphView.load) return graphView.load;
+    const current = graphView.data && graphView.data.include_met === graphView.includeMet;
+    if (!force && current && Date.now() - graphView.loadedAt < 30000) return;
+    graphView.load = (async () => {
+      try {
+        graphView.data = await api('/v1/task-graph?include_met=' + graphView.includeMet);
+        graphView.error = ''; graphView.loadedAt = Date.now();
+        taskStore.rememberTasks(graphView.data.tasks.map(task => ({id: task.id, title: task.title})));
+      } catch (error) { graphView.error = error.message; }
+      finally { graphView.load = null; renderGraph(); }
+    })();
+    return graphView.load;
+  }
+  function graphTask(id) { return graphView.data?.tasks.find(task => task.id === id); }
+  function agentName(id) { return id ? graphView.data?.agents?.[id] || name(id) : ''; }
+  function linkSentence(link, titleOf, agents) {
+    const needer = titleOf(link.target), needed = link.source === 'operator' ? 'you' : titleOf(link.source);
+    const who = link.agent ? (agents[link.agent] || name(link.agent)) + ' on “' + needer + '”' : '“' + needer + '”';
+    const what = link.kind === 'requirement' ? who + ' requires “' + needed + '” (' + link.detail + ')'
+      : link.kind === 'subscription' ? who + ' waits for “' + needed + '”: ' + link.detail
+      : who + ' waits for ' + link.detail;
+    return what + (link.met ? ' · met' : ' · not met');
+  }
+  function noteSentence(note, agents) {
+    const who = note.agent ? agents[note.agent] || name(note.agent) : 'Its contract';
+    return who + ' waits for ' + note.detail + (note.met ? ' (met)' : '');
+  }
+  function svgNode(tag, attributes = {}, children = []) {
+    const value = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    for (const [key, attribute] of Object.entries(attributes)) value.setAttribute(key, String(attribute));
+    for (const child of children) if (child) value.append(child);
+    return value;
+  }
+  function graphBanner(tone, parts) {
+    const banner = node('div', undefined, 'graph-banner ' + tone);
+    for (const part of parts) banner.append(part);
+    return banner;
+  }
+  function taskList(ids) {
+    const parts = [];
+    ids.forEach((id, index) => { if (index) parts.push(', '); parts.push(taskButton(id, taskTitle(id))); });
+    return parts;
+  }
+  function renderGraph() {
+    const value = graphView.data;
+    const signature = JSON.stringify([graphView.loadedAt, graphView.error, Boolean(graphView.load), taskStore.selectedTask,
+      data?.workers.map(w => [w.id, w.display_name]), retired.records.length]);
+    if (signature === graphView.signature) return;
+    graphView.signature = signature;
+    const banners = el('graph-banners'), canvas = el('graph-canvas'), notes = el('graph-notes');
+    banners.replaceChildren(); notes.replaceChildren();
+    el('graph-legend').replaceChildren();
+    if (!value) {
+      canvas.replaceChildren(node('p', graphView.error ? 'The dependency graph could not be loaded: ' + graphView.error : 'Loading the dependency graph…',
+        graphView.error ? 'request-error graph-empty' : 'graph-empty'));
+      el('graph-summary').textContent = '';
+      return;
+    }
+    const agents = value.agents || {}, titleOf = id => graphTask(id)?.title || taskTitle(id);
+    el('graph-summary').textContent = plural(value.tasks.length, 'task') + ' · ' + plural(value.counts.unmet, 'unmet link')
+      + ' of ' + value.counts.links.toLocaleString() + (graphView.error ? ' · refresh failed: ' + graphView.error : '');
+    for (const group of value.deadlocks) {
+      banners.append(graphBanner('bad', [node('strong', 'Deadlock: '), ...taskList(group),
+        ' need each other through unmet links, so none of them can go on. Revise a contract, or message a worker who waits.']));
+    }
+    if (value.waiting_on_operator.length) {
+      const open = node('button', 'Open the requests', 'link');
+      open.onclick = () => { el('tasks-dialog').close(); el('show-requests').click(); };
+      banners.append(graphBanner('attention', [plural(value.waiting_on_operator.length, 'task') + ' wait for your answer, directly or through other tasks: ',
+        ...taskList(value.waiting_on_operator), '. ', open]));
+    }
+    const legend = el('graph-legend');
+    legend.append(node('span', 'Arrows run from what is needed to what needs it.'));
+    for (const [kind, text] of [['', 'contract requirement'], ['subscription', 'subscription'], ['wait', 'wait for your answer'],
+      ['met', 'met'], ['deadlock', 'deadlock']]) {
+      const item = node('span'); item.append(node('span', undefined, 'swatch ' + kind), text); legend.append(item);
+    }
+    const edges = graphEdges(value.links, value.deadlocks);
+    const ids = [...new Set(edges.flatMap(edge => [edge.source, edge.target]))];
+    if (!ids.length) {
+      canvas.replaceChildren(node('p', value.counts.links ? 'Every link between open tasks is met. Show met links to see them.'
+        : 'No open task needs another task, and none waits for your answer.', 'graph-empty'));
+    } else {
+      const order = new Map(value.tasks.map((task, index) => [task.id, index]));
+      ids.sort((a, b) => (order.get(a) ?? -1) - (order.get(b) ?? -1));
+      const layout = layeredLayout(ids, edges);
+      const selected = ids.includes(taskStore.selectedTask) ? taskStore.selectedTask : null;
+      const near = selected ? graphNeighbours(edges, selected) : null;
+      const deadlocked = new Set(value.deadlocks.flat()), onYou = new Set(value.waiting_on_operator);
+      const drawing = node('div', undefined, 'graph');
+      drawing.style.width = layout.width + 'px'; drawing.style.height = layout.height + 'px';
+      const heads = ['plain', 'subscription', 'wait', 'met', 'deadlock'].map(kind => svgNode('marker', {
+        id: 'task-head-' + kind, viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse'},
+      [svgNode('path', {d: 'M0,0 L10,5 L0,10 z', class: 'head ' + kind})]));
+      const paths = edges.map(edge => {
+        const {d} = edgeRoute(edge, layout);
+        const focus = !selected ? '' : edge.source === selected || edge.target === selected ? ' focus' : ' dim';
+        const kind = edge.kind === 'requirement' ? '' : edge.kind;
+        const title = svgNode('title');
+        title.textContent = edge.links.map(link => linkSentence(link, titleOf, agents)).join('\n');
+        return svgNode('path', {d, class: 'edge ' + kind + focus, 'marker-end': 'url(#task-head-' + (kind || 'plain') + ')'}, [title]);
+      });
+      drawing.append(svgNode('svg', {width: layout.width, height: layout.height, 'aria-hidden': 'true'}, [svgNode('defs', {}, heads), ...paths]));
+      for (const id of ids) {
+        const position = layout.position.get(id);
+        const button = node('button', undefined, 'gnode');
+        button.style.left = position.x + 'px'; button.style.top = position.y + 'px';
+        button.style.width = GRAPH.nodeWidth + 'px'; button.style.height = GRAPH.nodeHeight + 'px';
+        if (id === 'operator') {
+          const asks = value.links.filter(link => link.source === 'operator' && !link.met).length;
+          button.classList.add('operator');
+          button.append(node('span', 'You', 'line title'), node('span', plural(asks, 'answer') + ' awaited', 'line'), node('span', 'Open the requests', 'line'));
+          button.onclick = () => { el('tasks-dialog').close(); el('show-requests').click(); };
+        } else {
+          const task = graphTask(id) || {id, title: taskTitle(id), state: 'ready', executors: []};
+          const state = taskOutlineState(task);
+          const first = node('span', undefined, 'line');
+          first.append(state.text + ' · ' + shortId(id) + (onYou.has(id) ? ' · waits on you' : ''));
+          const waiting = (value.notes || []).filter(note => note.task === id && !note.met).map(note => noteSentence(note, agents));
+          const third = waiting.length ? waiting.join('; ') : task.executors.length ? executorText(task.executors) : 'No executors';
+          button.append(first, node('span', task.title || 'Untitled task', 'line title'), node('span', third, 'line muted'));
+          button.title = (task.title || id) + '\n' + third;
+          button.onclick = () => showTask(id).catch(error => notice(error.message));
+          if (deadlocked.has(id)) button.classList.add('deadlock');
+          if (['done', 'retired'].includes(task.state)) button.classList.add('done');
+        }
+        if (id === selected) button.classList.add('selected');
+        else if (near && !near.has(id)) button.classList.add('dim');
+        drawing.append(button);
+      }
+      const scrollTop = canvas.scrollTop, scrollLeft = canvas.scrollLeft;
+      canvas.replaceChildren(drawing);
+      canvas.scrollTop = scrollTop; canvas.scrollLeft = scrollLeft;
+      if (selected && graphView.scrolledTo !== selected) {
+        graphView.scrolledTo = selected;
+        const position = layout.position.get(selected);
+        canvas.scrollLeft = Math.max(0, position.x - canvas.clientWidth / 2 + GRAPH.nodeWidth / 2);
+        canvas.scrollTop = Math.max(0, position.y - canvas.clientHeight / 2 + GRAPH.nodeHeight / 2);
+      }
+    }
+    const drawn = new Set(ids), inner = new Map();
+    for (const note of value.notes || []) {
+      if (note.met || drawn.has(note.task)) continue;
+      if (!inner.has(note.task)) inner.set(note.task, []);
+      inner.get(note.task).push(note);
+    }
+    if (inner.size) {
+      const section = node('section', undefined, 'graph-notes');
+      section.append(node('h3', 'Waits within a task'),
+        node('p', 'These waits involve no other task: a worker waits on its own submission, a decision, or a peer\'s answer.', 'muted'));
+      const list = node('ul', undefined, 'relation-list');
+      for (const [id, items] of inner) {
+        const entry = node('li');
+        entry.append(taskButton(id, titleOf(id)), node('span', items.map(note => noteSentence(note, agents)).join('; '), 'muted'));
+        list.append(entry);
+      }
+      section.append(list); notes.append(section);
+    }
+  }
+
   function renderTasks() {
-    const page = taskStore.page, loading = Boolean(taskStore.pageLoad), outlineMode = taskMode === 'outline';
-    el('tasks-outline').classList.toggle('active', outlineMode);
-    el('tasks-outline').setAttribute('aria-pressed', String(outlineMode));
-    el('task-outline').classList.toggle('hidden', !outlineMode);
-    el('task-table-view').classList.toggle('hidden', outlineMode);
+    const page = taskStore.page, loading = Boolean(taskStore.pageLoad);
+    for (const [mode, button, view] of [['outline', 'tasks-outline', 'task-outline-view'], ['graph', 'tasks-graph', 'task-graph-view']]) {
+      el(button).classList.toggle('active', taskMode === mode);
+      el(button).setAttribute('aria-pressed', String(taskMode === mode));
+      el(view).classList.toggle('hidden', taskMode !== mode);
+    }
+    el('task-table-view').classList.toggle('hidden', taskMode !== 'list');
+    el('tasks-dialog').classList.toggle('graph-mode', taskMode === 'graph');
     const viewNames = {all: 'All', running: 'Running', pool: 'Task pool', history: 'History'};
     for (const [view, title] of Object.entries(viewNames)) {
-      const button = el('tasks-' + view);
-      button.textContent = title + ' (' + taskStore.counts[view] + ')';
-      button.classList.toggle('active', !outlineMode && taskStore.view === view);
-      button.setAttribute('aria-pressed', String(!outlineMode && taskStore.view === view));
+      const button = el('tasks-' + view), count = taskStore.counts[view];
+      button.textContent = title + (count === null || count === undefined ? '' : ' (' + count.toLocaleString() + ')');
+      button.classList.toggle('active', taskMode === 'list' && taskStore.view === view);
+      button.setAttribute('aria-pressed', String(taskMode === 'list' && taskStore.view === view));
     }
-    if (outlineMode) {
-      el('task-view-description').textContent = 'Progress at a glance: Task 0 first, every task once, and reviews under the task they review.';
+    renderTotals();
+    if (taskMode === 'outline') {
+      el('task-view-description').textContent = 'Each work task under the task it was published from, Task 0 first; a repair under the task it repairs. Reviews are counted on their task.';
       renderOutline();
       return;
     }
+    if (taskMode === 'graph') {
+      el('task-view-description').textContent = 'Open tasks that need other tasks: contract requirements, and workers waiting on another task or on your answer. Select a task to bring out its neighbours.';
+      renderGraph();
+      return;
+    }
+    const kinds = {work: 'work tasks', review: 'reviews', both: 'tasks'}[taskStore.kind];
     el('task-view-description').textContent = {
-      all: 'Every task, including unfinished and historical work.',
+      all: 'Every ' + (taskStore.kind === 'review' ? 'review' : taskStore.kind === 'work' ? 'work task' : 'task') + ', unfinished and finished.',
       running: 'Tasks with a worker executing or finishing task work.',
       pool: 'Tasks with an available execution opportunity, in the order TaskHub takes them: reviews, then pinned tasks, then by priority (0 first) and the earliest published. A running task may also be recruiting.',
       history: 'Completed and retired tasks.'
     }[taskStore.view];
+    el('task-kind').value = taskStore.kind; el('task-sort').value = taskStore.sort;
+    el('task-sort').disabled = taskStore.view === 'pool';
     const start = page?.items.length ? page.offset + 1 : 0;
-    el('task-count').textContent = page ? start + '–' + (page.offset + page.items.length) + ' of ' + page.total + ' tasks' : 'Loading tasks…';
+    el('task-count').textContent = page ? start.toLocaleString() + '–' + (page.offset + page.items.length).toLocaleString() + ' of '
+      + page.total.toLocaleString() + ' ' + kinds : 'Loading tasks…';
+    el('task-newer').classList.toggle('hidden', !page?.newer);
+    el('task-newer').textContent = page?.newer ? plural(page.newer, 'newer task') + ' · Show' : '';
     el('task-list-state').textContent = taskStore.error ? 'Tasks could not be refreshed: ' + taskStore.error
       : loading && !page ? 'Loading tasks…' : '';
     el('task-retry').classList.toggle('hidden', !taskStore.error);
     el('task-previous').disabled = !page || taskStore.offset === 0;
     el('task-next').disabled = !page?.has_more;
-    const signature = JSON.stringify([taskStore.view, taskStore.query, taskStore.offset, taskStore.selectedTask,
+    const pages = page ? Math.max(1, Math.ceil(page.total / taskStore.limit)) : 1, current = Math.floor(taskStore.offset / taskStore.limit) + 1;
+    el('task-page-label').textContent = page ? 'Page ' + current.toLocaleString() + ' of ' + pages.toLocaleString() : '';
+    el('task-page').max = String(pages);
+    if (document.activeElement !== el('task-page')) el('task-page').value = page ? String(current) : '';
+    const signature = JSON.stringify([taskStore.view, taskStore.kind, taskStore.sort, taskStore.query, taskStore.offset, taskStore.selectedTask,
       page?.items, Boolean(taskStore.error), data?.workers.map(w => [w.id, w.display_name]), retired.records.length]);
     if (signature === taskSignature) return;
     taskSignature = signature;
-    const list = el('task-list'), top = el('tasks-body').scrollTop;
+    const list = el('task-list'), pane = el('task-list-pane'), top = pane.scrollTop;
     list.replaceChildren();
     for (const task of page?.items || []) {
-      const contract = task.contract || task;
+      const contract = task.contract || task, review = contract.kind === 'review';
       const row = node('tr', undefined, task.id === taskStore.selectedTask ? 'selected-task' : '');
-      const title = node('td'), result = node('td');
+      const title = node('td'), state = node('td'), members = node('td'), reviews = node('td'), published = node('td');
       const open = taskButton(task.id, contract.title || 'Untitled task');
-      open.setAttribute('aria-pressed', String(task.id === taskStore.selectedTask));
+      open.setAttribute('aria-current', String(task.id === taskStore.selectedTask));
+      const meta = [shortId(task.id)];
+      if (review) meta.push('review');
+      if (task.revision > 1) meta.push('revision ' + task.revision);
       const place = admissionLabel(task);
-      title.append(open, node('div', 'Revision ' + task.revision + (place ? ' · ' + place : ''), 'muted'));
-      result.append(node('div', reviewResult(task)));
-      if (place && task.admission.pinned_at) result.append(node('span', 'Pinned', 'badge'));
-      if (task.running) result.append(node('span', 'Running', 'badge'));
+      // Priority 1 is every contract's default: only another one, or the operator's, is news.
+      if (place && (task.admission.priority !== 1 || task.admission.operator_priority !== null)) meta.push(place);
+      title.append(open, node('span', meta.join(' · '), 'task-meta'));
+      const cell = node('div', undefined, 'task-state-cell');
+      cell.append(stateChip(task));
+      if (place && task.admission.pinned_at) cell.append(chip('Pinned', 'active'));
+      if (task.running && !['done', 'retired'].includes(task.state)) cell.append(chip('Running', 'active'));
+      state.append(cell);
       if (task.pool_opportunity) {
-        const opportunity = task.pool_opportunity;
-        result.append(node('div', opportunity.opportunity === 'collaborator' ? 'Collaborator opportunity'
-          : opportunity.opportunity === 'review' ? 'Review opportunity' : 'Initial executor opportunity', 'muted'));
-        if (opportunity.invitation) result.append(node('div', opportunity.invitation, 'small'));
+        const opportunity = task.pool_opportunity, line = node('span', undefined, 'task-opportunity');
+        line.append(opportunity.opportunity === 'collaborator' ? 'Open to a collaborator'
+          : opportunity.opportunity === 'review' ? 'Needs a reviewer' : 'Needs an executor');
+        if (opportunity.invitation) {
+          const invitation = node('details'); invitation.dataset.key = 'invitation:' + task.id;
+          invitation.append(node('summary', 'Invitation'), node('div', opportunity.invitation, 'small'));
+          line.append(invitation);
+        }
+        state.append(line);
       }
-      const kind = node('td', contract.kind || 'Work'); kind.dataset.label = 'Kind';
-      result.dataset.label = 'State / result';
-      const members = node('td'); members.dataset.label = 'Members'; members.append(taskMembers(task));
-      row.append(title, kind, result, members); list.append(row);
+      members.append(taskMembers(task));
+      reviews.textContent = review ? '—' : reviewSummary(task.reviews) || '—';
+      published.textContent = shortDate(task.created_at);
+      published.title = dateLabel(task.created_at);
+      state.dataset.label = 'State'; members.dataset.label = 'Executors'; reviews.dataset.label = 'Reviews'; published.dataset.label = 'Published';
+      row.append(title, state, members, reviews, published); list.append(row);
     }
     if (!list.children.length) {
-      const row = node('tr'), cell = node('td', page ? 'No tasks match this view and search.' : taskStore.error ? 'Task list unavailable.' : 'Loading tasks…', 'muted');
-      cell.colSpan = 4; row.append(cell); list.append(row);
+      const row = node('tr'), cell = node('td', page ? 'No ' + kinds + ' match this view and search.' : taskStore.error ? 'Task list unavailable.' : 'Loading tasks…', 'muted empty-cell');
+      cell.colSpan = 5; row.append(cell); list.append(row);
     }
-    el('tasks-body').scrollTop = top;
+    pane.scrollTop = top;
   }
   async function showTask(id) {
     openTasks();
+    el('tasks-dialog').classList.add('detail-open');
     const changed = taskStore.selectedTask !== id;
     const pending = taskStore.selectTask(id);
-    if (changed) el('task-detail').scrollIntoView({block: 'nearest'});
+    if (changed) el('task-detail-pane').scrollTop = 0;
     await pending;
   }
   function openTasks() {
@@ -2083,16 +2656,188 @@ if (typeof document !== 'undefined') {
     taskStore.setOpen(true);
     renderTasks(); renderTaskDetail();
     taskStore.loadPage().catch(() => {});
-    loadOutline();
+    loadOutline(); loadGraph();
+  }
+  function inlineNodes(spans) {
+    return spans.map(span => {
+      if (span.type === 'text') return document.createTextNode(span.text);
+      if (span.type === 'link') {
+        const link = node('a', span.text); link.href = span.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
+        return link;
+      }
+      return node({code: 'code', strong: 'strong', em: 'em'}[span.type], span.text);
+    });
+  }
+  function markdown(text) {
+    const root = node('div', undefined, 'markdown');
+    for (const block of markdownBlocks(text)) {
+      if (block.type === 'heading') { const heading = node('h' + Math.min(6, block.level + 2)); heading.append(...inlineNodes(block.inline)); root.append(heading); }
+      else if (block.type === 'paragraph') { const paragraph = node('p'); paragraph.append(...inlineNodes(block.inline)); root.append(paragraph); }
+      else if (block.type === 'quote') { const quote = node('blockquote'); quote.append(...inlineNodes(block.inline)); root.append(quote); }
+      else if (block.type === 'code') { const pre = node('pre'); pre.append(node('code', block.text)); root.append(pre); }
+      else if (block.type === 'rule') root.append(node('hr'));
+      else if (block.type === 'list') {
+        const list = node(block.ordered ? 'ol' : 'ul');
+        for (const item of block.items) { const entry = node('li'); entry.append(...inlineNodes(item)); list.append(entry); }
+        root.append(list);
+      }
+    }
+    return root;
+  }
+  function markdownDisclosure(title, text, key) {
+    const group = node('details'); group.dataset.key = key;
+    group.append(node('summary', title));
+    let loaded = false;
+    group.addEventListener('toggle', () => { if (group.open && !loaded) { loaded = true; group.append(markdown(text)); } });
+    return group;
+  }
+  function relationTask(relations, id) {
+    if (id === 'operator') return node('strong', 'you');
+    return taskButton(id, relations.tasks?.[id]?.title || taskTitle(id));
+  }
+  function relationLinks(relations, title, links, other) {
+    if (!links.length) return null;
+    const section = node('div'), list = node('ul', undefined, 'relation-list');
+    section.append(node('div', title, 'eyebrow'));
+    for (const link of links) {
+      const item = node('li'), body = node('div'), who = link.agent ? relations.agents?.[link.agent] || name(link.agent) : '';
+      body.append(relationTask(relations, other(link)));
+      const kind = link.kind === 'requirement' ? 'contract requirement' : link.kind === 'subscription' ? 'subscription of ' + who : 'wait of ' + who;
+      const state = other(link) === 'operator' ? '' : relations.tasks?.[other(link)]?.state;
+      body.append(node('span', kind + (link.met ? ' · met' : ' · not met') + (state ? ' · task ' + label(state).toLowerCase() : '')
+        + (link.detail ? ' — ' + link.detail : ''), 'muted'));
+      item.append(node('span', link.met ? '✓' : '○', 'relation-mark ' + (link.met ? 'met' : 'unmet')), body);
+      list.append(item);
+    }
+    section.append(list);
+    return section;
+  }
+  function relationsSection(view, id) {
+    const box = node('section', undefined, 'detail-section'), relations = view.relations;
+    box.append(node('h4', 'Relations'));
+    if (!relations) {
+      box.append(node('p', view.relationsError ? 'Relations could not be loaded: ' + view.relationsError : 'Loading relations…',
+        view.relationsError ? 'request-error' : 'muted'));
+      return box;
+    }
+    const origin = node('p');
+    if (relations.host) origin.append('Reviews ', relationTask(relations, relations.host.id), '.');
+    else if (relations.parent) {
+      origin.append(relations.relation === 'repair' ? 'Repairs the evidence of ' : 'Published from ', relationTask(relations, relations.parent.id));
+      if (relations.publisher && relations.relation !== 'repair') origin.append(' by ', workerButton(relations.publisher.worker_id, relations.publisher.display_name));
+      origin.append('.');
+    } else if (relations.publisher) origin.append('Published by ', workerButton(relations.publisher.worker_id, relations.publisher.display_name), ' outside a task.');
+    else origin.append('A top-level task: published by you or by the system.');
+    box.append(origin);
+    for (const group of relations.deadlocks || []) {
+      box.append(graphBanner('bad', [node('strong', 'Deadlock: '), ...taskList(group), ' need each other through unmet links.']));
+    }
+    const needs = relationLinks(relations, 'Needs', relations.needs, link => link.source);
+    const neededBy = relationLinks(relations, 'Needed by', relations.needed_by, link => link.target);
+    if (needs) box.append(needs);
+    if (neededBy) box.append(neededBy);
+    if (relations.notes?.length) {
+      const waits = node('div'), list = node('ul', undefined, 'relation-list');
+      waits.append(node('div', 'Waits within this task', 'eyebrow'));
+      for (const note of relations.notes) {
+        const item = node('li');
+        item.append(node('span', note.met ? '✓' : '○', 'relation-mark ' + (note.met ? 'met' : 'unmet')), noteSentence(note, relations.agents || {}));
+        list.append(item);
+      }
+      waits.append(list); box.append(waits);
+    }
+    if (!needs && !neededBy && !relations.notes?.length) box.append(node('p', 'It needs no other task, and no task needs it.', 'muted'));
+    if (relations.children.total) {
+      const group = node('details'); group.dataset.key = 'published-here';
+      group.append(node('summary', 'Published from this task · ' + relations.children.total.toLocaleString()));
+      const list = node('ul', undefined, 'relation-list');
+      for (const child of relations.children.items) {
+        const item = node('li');
+        item.append(taskButton(child.id, child.title || 'Untitled task'), ' ', chip(label(child.state), ['done', 'retired'].includes(child.state) ? 'done' : 'idle'));
+        if (child.relation === 'repair') item.append(' ', chip('Repair', 'bad'));
+        list.append(item);
+      }
+      if (relations.children.total > relations.children.items.length) {
+        list.append(node('li', 'The first ' + relations.children.items.length + ' are listed; find the rest in the overview.', 'muted'));
+      }
+      group.append(list); box.append(group);
+    }
+    if (relations.reviews.counts.total) {
+      const group = node('details'); group.dataset.key = 'reviews-of-task';
+      group.append(node('summary', reviewSummary(relations.reviews.counts)));
+      const list = node('ul', undefined, 'relation-list');
+      for (const review of relations.reviews.items) {
+        const item = node('li');
+        const verdict = review.verdict === 'approve' ? chip('Approved', 'done') : review.verdict === 'request_changes' ? chip('Changes requested', 'attention')
+          : ['pending', 'integrating'].includes(review.state) ? chip(review.state === 'pending' ? 'Open' : 'Integrating', 'active') : chip(label(review.state), 'idle');
+        item.append(taskButton(review.id, review.reviewer_name ? 'Review by ' + review.reviewer_name : 'Review ' + shortId(review.id)), ' ', verdict,
+          node('span', dateLabel(review.created_at), 'muted'));
+        list.append(item);
+      }
+      group.append(list); box.append(group);
+    }
+    return box;
+  }
+  // Workers that left the task, and the operator's invitation back (task.invite_back). The draft
+  // and the outcome belong to the task and worker they were written for.
+  const inviteState = {task: null, worker: null, draft: '', busy: false, note: '', error: ''};
+  function departedMembers(task, departed) {
+    const box = node('div', undefined, 'departed-members'), list = node('ul', undefined, 'relation-list');
+    box.append(node('div', 'Left this task', 'eyebrow'));
+    const open = !['done', 'retired'].includes(task.state) && task.contract?.kind !== 'review';
+    for (const member of departed) {
+      const item = node('li'), body = node('div'), mine = inviteState.task === task.id && inviteState.worker === member.worker_id;
+      body.append(workerButton(member.worker_id));
+      if (member.work_reason) body.append(node('span', 'Left: ' + member.work_reason, 'muted'));
+      if (open && !mine) {
+        const invite = node('button', 'Invite back', 'small');
+        invite.onclick = () => { Object.assign(inviteState, {task: task.id, worker: member.worker_id, draft: '', note: '', error: ''}); taskDetailSignature = ''; renderTaskDetail(); };
+        body.append(invite);
+      }
+      if (mine && (inviteState.note || inviteState.error) && !inviteState.draft && !inviteState.busy) {
+        body.append(node('span', inviteState.error || inviteState.note, inviteState.error ? 'request-error' : 'muted'));
+      } else if (mine && open) {
+        const form = node('form', undefined, 'invite-form'), text = document.createElement('textarea');
+        text.id = 'invite-reason'; text.rows = 3; text.maxLength = 4000; text.value = inviteState.draft;
+        text.placeholder = 'Why ' + name(member.worker_id) + ' is needed again (it reads this)';
+        text.setAttribute('aria-label', 'Reason to invite ' + name(member.worker_id) + ' back');
+        text.oninput = () => { inviteState.draft = text.value; send.disabled = inviteState.busy || !text.value.trim(); };
+        const send = node('button', inviteState.busy ? 'Inviting…' : 'Invite back', 'small primary'), cancel = node('button', 'Cancel', 'small');
+        send.type = 'submit'; cancel.type = 'button';
+        send.disabled = inviteState.busy || !inviteState.draft.trim();
+        cancel.onclick = () => { Object.assign(inviteState, {task: null, worker: null, draft: ''}); taskDetailSignature = ''; renderTaskDetail(); };
+        form.onsubmit = event => { event.preventDefault(); void inviteBack(task.id, member.worker_id); };
+        const actions = node('div', undefined, 'row'); actions.append(send, cancel);
+        form.append(text, actions);
+        if (inviteState.error) form.append(node('p', inviteState.error, 'request-error'));
+        body.append(form);
+      }
+      item.append(node('span', '↩', 'relation-mark'), body);
+      list.append(item);
+    }
+    box.append(list);
+    return box;
+  }
+  async function inviteBack(taskId, workerId) {
+    Object.assign(inviteState, {busy: true, error: '', note: ''});
+    taskDetailSignature = ''; renderTaskDetail();
+    try {
+      await command('task.invite_back', {task_id: taskId, worker_id: workerId, reason: inviteState.draft.trim()});
+      Object.assign(inviteState, {draft: '', note: name(workerId) + ' is a member again and resumes this task in its next turn.'});
+    } catch (error) { inviteState.error = error.message; }
+    inviteState.busy = false;
+    await taskStore.reload();
+    taskDetailSignature = ''; renderTaskDetail();
   }
   function renderTaskDetail() {
     const view = taskStore.detail(), detail = el('task-detail'), id = taskStore.selectedTask;
+    el('task-detail-empty').classList.toggle('hidden', Boolean(view));
     if (!view) { detail.classList.add('hidden'); return; }
     detail.classList.remove('hidden');
     const task = view.current, pinned = view.selectedRevision !== null;
     const record = pinned ? view.history.get(view.selectedRevision) : task;
     const signature = JSON.stringify([id, task, view.selectedRevision, record, view.revisions, view.revisionOffset,
-      view.currentError, view.historicalError, view.revisionsError, admissionState,
+      view.currentError, view.historicalError, view.revisionsError, admissionState, view.relations, view.relationsError,
       Boolean(view.historicalLoad), Boolean(view.revisionsLoad), data?.workers.map(w => [w.id, w.display_name]), retired.records.length]);
     if (signature === taskDetailSignature) return;
     taskDetailSignature = signature;
@@ -2100,20 +2845,51 @@ if (typeof document !== 'undefined') {
     const render = () => {
       detail.dataset.task = id;
       detail.replaceChildren();
-      const contract = record?.contract;
-      detail.append(node('div', pinned ? 'Frozen contract · revision ' + view.selectedRevision
-        : 'Current contract' + (task ? ' · revision ' + task.revision : ''), 'eyebrow'));
+      const contract = record?.contract, review = (contract || task?.contract)?.kind === 'review';
+      detail.append(node('div', (review ? 'Review' : 'Work task') + ' · ' + shortId(id)
+        + (pinned ? ' · contract frozen at revision ' + view.selectedRevision : ''), 'eyebrow'));
       detail.append(node('h3', contract?.title || taskTitle(id)));
       if (task) {
-        detail.append(node('p', 'Current status: ' + reviewResult(task) + ' · Current revision ' + task.current_revision, 'muted'));
-        if (pinned) detail.append(node('p', 'The contract below is frozen at the selected revision. Execution, members, and evidence show the current state.', 'muted'));
-        if (admissionLabel(task)) detail.append(admissionControls(task));
+        const head = node('div', undefined, 'detail-head');
+        head.append(stateChip(task));
+        if (task.running && !['done', 'retired'].includes(task.state)) head.append(chip('Running', 'active'));
+        if (task.admission?.pinned_at && admissionLabel(task)) head.append(chip('Pinned', 'active'));
+        if (task.current_revision > 1 || pinned) head.append(node('span', 'Revision ' + (pinned ? view.selectedRevision + ' of ' : '') + task.current_revision, 'muted'));
+        detail.append(head, taskMembers(task));
+        const departed = (task.collaboration?.members || []).filter(member => member.executor && member.membership_state === 'left');
+        if (departed.length) detail.append(departedMembers(task, departed));
+        if (inviteState.task === task.id && inviteState.note && !departed.some(member => member.worker_id === inviteState.worker)) {
+          detail.append(node('p', inviteState.note, 'muted'));  // It returned: its row has moved to the executors.
+        }
+        if (pinned) detail.append(node('p', 'The contract below is frozen at the selected revision. Execution, members, relations and evidence show the current state.', 'muted'));
       }
       if (view.currentError || view.historicalError) {
         detail.append(node('p', 'Task details could not be refreshed: ' + (view.historicalError || view.currentError), 'request-error'));
         const retry = node('button', 'Retry task details');
         retry.onclick = () => taskStore.selectTask(id);
         detail.append(retry);
+      }
+      if (task) detail.append(relationsSection(view, id));
+      if (contract) {
+        const objective = node('section', undefined, 'detail-section');
+        objective.append(node('h4', 'Objective'), markdown(contract.objective || ''));
+        if (contract.context) objective.append(markdownDisclosure('Task context', contract.context, 'task-context'));
+        if (contract.constraints?.length) objective.append(disclosure('Acceptance constraints', contract.constraints, 'constraints'));
+        if (contract.requirements?.length) objective.append(disclosure('Requirements', contract.requirements, 'requirements'));
+        detail.append(objective);
+      } else if (!view.historicalError && !view.currentError) detail.append(node('p', 'Loading contract…', 'muted'));
+      if (task) {
+        const execution = node('section', undefined, 'detail-section');
+        execution.append(node('h4', 'Evidence'));
+        if (task.current_evidence?.state === 'invalid') {
+          execution.append(node('p', 'Historical completion is retained. Its current evidence is no longer valid; the linked repair work has a separate lifecycle.'));
+          const repairs = new Set((task.current_evidence.invalidations || []).map(item => item.repair_task_id).filter(Boolean));
+          for (const repair of repairs) execution.append(taskButton(repair, 'Repair: ' + taskTitle(repair)));
+          execution.append(disclosure('Invalidated evidence', task.current_evidence.invalidations || [], 'invalidated-evidence'));
+        } else execution.append(node('p', task.state === 'done' ? 'Completed; its evidence is current.' : 'No completion yet.', 'muted'));
+        if (task.repair_of?.task_id) execution.append(taskButton(task.repair_of.task_id, 'Original task: ' + taskTitle(task.repair_of.task_id)));
+        detail.append(execution);
+        if (admissionLabel(task)) detail.append(admissionControls(task));
       }
       const revisions = node('details'); revisions.dataset.key = 'task-revisions';
       revisions.append(node('summary', 'Contract revisions' + (view.revisions ? ' · ' + view.revisions.total : '')));
@@ -2144,28 +2920,19 @@ if (typeof document !== 'undefined') {
         const retry = node('button', 'Retry revisions');
         retry.onclick = () => taskStore.loadRevisions(id).catch(() => {}); pager.append(retry);
       } else if (view.revisionsLoad) pager.append(node('span', 'Loading revisions…', 'muted'));
-      revisions.append(pager); detail.append(revisions);
-      if (contract) {
-        detail.append(node('pre', contract.objective || ''));
-        if (contract.context) detail.append(disclosure('Task context', contract.context, 'task-context'));
-        if (contract.constraints?.length) detail.append(disclosure('Acceptance constraints', contract.constraints, 'constraints'));
-        if (contract.requirements?.length) detail.append(disclosure('Requirements', contract.requirements, 'requirements'));
-        detail.append(disclosure(pinned ? 'Frozen contract · technical details' : 'Contract · technical details',
-          {revision: record.revision, contract_hash: record.contract_hash, contract}, 'task-contract'));
-      } else if (!view.historicalError && !view.currentError) detail.append(node('p', 'Loading contract…', 'muted'));
-      if (!task) return;
-      detail.append(node('h4', 'Current execution and evidence'), taskMembers(task));
-      if (task.current_evidence?.state === 'invalid') {
-        detail.append(node('p', 'Historical completion is retained. Its current evidence is no longer valid; the linked repair work has a separate lifecycle.'));
-        const repairs = new Set((task.current_evidence.invalidations || []).map(item => item.repair_task_id).filter(Boolean));
-        for (const repair of repairs) detail.append(taskButton(repair, 'Repair: ' + taskTitle(repair)));
-        detail.append(disclosure('Invalidated evidence', task.current_evidence.invalidations || [], 'invalidated-evidence'));
-      }
-      if (task.repair_of?.task_id) detail.append(taskButton(task.repair_of.task_id, 'Original task: ' + taskTitle(task.repair_of.task_id)));
-      detail.append(disclosure('Current task record · technical details', task, 'task-record'));
+      revisions.append(pager);
+      const technical = node('section', undefined, 'detail-section');
+      technical.append(node('h4', 'History and records'), revisions);
+      if (contract) technical.append(disclosure(pinned ? 'Frozen contract · technical details' : 'Contract · technical details',
+        {revision: record.revision, contract_hash: record.contract_hash, contract}, 'task-contract'));
+      if (task) technical.append(disclosure('Current task record · technical details', task, 'task-record'));
+      detail.append(technical);
     };
-    if (sameTask) preserveDisclosures(detail, render, el('tasks-body'));
+    // A refresh while the operator types an invitation keeps the text and the cursor.
+    const typing = document.activeElement?.id === 'invite-reason' ? document.activeElement.selectionStart : null;
+    if (sameTask) preserveDisclosures(detail, render, el('task-detail-pane'));
     else render();
+    if (typing !== null && el('invite-reason')) { el('invite-reason').focus(); el('invite-reason').setSelectionRange(typing, typing); }
   }
   // The operator's place for a task in admission: its priority, and a pin to the top. Neither
   // revises the task. The note or error belongs to the task it was set for.
@@ -2241,8 +3008,8 @@ if (typeof document !== 'undefined') {
     const busy = Boolean(setupStore.submission || setupStore.driveLoad);
     el('setup-summary').textContent = !snapshot ? 'Loading project status…' : !configurable
       ? snapshot.reason || 'Project setup is read-only. Use the existing task and run controls.'
-      : snapshot.task ? 'Task 0 is ready. Choose the model and effort to start the project.'
-      : 'Describe the goal for Task 0 and choose the model and effort for the project.';
+      : snapshot.task ? 'Task 0 is ready. Choose the agents\' models and sessions below, then Start.'
+      : 'Describe the goal for Task 0, choose the agents\' models and sessions below, then Start.';
     el('setup-repository').textContent = !snapshot ? '' : snapshot.repository.enabled
       ? snapshot.repository.initialized ? 'Workers use this project\'s local managed Git repository.'
         : 'Starting will initialize a local managed Git repository in this project\'s folder.'
@@ -2253,18 +3020,11 @@ if (typeof document !== 'undefined') {
     goal.readOnly = !editable || Boolean(snapshot?.task);
     el('setup-goal-help').textContent = snapshot?.task ? 'Saved Task 0 goal · revision ' + snapshot.task.revision
       : setupStore.goal.length.toLocaleString() + ' / 20,000 characters.';
-    const models = catalog?.models || [];
-    setupOptions(el('setup-model'), configurable && catalog ? models : setupStore.model ? [{id: setupStore.model,
-      name: models.find(model => model.id === setupStore.model)?.name || setupStore.model}] : [],
-    setupStore.model, configurable ? setupStore.modelsLoad ? 'Loading models…' : 'Choose a model' : 'Project default');
-    setupOptions(el('setup-effort'), configurable && catalog ? selectedModel?.efforts || []
-      : setupStore.effort ? [{id: setupStore.effort}] : [], setupStore.effort, 'Choose an effort');
-    el('setup-model').disabled = !editable || !catalog || Boolean(setupStore.modelsLoad || setupStore.modelsError || catalog.authentication_required);
-    el('setup-effort').disabled = el('setup-model').disabled || !selectedModel;
-    el('setup-model-description').textContent = selectedModel?.description || '';
-    el('setup-effort-description').textContent = selectedModel?.efforts.find(effort => effort.id === setupStore.effort)?.description || '';
+    // The model and effort are chosen in Agents and sessions, on its Worker · Codex row.
+    const described = [selectedModel?.description,
+      selectedModel?.efforts.find(effort => effort.id === setupStore.effort)?.description].filter(Boolean).join(' · ');
     el('setup-model-state').textContent = configurable ? setupStore.modelsLoad ? 'Loading models from the configured worker profile…'
-      : setupStore.selectionIssue : '';
+      : setupStore.selectionIssue ? 'Worker · Codex: ' + setupStore.selectionIssue : described : '';
     el('setup-error').textContent = [setupStore.stateError && 'Project status could not be refreshed: ' + setupStore.stateError,
       setupStore.modelsError && 'Models could not be loaded: ' + setupStore.modelsError,
       setupStore.submitError, setupStore.driveError].filter(Boolean).join('\n');
@@ -2283,6 +3043,7 @@ if (typeof document !== 'undefined') {
     el('setup-drive').classList.toggle('hidden', !snapshot?.can_drive && !setupStore.driveLoad);
     el('setup-drive').disabled = !setupStore.canDrive || busy;
     el('setup-drive').textContent = setupStore.driveLoad ? 'Starting…' : 'Start prepared run';
+    renderAgentSettings();  // Before the first run, its Worker · Codex row is this choice.
   }
 
   // Choices for conversations that begin later and each account's session limit. Read when
@@ -2309,29 +3070,51 @@ if (typeof document !== 'undefined') {
   function codexEfforts(model) {
     return (agents.catalog?.models.find(item => item.id === model)?.efforts || []).map(effort => ({id: effort.id}));
   }
+  // Before the first run (Project setup can still configure it), the Worker · Codex row is the
+  // project's own model and effort, which Start saves in project.toml.
+  function settingUp() { return Boolean(setupStore.snapshot?.can_configure); }
+  function renderSetupChoice() {
+    if (!settingUp()) return;
+    const catalog = setupStore.catalog, selected = setupStore.selectedModel();
+    const model = el('agent-worker-codex-model'), effort = el('agent-worker-codex-effort');
+    setupOptions(model, catalog ? catalog.models : setupStore.model ? [{id: setupStore.model}] : [], setupStore.model,
+      setupStore.modelsLoad ? 'Loading models…' : 'Choose a model');
+    setupOptions(effort, selected?.efforts || [], setupStore.effort, 'Choose an effort');
+    model.disabled = !setupStore.editable || !catalog
+      || Boolean(setupStore.modelsLoad || setupStore.modelsError || catalog.authentication_required);
+    effort.disabled = model.disabled || !selected;
+  }
   function renderAgentSettings() {
-    const section = el('agent-settings'), visible = Boolean(data?.runs?.length);
+    const setup = settingUp(), section = el('agent-settings'), visible = Boolean(data?.runs?.length) || setup;
     section.classList.toggle('hidden', !visible);
     if (!visible || !el('setup-dialog').open) return;
     const status = agents.status, draft = agents.draft, ready = Boolean(status && draft) && !agents.saving;
     for (const control of section.querySelectorAll('select, input')) control.disabled = !ready;
+    el('agent-settings-setup').classList.toggle('hidden', !setup);
+    // No worker exists yet to keep earlier choices.
+    for (const [role, backend] of AGENT_ROWS) el('agent-' + role + '-' + backend + '-existing-row').classList.toggle('hidden', setup);
+    renderSetupChoice();
     el('agent-settings-save').disabled = !ready;
     el('agent-settings-reload').disabled = Boolean(agents.load || agents.saving);
     el('agent-settings-state').textContent = agents.load ? 'Loading…' : agents.saving ? 'Saving…' : agents.state
       || (agents.catalog?.error ? 'The Codex model list is unavailable (' + agents.catalog.error + '); current choices are shown.' : '');
     el('agent-settings-error').textContent = agents.error;
+    // Each role's model and effort, and the answer deadline: a run starts only once all are chosen.
+    const missing = status?.missing_choices || [];
+    el('agent-settings-missing').textContent = missing.length ? 'Still to choose before a run starts: ' + missing.join('; ') + '.' : '';
     if (!status || !draft) return;
     el('agent-next-backend').value = draft.nextBackend;
     el('agent-next-source').textContent = {operator: 'your choice', plan: 'from the assignment plan', config: 'project default'}[status.new_worker_source] || '';
     const catalog = (agents.catalog?.models || []).map(model => ({id: model.id, name: model.name || model.id}));
-    for (const key of ['worker_codex', 'review_codex']) {
+    for (const key of ['worker_codex', 'review_codex', 'integrator_codex']) {
+      if (setup && key === 'worker_codex') continue;  // Project setup's choice (renderSetupChoice).
       const value = draft.models[key], prefix = 'agent-' + key.replace('_', '-');
-      agentOptions(el(prefix + '-model'), catalog, value.model, 'Project default');
-      agentOptions(el(prefix + '-effort'), codexEfforts(value.model), value.effort, 'Project default');
+      agentOptions(el(prefix + '-model'), catalog, value.model, 'Choose a model');
+      agentOptions(el(prefix + '-effort'), codexEfforts(value.model), value.effort, 'Choose an effort');
     }
     const claude = draft.models.worker_claude;
     if (el('agent-worker-claude-model').value !== claude.model) el('agent-worker-claude-model').value = claude.model;
-    agentOptions(el('agent-worker-claude-effort'), CLAUDE_EFFORTS.map(id => ({id})), claude.effort, 'Project default');
+    agentOptions(el('agent-worker-claude-effort'), CLAUDE_EFFORTS.map(id => ({id})), claude.effort, 'Choose an effort');
     for (const [role, backend] of AGENT_ROWS) {
       const prefix = 'agent-' + role + '-' + backend, kept = status.role_models?.[role]?.[backend]?.kept_by_existing || 0;
       el(prefix + '-existing').checked = draft.models[role + '_' + backend].existing;
@@ -2340,6 +3123,12 @@ if (typeof document !== 'undefined') {
     agentOptions(el('agent-dispatcher-model'), catalog, draft.dispatcher.model, 'Choose a model');
     agentOptions(el('agent-dispatcher-effort'), codexEfforts(draft.dispatcher.model).filter(effort => CLAUDE_EFFORTS.includes(effort.id)),
       draft.dispatcher.effort, 'Choose an effort');
+    agentOptions(el('agent-waker-model'), catalog, draft.waker.model, 'Choose a model');
+    agentOptions(el('agent-waker-effort'), codexEfforts(draft.waker.model).filter(effort => CLAUDE_EFFORTS.includes(effort.id)),
+      draft.waker.effort, 'Choose an effort');
+    const deadline = el('agent-answer-deadline');
+    if (deadline.value !== draft.deadline) deadline.value = draft.deadline;
+    el('agent-answer-deadline-source').textContent = {operator: 'your choice', config: 'project.toml'}[status.answer_deadline?.source] || 'not chosen';
     for (const backend of ['codex', 'claude']) {
       const input = el('agent-sessions-' + backend), session = status.sessions?.[backend] || {};
       if (input.value !== draft.sessions[backend]) input.value = draft.sessions[backend];
@@ -2482,11 +3271,18 @@ if (typeof document !== 'undefined') {
     if (!agents.draft) return;
     change(agents.draft); agents.state = ''; agents.error = ''; renderAgentSettings();
   }
-  async function saveAgentSettings() {
+  // Whether everything changed was saved. Before the first run the Worker · Codex row is not a
+  // role choice: Start saves it as the project's own (setupStore).
+  async function saveAgentSettings({starting = false} = {}) {
     let commands;
-    try { commands = agentSettingCommands(agents.status, agents.draft); }
-    catch (error) { agents.error = error.message; renderAgentSettings(); return; }
-    if (!commands.length) { agents.state = 'Nothing has changed.'; renderAgentSettings(); return; }
+    const draft = settingUp() ? {...agents.draft, models: {...agents.draft.models,
+      worker_codex: agentDraft(agents.status).models.worker_codex}} : agents.draft;
+    try { commands = agentSettingCommands(agents.status, draft); }
+    catch (error) { agents.error = error.message; renderAgentSettings(); return false; }
+    if (!commands.length) {
+      if (!starting) agents.state = 'Nothing has changed.';
+      renderAgentSettings(); return true;
+    }
     agents.saving = true; agents.error = ''; renderAgentSettings();
     let saved = 0, failure = '';
     try {
@@ -2495,15 +3291,26 @@ if (typeof document !== 'undefined') {
       failure = (saved ? saved + ' of ' + commands.length + ' changes were saved. ' : '') + error.message;
     }
     agents.saving = false;
-    const draft = agents.draft;
+    const edited = agents.draft;
     await loadAgentSettings();
-    if (failure) { agents.error = failure; agents.draft = draft; }  // Keep what was not saved.
-    else agents.state = 'Saved. Conversations that begin from now on use these; a new model or effort reaches existing workers only where you ticked “Also existing”.';
+    if (failure) { agents.error = failure; agents.draft = edited; }  // Keep what was not saved.
+    else agents.state = starting ? 'Saved; starting the project…'
+      : 'Saved. Conversations that begin from now on use these; a new model or effort reaches existing workers only where you ticked “Also existing”.';
     renderAgentSettings();
+    return !failure;
+  }
+
+  // Start saves what changed in Agents and sessions, then starts the project with the Worker ·
+  // Codex row as its own model and effort. A save that fails starts nothing.
+  async function startSetup() {
+    if (agents.saving) return;
+    if (!setupStore.startBlockedReason && agents.status && agents.draft && !await saveAgentSettings({starting: true})) return;
+    await setupStore.start().then(finishSetup).catch(() => {});
   }
 
   async function finishSetup(result, projectId = setupStore.snapshot?.project_id) {
     if (!result) return;
+    void loadAgentSettings();  // The project's own model and effort may have changed.
     await refresh();
     // A start must never take someone away from the history they are reading.
     if (selected || !el('setup-dialog').open || !result.driving || setupStore.snapshot?.project_id !== projectId) return;
@@ -2897,7 +3704,7 @@ if (typeof document !== 'undefined') {
       if (el('controls-dialog').open) renderControls();
       void refreshQueueHistory();
       void refreshLibraryStats();
-      if (el('tasks-dialog').open) { await taskStore.refresh(); await loadOutline(); }
+      if (el('tasks-dialog').open) { await taskStore.refresh({page: taskMode === 'list'}); await Promise.all([loadOutline(), loadGraph()]); }
       if (el('setup-dialog').open) await setupStore.refresh().catch(() => {});
       if (selected) { renderWorkerHead(); await loadWorker(selected); }
       if (data.delivery_holds?.length) notice(data.delivery_holds.length + ' message delivery outcome(s) need reconciliation. They will not be resent automatically.', 'health');
@@ -2916,17 +3723,16 @@ if (typeof document !== 'undefined') {
     if (!el('setup-dialog').open) el('setup-dialog').showModal();
     setupStore.show().catch(() => {});
     agents.state = '';
-    if (data.runs.length) void loadAgentSettings(); else renderAgentSettings();
+    // Read before the first run too: Project setup chooses the agents' models here.
+    void loadAgentSettings();
   };
   el('setup-dialog').addEventListener('close', () => setupStore.setOpen(false));
   el('setup-goal').oninput = () => setupStore.setGoal(el('setup-goal').value);
-  el('setup-model').onchange = () => setupStore.selectModel(el('setup-model').value);
-  el('setup-effort').onchange = () => setupStore.selectEffort(el('setup-effort').value);
   el('setup-refresh').onclick = () => setupStore.loadState().catch(() => {});
   el('setup-model-retry').onclick = () => setupStore.loadModels().catch(() => {});
   el('setup-form').onsubmit = event => {
     event.preventDefault();
-    setupStore.start().then(finishSetup).catch(() => {});
+    void startSetup();
   };
   el('setup-drive').onclick = () => setupStore.drive().then(finishSetup).catch(() => {});
   el('worker-filter').oninput = () => { if (data) renderWorkers(); };
@@ -2943,16 +3749,18 @@ if (typeof document !== 'undefined') {
     });
   }
   el('agent-next-backend').onchange = () => editAgents(draft => { draft.nextBackend = el('agent-next-backend').value; });
-  for (const key of ['worker_codex', 'review_codex']) {
-    const prefix = 'agent-' + key.replace('_', '-');
-    el(prefix + '-model').onchange = () => editAgents(draft => {
-      const value = draft.models[key], efforts = codexEfforts(el(prefix + '-model').value).map(effort => effort.id);
+  for (const key of ['worker_codex', 'review_codex', 'integrator_codex']) {
+    const prefix = 'agent-' + key.replace('_', '-'), setupChoice = () => key === 'worker_codex' && settingUp();
+    el(prefix + '-model').onchange = () => setupChoice() ? setupStore.selectModel(el(prefix + '-model').value) : editAgents(draft => {
+      const value = draft.models[key];
+      const efforts = codexEfforts(el(prefix + '-model').value).map(effort => effort.id);
       value.model = el(prefix + '-model').value;
       if (efforts.length && !efforts.includes(value.effort)) {
         value.effort = agents.catalog.models.find(item => item.id === value.model)?.default_effort || efforts[0];
       }
     });
-    el(prefix + '-effort').onchange = () => editAgents(draft => { draft.models[key].effort = el(prefix + '-effort').value; });
+    el(prefix + '-effort').onchange = () => setupChoice() ? setupStore.selectEffort(el(prefix + '-effort').value)
+      : editAgents(draft => { draft.models[key].effort = el(prefix + '-effort').value; });
   }
   el('agent-worker-claude-model').oninput = () => editAgents(draft => { draft.models.worker_claude.model = el('agent-worker-claude-model').value; });
   el('agent-worker-claude-effort').onchange = () => editAgents(draft => { draft.models.worker_claude.effort = el('agent-worker-claude-effort').value; });
@@ -2962,6 +3770,9 @@ if (typeof document !== 'undefined') {
   }
   el('agent-dispatcher-model').onchange = () => editAgents(draft => { draft.dispatcher.model = el('agent-dispatcher-model').value; });
   el('agent-dispatcher-effort').onchange = () => editAgents(draft => { draft.dispatcher.effort = el('agent-dispatcher-effort').value; });
+  el('agent-waker-model').onchange = () => editAgents(draft => { draft.waker.model = el('agent-waker-model').value; });
+  el('agent-waker-effort').onchange = () => editAgents(draft => { draft.waker.effort = el('agent-waker-effort').value; });
+  el('agent-answer-deadline').oninput = () => editAgents(draft => { draft.deadline = el('agent-answer-deadline').value; });
   for (const backend of ['codex', 'claude']) {
     el('agent-sessions-' + backend).oninput = () => editAgents(draft => { draft.sessions[backend] = el('agent-sessions-' + backend).value; });
     el('agent-idle-' + backend).oninput = () => editAgents(draft => { draft.idle[backend] = el('agent-idle-' + backend).value; });
@@ -2991,11 +3802,41 @@ if (typeof document !== 'undefined') {
     taskStore.browse({view, query: el('task-filter').value}).catch(() => {});
   };
   el('tasks-outline').onclick = () => { taskMode = 'outline'; renderTasks(); loadOutline(); };
+  el('tasks-graph').onclick = () => { taskMode = 'graph'; renderTasks(); loadGraph(); };
+  el('task-kind').onchange = () => taskStore.browse({kind: el('task-kind').value}).catch(() => {});
+  el('task-sort').onchange = () => taskStore.browse({sort: el('task-sort').value}).catch(() => {});
+  el('task-newer').onclick = () => taskStore.showNewer().catch(() => {});
+  el('task-page').onchange = () => {
+    const pages = Math.max(1, Math.ceil((taskStore.page?.total || 0) / taskStore.limit));
+    const wanted = Math.min(pages, Math.max(1, Math.round(Number(el('task-page').value) || 1)));
+    taskStore.browse({offset: (wanted - 1) * taskStore.limit}).catch(() => {});
+  };
   el('task-previous').onclick = () => taskStore.browse({offset: Math.max(0, taskStore.offset - taskStore.limit)}).catch(() => {});
   el('task-next').onclick = () => { if (taskStore.page?.has_more) taskStore.browse({offset: taskStore.page.next_offset}).catch(() => {}); };
   el('task-retry').onclick = () => taskStore.loadPage().catch(() => {});
-  el('show-tasks').onclick = () => { if (data) { openTasks(); taskStore.refresh(); } };
-  el('tasks-dialog').addEventListener('close', () => { taskStore.setOpen(false); clearTimeout(taskFilterTimer); });
+  el('outline-filter').oninput = () => {
+    clearTimeout(outlineFilterTimer);
+    outlineFilterTimer = setTimeout(() => { outlineView.filter = el('outline-filter').value; renderOutline(); }, 200);
+  };
+  el('outline-hide-done').onchange = () => { outlineView.hideDone = el('outline-hide-done').checked; renderOutline(); };
+  el('outline-expand').onclick = () => {
+    // Every task above an unfinished one opens, so all open work shows in its place.
+    if (!outlineTree) return;
+    outlineView.touched = true;
+    for (const item of outline.items) {
+      if (!['done', 'retired'].includes(item.state)) for (const up of treeAncestors(outlineTree, item.id)) outlineView.expanded.add(up);
+    }
+    renderOutline();
+  };
+  el('outline-collapse').onclick = () => { outlineView.touched = true; outlineView.expanded.clear(); outlineView.shown.clear(); renderOutline(); };
+  el('graph-met').onchange = () => { graphView.includeMet = el('graph-met').checked; loadGraph({force: true}); };
+  el('graph-refresh').onclick = () => loadGraph({force: true});
+  el('task-back').onclick = () => el('tasks-dialog').classList.remove('detail-open');
+  el('show-tasks').onclick = () => { if (data) { openTasks(); taskStore.refresh({page: taskMode === 'list'}); } };
+  el('tasks-dialog').addEventListener('close', () => {
+    taskStore.setOpen(false); clearTimeout(taskFilterTimer); clearTimeout(outlineFilterTimer);
+    el('tasks-dialog').classList.remove('detail-open');
+  });
   el('show-requests').onclick = () => { if (data) el('requests-dialog').showModal(); };
   el('show-controls').onclick = () => { if (data) { el('controls-list').dataset.rows = ''; renderControls(); el('controls-dialog').showModal(); } };
   for (const tab of [claudeTab, codexTab]) {

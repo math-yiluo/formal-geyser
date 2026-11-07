@@ -164,3 +164,15 @@ async def test_repeated_startup_cancellation_awaits_owned_tree_cleanup(tmp_path,
     with pytest.raises(asyncio.CancelledError):
         await startup
     assert len(captured) == 1 and captured[0].tree_quiet
+
+
+def test_a_service_raises_its_open_file_limit_to_the_hard_one(monkeypatch):
+    limits = {process_module.resource.RLIMIT_NOFILE: (1024, 524288)}
+    monkeypatch.setattr(process_module.resource, "getrlimit", lambda kind: limits[kind])
+    monkeypatch.setattr(process_module.resource, "setrlimit", lambda kind, value: limits.__setitem__(kind, value))
+    process_module.raise_open_files_limit()
+    assert limits[process_module.resource.RLIMIT_NOFILE] == (524288, 524288)
+    # An unlimited hard limit is left alone: the soft one cannot be set to it everywhere.
+    limits[process_module.resource.RLIMIT_NOFILE] = (1024, process_module.resource.RLIM_INFINITY)
+    process_module.raise_open_files_limit()
+    assert limits[process_module.resource.RLIMIT_NOFILE] == (1024, process_module.resource.RLIM_INFINITY)

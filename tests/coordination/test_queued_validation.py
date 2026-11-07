@@ -227,3 +227,108 @@ async def test_an_interrupted_wait_leaves_an_outliving_validation_queued_not_unc
         "SELECT validation_state,validation_reason FROM native_call_receipts WHERE call_id='stage-1'")])
     assert rows and rows[0]["validation_state"] == "queued"
     assert json.dumps(rows[0]).count("uncertain") == 0
+
+
+def receipt(hub, artifact_id):
+    return hub.db.call(lambda c: dict(c.execute(
+        "SELECT validation_state,validation_reason FROM native_call_receipts WHERE validation_artifact_id=?",
+        (artifact_id,)).fetchone()))
+
+
+async def test_a_report_that_cannot_be_kept_queues_its_validation_again(native_runtime, monkeypatch):
+    case, attempt, runner, _, args = await prepare(native_runtime)
+    runner.plugin = plugin = Outliving()
+    plugin.release.set()  # The check finishes within the submission's wait ...
+    keep = case.hub.retain_native_validation_report
+
+    async def full_disk(*_):  # ... and its report cannot be written.
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(case.hub, "retain_native_validation_report", full_disk)
+    try:
+        await call(runner, attempt, "author", "stage", args, "stage-1")
+    except OSError:
+        pass
+    artifact_id = await case.hub.db.call(lambda c: c.execute(
+        "SELECT validation_artifact_id FROM native_call_receipts WHERE call_id='stage-1'").fetchone()[0])
+    row = await receipt(case.hub, artifact_id)
+    assert row["validation_state"] == "queued" and "could not be kept" in row["validation_reason"]
+    monkeypatch.setattr(case.hub, "retain_native_validation_report", keep)
+    [pending] = await case.hub.pending_native_validations(case.run["id"])
+    result = await runner._recover_submission(pending, background=True)
+    assert result["evidence"][-1]["verdict"] == "accepted" and plugin.started == 2
+
+
+async def test_a_running_validation_no_wait_holds_goes_back_as_a_restart_would_put_it(native_runtime, monkeypatch):
+    case, attempt, runner, _, args = await prepare(native_runtime)
+    runner.plugin = Outliving()
+    staged = await call(runner, attempt, "author", "stage", args, "stage-1")  # Unfinished: queued.
+    artifact_id = staged["artifact_id"]
+
+    def running(c):  # Its wait ended, and could not even record that it had.
+        c.execute("UPDATE native_call_receipts SET validation_state='running' WHERE validation_artifact_id=?",
+                  (artifact_id,))
+    await case.hub.db.call(running, write=True)
+    monkeypatch.setattr(GeneralPlugin, "validations_survive_interruption", True, raising=False)
+    with case.hub.attached_validation(artifact_id):  # A wait holds it: it is left alone.
+        assert await case.hub.pending_native_validations(case.run["id"]) == []
+        assert (await receipt(case.hub, artifact_id))["validation_state"] == "running"
+    [pending] = await case.hub.pending_native_validations(case.run["id"])
+    assert pending["validation_state"] == "queued"
+    assert "wait ended without a result" in (await receipt(case.hub, artifact_id))["validation_reason"]
+    events = [event for event in await case.hub.events(limit=1000) if event["kind"] == "validation.stranded"]
+    assert [(event["object_id"], event["payload"]["state"]) for event in events] == [(artifact_id, "queued")]
+
+    await case.hub.db.call(running, write=True)
+    monkeypatch.setattr(GeneralPlugin, "validations_survive_interruption", False, raising=False)
+    assert await case.hub.pending_native_validations(case.run["id"]) == []
+    assert (await receipt(case.hub, artifact_id))["validation_state"] == "uncertain"  # A local checker: recovery.
+
+
+async def test_the_driver_finishes_a_validation_whose_wait_failed_on_a_full_disk(native_runtime, monkeypatch):
+    from formal_geyser.coordination.runtime import runner as runner_module
+
+    case, attempt, runner, _, args = await prepare(native_runtime)
+    runner.plugin = plugin = Outliving()
+    staged = await call(runner, attempt, "author", "stage", args, "stage-1")  # Unfinished: queued.
+    artifact_id = staged["artifact_id"]
+    await case.hub.ordinary_turn_completed(attempt["worker_id"], attempt["id"])
+    plugin.release.set()
+    monkeypatch.setattr(GeneralPlugin, "validations_survive_interruption", True, raising=False)
+    monkeypatch.setattr(runner_module, "VALIDATION_RETRY_SECONDS", 0.0)
+    keep, queue = case.hub.retain_native_validation_report, case.hub.native_validation_queued
+    failures = {"report": 1, "queue": 1}
+
+    async def report(*arguments):
+        if failures["report"]:
+            failures["report"] -= 1
+            raise OSError(28, "No space left on device")
+        return await keep(*arguments)
+
+    async def queued(*arguments, **keywords):
+        if failures["queue"]:
+            failures["queue"] -= 1
+            raise OSError(28, "database or disk is full")
+        return await queue(*arguments, **keywords)
+
+    async def nothing(*_):
+        return None
+
+    async def none(*_):
+        return []
+
+    def no_model():
+        raise AssertionError("Collecting a validation starts no model turn")
+
+    monkeypatch.setattr(case.hub, "retain_native_validation_report", report)
+    monkeypatch.setattr(case.hub, "native_validation_queued", queued)
+    monkeypatch.setattr(runner, "_select", nothing)
+    monkeypatch.setattr(case.hub, "due_recruitment_intents", none)
+    monkeypatch.setattr(case.hub, "due_assignment_intents", none)
+    runner.harness_factory = no_model
+    await asyncio.wait_for(runner.run_until_idle(case.run["id"]), 60)
+    assert failures == {"report": 0, "queue": 0} and plugin.started == 3
+    assert (await case.hub.native_validation(artifact_id))["validation_state"] == "completed"
+    assert await finished(case.hub, artifact_id)
+    events = [event["kind"] for event in await case.hub.events(limit=1000) if event["object_id"] == artifact_id]
+    assert events.count("validation.stranded") == 1

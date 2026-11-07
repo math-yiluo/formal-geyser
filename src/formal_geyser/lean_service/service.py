@@ -12,16 +12,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import shutil
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .. import offload
 from ..coordination.models import LeanServiceConfig
-from ..coordination.storage import digest
+from ..coordination.storage import collected_thread_call, digest
 from ..process import ProcessRunner, process_environment
 from . import machine as machine_module
 from .executor import JobSpec, content_key, memory_limited, run_check, stopped_reason
@@ -43,11 +46,19 @@ SAFETY = 1.15  # Estimates are the last observed peak with this margin.
 CLIENT_SECONDS = 60.0  # A development check nobody has asked about for this long is abandoned.
 SAMPLE_SECONDS = 10.0
 TICK_SECONDS = 1.0
+# A validation's build keeps the threads its CPU over this long shows it uses, plus one
+# (_release_idle_threads): its Lake build may start no more processes than it was given, so this
+# overcommits the machine by at most a validation's few threads (validation_threads).
+RELEASE_WINDOW_SECONDS = 120.0
 # A reading of free memory serves this long while the next ones fail; past it free memory is
 # unknown and nothing starts or resumes: taken as unlimited, it would start every queued check.
 MEASUREMENT_SECONDS = 30.0
 # A job's cgroup that could not be removed is tried again after this long, doubling to the most.
 CLEANUP_SECONDS, CLEANUP_MAX_SECONDS = 5.0, 300.0
+# A job that could not start (its scratch directory could not be made: on 2026-11-05 the Linux
+# pilot's disk was full) stays queued and is tried again after this long, doubling to the most;
+# meanwhile other jobs may start.
+START_RETRY_SECONDS, START_RETRY_MAX_SECONDS = 1.0, 60.0
 # bwrap, which the Codex sandbox runs, refuses a command of more than 9,000 arguments in all. On
 # 2026-11-01 a validation in the Linux pilot passed one Lake target for each of 9,429 modules (the
 # Library's 8,674 and a candidate's 755) and failed before Lean ran. A longer command reads its
@@ -68,11 +79,41 @@ def argument_file_command(argv, directory: Path) -> tuple[list[str], Path]:
     return ["/bin/sh", "-c", 'set -f; exec "$0" $(cat "$1")', str(argv[0]), str(path)], path
 
 
+async def carried_out(awaitable):
+    """`awaitable` awaited to its end even when the caller is cancelled meanwhile, which is then
+    raised. Ending a job is not left halfway: a cgroup taken from the job and never removed, a
+    job left running with no run, or its end never recorded."""
+    task = asyncio.ensure_future(awaitable)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            break
+    if cancelled:
+        if not task.cancelled():
+            task.exception()
+        raise asyncio.CancelledError
+    return task.result()
+
+
 def estimate_key(spec: JobSpec) -> str:
     """Jobs on the same modules; a job nothing like has run yet takes the defaults."""
     request = spec.request
     return digest({"kind": spec.kind, "modules": sorted(request.modules), "replay": request.kernel_replay,
                    "inspections": len(request.inspections), "official": request.snapshot is not None})
+
+
+def threads_in_use(samples, assigned: int, window: float = RELEASE_WINDOW_SECONDS) -> int | None:
+    """The threads a running build needs, from its CPU over the last `window` seconds (`samples`:
+    monotonic time and CPU seconds): the cores it used, rounded up, plus one, and never more than
+    it holds; None until its samples span the window."""
+    if len(samples) < 2 or samples[-1][0] - samples[0][0] < window:
+        return None
+    cores = (samples[-1][1] - samples[0][1]) / (samples[-1][0] - samples[0][0])
+    return min(assigned, max(1, math.ceil(cores) + 1))
 
 
 class ServiceJob:
@@ -95,6 +136,10 @@ class ServiceJob:
         self.run_paused_base = 0.0  # Suspended seconds before the current run started.
         self.peak_committed = 0
         self.cpu_seconds = 0.0
+        # Its current run's (monotonic time, CPU seconds), over RELEASE_WINDOW_SECONDS.
+        self.cpu_samples: deque[tuple[float, float]] = deque()
+        self.start_failures = 0  # In a row; a start resets it.
+        self.start_retry_at = 0.0  # A queued job whose start failed is not started before then.
 
     def paused_total(self, now: float) -> float:
         return self.row["suspended_seconds"] + (now - self.suspended_since if self.suspended_since else 0.0)
@@ -202,10 +247,15 @@ class LeanService:
         self.jobs: dict[str, ServiceJob] = {}
         self.finished: dict[str, ServiceJob] = {}  # Recent, for clients still waiting.
         self.lingering: dict[str, Lingering] = {}  # By job ID.
+        # Job records whose write failed, by job ID: the job's row and the fields to write from it
+        # again each second (_write), and since when writes have been failing.
+        self._unwritten: dict[str, tuple[dict[str, Any], set[str]]] = {}
+        self._unwritten_since: float | None = None
         self._measured: tuple[float, tuple[int, int]] | None = None  # The last reading of free memory.
         self._memory_unknown = False
         self.policy = Policy(per_owner=self.config.per_owner, aging_seconds=self.config.aging_minutes * 60,
-                             validation_slots=self.config.validation_slots)
+                             validation_slots=self.config.validation_slots,
+                             validation_threads=self.config.validation_threads)
         self._wake = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
         self._closing = False
@@ -223,18 +273,20 @@ class LeanService:
     # Lifecycle
 
     async def start(self) -> None:
+        # Each check's reading, syncing and hashing of the Library runs in these processes, so
+        # checks use the machine's cores instead of sharing this process's one interpreter.
+        await asyncio.to_thread(offload.configure, self.config.bookkeeping_processes)
         now = self.clock()
         for row in await asyncio.to_thread(self.store.live):
             spec = JobSpec.model_validate_json(row["spec_json"])
             restarted = row["state"] != "queued"
             row.update(state="queued", requeues=row["requeues"] + int(restarted),
                        last_polled_at=now if spec.lane == "interactive" else row["last_polled_at"])
-            await asyncio.to_thread(self.store.update, row["id"], state="queued", requeues=row["requeues"],
-                                    last_polled_at=row["last_polled_at"])
             estimate = await self._estimate(spec)
             job = ServiceJob(row, spec, self._sched(row["id"], spec, estimate, row["submitted_at"]))
             job.sched.requeues = row["requeues"]
             self.jobs[job.id] = job
+            await self._write(job, "state", "requeues", "last_polled_at")
         self._tasks = [asyncio.create_task(self._schedule_loop(), name="lean-service-schedule"),
                        asyncio.create_task(self._sample_loop(), name="lean-service-sample")]
         self.wake()
@@ -260,6 +312,12 @@ class LeanService:
                 await asyncio.to_thread(group.close)
             except Exception:
                 logger.exception("A Lean job's cgroup cannot be removed; the service's unit ends what is left in it")
+        await self._flush()
+        if self._unwritten:
+            # Their jobs are queued again at the next start, as the store still shows them live.
+            logger.error("The records of %d Lean jobs could not be written before the service stopped",
+                         len(self._unwritten))
+        await asyncio.to_thread(offload.shutdown)
         self.store.close()
 
     def wake(self) -> None:
@@ -358,6 +416,7 @@ class LeanService:
                           "private_memory": job.sched.observed_memory} for job in jobs],
                 "cleanup": [{"id": job_id, "threads": item.threads, "seconds": now - item.since}
                             for job_id, item in self.lingering.items()],
+                "unwritten": len(self._unwritten),
                 "warm": self.warm.status() if self.warm is not None else None}
 
     async def telemetry(self, hours: float) -> dict[str, Any]:
@@ -387,9 +446,13 @@ class LeanService:
             threads = self.policy.integrator_threads
         else:
             threads = max(self.policy.single_threads, processes) if modules > 1 else self.policy.single_threads
+        if spec.lane == "official":
+            # Lake restores nearly all of it from its cache (LeanServiceConfig.validation_threads).
+            threads = min(threads, self.policy.validation_threads)
         threads = min(self.threads, threads)
         return Job(id=job_id, lane=spec.lane, owner=spec.owner, shape="build", threads=threads,
-                   min_threads=max(1, min(threads, self.threads // 4)) if processes > 1 else 1,
+                   min_threads=max(1, min(threads, self.threads // 4)) if processes > 1 and spec.lane != "official"
+                   else 1,
                    memory=memory, commit=commit, processes=processes, seconds=seconds, blocking=spec.blocking,
                    submitted_at=submitted_at)
 
@@ -404,7 +467,7 @@ class LeanService:
             changed = True
         if changed:
             job.row.update(lane=job.sched.lane, blocking=int(job.sched.blocking))
-            await asyncio.to_thread(self.store.update, job.id, lane=job.sched.lane, blocking=int(job.sched.blocking))
+            await self._write(job, "lane", "blocking")
             self.wake()
 
     def _machine(self) -> Machine | None:
@@ -448,47 +511,83 @@ class LeanService:
         """One scheduling decision, carried out."""
         if self._closing:
             return
+        await self._recover()
         machine = self._machine()
         if machine is None:
             return
-        # A job queued again waits while its previous run's cgroup is lingering.
-        actions = plan([job.sched for job in self.jobs.values() if job.id not in self.lingering], machine,
-                       self.clock(), self.policy)
+        now = self.clock()
+        # A job queued again waits while its previous run's cgroup is lingering, and one that could
+        # not start waits until it is tried again.
+        actions = plan([job.sched for job in self.jobs.values()
+                        if job.id not in self.lingering and job.start_retry_at <= now], machine, now, self.policy)
         for action in actions:
             job = self.jobs.get(action.job_id)
             if job is None:
                 continue
-            if action.kind == "start":
-                await self._start(job, action.threads)
-            elif action.kind == "suspend":
-                await self._suspend(job, action.reason)
-            elif action.kind == "resume":
-                await self._resume(job)
-            elif action.kind == "requeue":
-                await self._requeue(job, action.reason)
+            try:
+                if action.kind == "start":
+                    await self._start(job, action.threads)
+                elif action.kind == "suspend":
+                    await self._suspend(job, action.reason)
+                elif action.kind == "resume":
+                    await self._resume(job)
+                elif action.kind == "requeue":
+                    await self._requeue(job, action.reason)
+            except Exception:
+                # The rest of the decision is still carried out; the next one tries this again.
+                logger.exception("Lean job %s: %s failed; it is retried", job.id, action.kind)
 
     async def _start(self, job: ServiceJob, threads: int) -> None:
+        """Start the job's run. Its state changes only once its cgroup and scratch directory exist,
+        together with the task of its run; until then a failure leaves it queued, holding nothing."""
         now = self.clock()
         try:
-            job.group = await asyncio.to_thread(JobGroup)
+            group = await asyncio.to_thread(JobGroup)
         except OSError as error:
             # No process of the job may run outside its cgroup: it ends, unavailable.
             logger.error("Lean job %s could not start: %s", job.id, error)
             await self._finish(job, {"error": {"type": "EnvironmentUnavailable", "message": str(error)},
                                      "definitive": False}, "failed")
             return
-        job.scratch = self.state_dir / "scratch" / job.id
-        job.scratch.mkdir(parents=True, exist_ok=True)
+        scratch = self.state_dir / "scratch" / job.id
+        if self.jobs.get(job.id) is not job:
+            await self._not_started(job, group, None)  # It ended meanwhile: cancelled by its client, say.
+            return
+        try:
+            scratch.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            await self._not_started(job, group, error)
+            return
+        job.group, job.scratch, job.start_failures, job.start_retry_at = group, scratch, 0, 0.0
         job.sched.state, job.sched.assigned, job.sched.started_at = "running", threads, now
         job.sched.observed_memory = job.sched.observed_commit = 0
+        job.cpu_samples.clear()
         job.run_paused_base = job.paused_total(now)
         job.runnable.set()
-        job.row.update(state="running", started_at=now, threads=max(job.row["threads"], threads))
-        fields = {"state": "running", "started_at": now, "threads": job.row["threads"]}
-        if job.row.get("queue_seconds") is None:
-            job.row["queue_seconds"] = fields["queue_seconds"] = now - job.row["submitted_at"]
-        await asyncio.to_thread(self.store.update, job.id, **fields)
         job.task = asyncio.create_task(self._run(job, threads), name="lean-job-" + job.id)
+        # However the run ends, the next decision looks at it (_recover).
+        job.task.add_done_callback(lambda _: self.wake())
+        job.row.update(state="running", started_at=now, threads=max(job.row["threads"], threads))
+        names = ["state", "started_at", "threads"]
+        if job.row.get("queue_seconds") is None:
+            job.row["queue_seconds"] = now - job.row["submitted_at"]
+            names.append("queue_seconds")
+        await self._write(job, *names)
+
+    async def _not_started(self, job: ServiceJob, group: JobGroup, error: OSError | None) -> None:
+        """Undo a start that failed before the job's run began: its cgroup, empty, is removed and
+        the job, if still queued, is tried again later (START_RETRY_SECONDS)."""
+        try:
+            await asyncio.to_thread(group.close)
+        except Exception:
+            logger.exception("Lean job %s: its unused cgroup cannot be removed", job.id)
+        if error is None or self.jobs.get(job.id) is not job or job.sched.state != "queued":
+            return
+        job.start_failures += 1
+        delay = min(START_RETRY_SECONDS * 2 ** (job.start_failures - 1), START_RETRY_MAX_SECONDS)
+        job.start_retry_at = self.clock() + delay
+        logger.warning("Lean job %s could not start (%s: %s); it stays queued and is tried again in %.0f s",
+                       job.id, type(error).__name__, error, delay)
 
     @staticmethod
     async def _signal(job: ServiceJob, action: str) -> bool:
@@ -507,14 +606,40 @@ class LeanService:
         return job.group is group
 
     async def _suspend(self, job: ServiceJob, reason: str) -> None:
+        """Freeze a running job. Its next process waits (`runnable`) only while it is suspended: a
+        freeze that fails, even part-way, is undone and the job runs on (_undo_freeze)."""
         job.runnable.clear()
-        if not await self._signal(job, "suspend"):
+        try:
+            frozen = await self._signal(job, "suspend")
+        except OSError as error:
+            await self._undo_freeze(job, error)
+            raise  # The decision logs it; a later one may suspend the job again.
+        if not frozen:
+            job.runnable.set()  # It ended meanwhile: nothing of it was suspended.
             return
         now = self.clock()
         job.sched.state, job.sched.suspended_at, job.sched.suspended_for = "suspended", now, reason
         job.suspended_since = now
         job.row.update(state="suspended", suspensions=job.row["suspensions"] + 1)
-        await asyncio.to_thread(self.store.update, job.id, state="suspended", suspensions=job.row["suspensions"])
+        await self._write(job, "state", "suspensions")
+
+    async def _undo_freeze(self, job: ServiceJob, error: OSError) -> None:
+        """A freeze that failed may have frozen part of the job (its cgroup, not a session it borrows,
+        say) while its state stays running, which nothing would thaw. Thaw all of it, so the job runs
+        on as its state says. If that fails too, its run is stopped and it is queued again, so it
+        never waits with nothing to resume it."""
+        thawed = True
+        for each in [each for each in (job.group, *job.borrowed) if each is not None]:
+            try:
+                await asyncio.to_thread(each.resume)
+            except OSError:
+                thawed = False
+                logger.exception("Lean job %s: a group its failed freeze may have frozen cannot be thawed", job.id)
+        job.runnable.set()
+        if not thawed and job.group is not None:
+            logger.error("Lean job %s could not be frozen (%s) nor thawed; its run is stopped and queued again",
+                         job.id, error)
+            await self._requeue(job, "a failed freeze could not be undone")
 
     async def _requeue(self, job: ServiceJob, reason: str) -> None:
         """Stop a suspended job, which holds memory it cannot use, and queue it again (_stopped)."""
@@ -534,8 +659,7 @@ class LeanService:
         job.sched.state, job.sched.suspended_at, job.sched.suspended_for = "running", None, None
         job.row["state"] = "running"
         job.runnable.set()
-        await asyncio.to_thread(self.store.update, job.id, state="running",
-                                suspended_seconds=job.row["suspended_seconds"])
+        await self._write(job, "state", "suspended_seconds")
 
     # Execution
 
@@ -549,12 +673,15 @@ class LeanService:
             result = await run_check(job.spec.request, runner=JobRunner(self, job), threads=threads,
                                      scratch=job.scratch, sessions=self.sessions if self.config.sessions else None,
                                      owner=job.row["owner"], time_limit=minutes * 60 if minutes else None,
-                                     time_limit_reason=stopped_reason(lane, minutes * 60) if minutes else None)
+                                     time_limit_reason=stopped_reason(lane, minutes * 60) if minutes else None,
+                                     build_slots=self.config.build_slots or None)
             if isinstance(result.get("timings"), dict):
                 result["timings"]["event_loop_lag"] = round(self.loop_lag - lag, 3)
             outcome = "completed"
         except asyncio.CancelledError:
-            await self._stopped(job)
+            # A second cancellation meanwhile (a client's cancel beside a stop for memory, say) does
+            # not leave the job running with no run.
+            await carried_out(self._stopped(job))
             return
         except Exception as error:
             logger.exception("Lean job %s failed", job.id)
@@ -608,6 +735,25 @@ class LeanService:
         logger.warning("Lean job %s: its cgroup was removed after %.0f s", job_id, self.clock() - item.since)
         self.wake()
 
+    async def _recover(self) -> None:
+        """A job whose run ended without ending the job (its task cancelled before it began, say)
+        keeps no threads: it is stopped as its cancelled run would have been (_stopped), and so,
+        unless its client cancelled it or it was stopped for its memory, queued again."""
+        for job in list(self.jobs.values()):
+            if job.sched.state == "queued" or (job.task is not None and not job.task.done()):
+                continue
+            task = job.task
+            if task is None:
+                how = "no run"
+            elif task.cancelled():
+                how = "its run cancelled"
+            else:
+                error = task.exception()
+                how = "its run ended" + (f": {error!r}" if error is not None else "")
+            logger.error("Lean job %s was left %s with %s; it is stopped as a cancelled run is", job.id,
+                         job.sched.state, how)
+            await self._stopped(job)
+
     async def _stopped(self, job: ServiceJob) -> None:
         """A cancelled run: cancelled by its client, stopped for its memory (it ends unavailable), or
         stopped with the service and queued again (to start once its cgroup is gone)."""
@@ -625,13 +771,12 @@ class LeanService:
         job.suspended_since = None
         job.runnable.set()
         job.row.update(state="queued", requeues=job.row["requeues"] + 1)
-        await asyncio.to_thread(self.store.update, job.id, state="queued", requeues=job.row["requeues"],
-                                suspended_seconds=job.row["suspended_seconds"])
+        await self._write(job, "state", "requeues", "suspended_seconds")
         self.wake()
 
     async def _finish(self, job: ServiceJob, result: dict | None, outcome: str) -> None:
         try:
-            await self._record(job, result, outcome)
+            await carried_out(self._record(job, result, outcome))
         except Exception:
             logger.exception("Lean job %s: its end was not recorded", job.id)
         finally:
@@ -662,7 +807,7 @@ class LeanService:
                   "peak_committed_memory": job.peak_committed or None,
                   "suspended_seconds": job.paused_total(now)}
         job.row.update(fields)
-        await asyncio.to_thread(self.store.update, job.id, **fields)
+        await self._write(job, *fields)
         if self.warm is not None and result and result.get("library_imports"):
             roots = [Path(root["path"]) for root in job.spec.request.environment.get("library_roots", [])]
             if self.warm.note(roots, set(result["library_imports"])):
@@ -672,10 +817,56 @@ class LeanService:
                 and job.memory_limited is None):
             compilation = (result or {}).get("compilation") or {}
             processes = max(1, min(job.row["threads"] or 1, len(compilation.get("built_modules") or []) or 1))
-            await asyncio.to_thread(
-                self.store.record_estimate, job.row["estimate_key"], memory=job.row["peak_private_memory"] // processes,
-                committed=(job.peak_committed or job.row["peak_private_memory"]) // processes,
-                processes=processes, seconds=run_seconds)
+            try:
+                await asyncio.to_thread(
+                    self.store.record_estimate, job.row["estimate_key"],
+                    memory=job.row["peak_private_memory"] // processes,
+                    committed=(job.peak_committed or job.row["peak_private_memory"]) // processes,
+                    processes=processes, seconds=run_seconds)
+            except Exception as error:
+                # An estimate only sizes later jobs; the next similar job measures again.
+                logger.warning("Lean job %s: its measurements were not kept (%s: %s)", job.id,
+                               type(error).__name__, error)
+
+    # Records
+
+    async def _write(self, job: ServiceJob, *names: str) -> None:
+        """Record these fields of the job's row in the store. Each write takes the row's values as
+        they are when it is made (Store.write_row). One that fails, as when the disk is full, is
+        kept and made again every second, with the job's later fields (_flush), so the store never
+        stays behind the job: a job whose end was not written would otherwise be shown running
+        and run again at the next start."""
+        held = self._unwritten.pop(job.id, None)
+        await self._store(job.id, job.row, set(names) | (held[1] if held is not None else set()))
+
+    async def _store(self, job_id: str, row: dict[str, Any], names: set[str]) -> bool:
+        written = False
+        try:
+            # A cancelled caller waits for the write: one still running then is not taken as failed.
+            await collected_thread_call(self.store.write_row, job_id, row, names)
+            written = True
+        except Exception as error:
+            if self._unwritten_since is None:
+                self._unwritten_since = self.clock()
+                logger.warning("Lean job records cannot be written (%s: %s); they are written again every second",
+                               type(error).__name__, error)
+        finally:
+            if not written:
+                held = self._unwritten.get(job_id)
+                self._unwritten[job_id] = (row, (held[1] | names) if held is not None else names)
+        return written
+
+    async def _flush(self) -> None:
+        """Write again the job records whose write failed; once one fails again, the rest wait."""
+        for job_id in list(self._unwritten):
+            if job_id not in self._unwritten:
+                continue  # Written meanwhile with the job's later fields.
+            row, names = self._unwritten.pop(job_id)
+            if not await self._store(job_id, row, names):
+                return
+        if self._unwritten_since is not None and not self._unwritten:
+            logger.warning("Lean job records are written again, after %.0f s", self.clock() - self._unwritten_since)
+            self._unwritten_since = None
 
     # Measurement
 
@@ -687,6 +878,7 @@ class LeanService:
         if group is None:
             return
         if job.sched.state == "suspended":
+            job.cpu_samples.clear()  # Its CPU while frozen says nothing of what it uses.
             await asyncio.to_thread(group.suspend)
             return
         if job.sched.state != "running":
@@ -706,6 +898,27 @@ class LeanService:
             job.sched.observed_commit += borrowed.committed_memory
         job.peak_committed = max(job.peak_committed, usage.peak_committed_memory)
         job.row["peak_private_memory"] = max(job.row.get("peak_private_memory") or 0, group.peak_private_memory)
+        samples, now = job.cpu_samples, time.monotonic()
+        if samples and usage.cpu_seconds < samples[-1][1]:
+            samples.clear()  # A new run, whose cgroup counts from zero.
+        samples.append((now, usage.cpu_seconds))
+        while len(samples) > 2 and now - samples[1][0] >= RELEASE_WINDOW_SECONDS:
+            samples.popleft()  # The first stays the latest one at least a window old.
+
+    def _release_idle_threads(self, job: ServiceJob) -> None:
+        """A validation's build keeps only the threads it uses, as every job keeps one once its build
+        has ended: its threads go back to the queue. In the Linux pilot a validation whose one new
+        module took more than half an hour to compile held 31 of the 32 threads while it used one
+        core, and 131 jobs waited."""
+        sched = job.sched
+        if sched.lane != "official" or sched.shape != "build" or sched.state != "running" or sched.assigned <= 1:
+            return
+        keep = threads_in_use(job.cpu_samples, sched.assigned)
+        if keep is not None and keep < sched.assigned:
+            logger.info("Lean job %s keeps %d of its %d threads: its build used %d or fewer for %.0f s",
+                        job.id, keep, sched.assigned, keep - 1, RELEASE_WINDOW_SECONDS)
+            sched.assigned = keep
+            self.wake()
 
     async def _limit_memory(self, job: ServiceJob) -> None:
         """Stop a running job one of whose Lean processes holds more than `process_memory_gib`: it
@@ -737,9 +950,11 @@ class LeanService:
             self.loop_lag += max(0.0, time.monotonic() - slept - TICK_SECONDS)
             try:
                 now = self.clock()
+                await self._flush()
                 for job in list(self.jobs.values()):
                     try:
                         await self._sample_job(job)
+                        self._release_idle_threads(job)
                         await self._limit_memory(job)
                     except Exception:
                         # One job's failed measurement costs neither the others' nor the rest

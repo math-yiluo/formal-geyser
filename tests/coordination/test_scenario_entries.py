@@ -119,7 +119,7 @@ def test_full_review_uses_only_one_canonical_mutable_phase():
 
 async def test_message_entry_keeps_exact_saved_wait_and_explicit_resume_changes(project):
     hub, run = project.hub, project.run
-    pause = ScriptedHarness([ScriptedTurn([ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {
+    pause = ScriptedHarness([ScriptedTurn([ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {"predicate": {"external_response_id": "unanswered-request"}, 
         "reason": "Await a concrete answer.",
         "checkpoint": {"summary": "Exact saved progress.", "next_action": "Read the user's answer."}}})])])
     paused = await WorkerRunner(hub, lambda: pause).run_once(run["id"])

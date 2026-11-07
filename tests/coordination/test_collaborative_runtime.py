@@ -153,7 +153,7 @@ async def test_recruitment_helper_opens_once_and_successful_admission_consumes_i
 
 async def test_paused_worker_stays_asleep_without_announcement_turn(collaborative):
     hub, host, run = collaborative
-    sleeping = ScriptedHarness([ScriptedTurn([ScriptedAction("taskhub_call", {"operation": 'pause', "arguments": {"reason": "Preserve progress until actionable work is available.", **({
+    sleeping = ScriptedHarness([ScriptedTurn([ScriptedAction("taskhub_call", {"operation": 'pause', "arguments": {"predicate": {"external_response_id": "unanswered-request"}, "reason": "Preserve progress until actionable work is available.", **({
         "checkpoint": {"summary": "Saved context", "next_action": "Wait for suitable work"}})}})])])
     first = await WorkerRunner(hub, lambda: sleeping).run_once(run["id"])
     other = await command(hub, "task.publish", {"contract": contract("Unrelated record")})
@@ -317,7 +317,7 @@ async def test_busy_team_review_gets_a_new_reviewer_without_interrupting_its_wor
                     # The review must accept before either ordinary turn
                     # releases. The test below owns the acceptance watchdog.
                     await accepted.wait()
-                    result = await call(on_tool, 'pause', {
+                    result = await call(on_tool, 'pause', {"predicate": {"external_response_id": "unanswered-request"}, 
                         "reason": "Save the independent work after acceptance.",
                         "checkpoint": {"summary": "Saved independent work", "next_action": "Await new useful work"}})
                 return TurnOutcome(turn_id, "interrupted", True, True, result["runtime_directive"])

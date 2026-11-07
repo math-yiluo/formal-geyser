@@ -6,6 +6,7 @@ import json
 from uuid import uuid4
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from formal_geyser.coordination.config import initialize
 from formal_geyser.coordination.errors import HubError
@@ -15,12 +16,15 @@ from formal_geyser.coordination.models import (
     Command,
     Limits,
     ProjectConfig,
+    Requirement,
     Role,
+    TaskContract,
 )
 
 from .lifecycle_helpers import select_review
 from .publication_helpers import approve as publish_review
 from .publication_helpers import file_payload, new_hub
+from .wait_helpers import legacy_wait
 
 OP = Actor(role=Role.OPERATOR)
 RUNNER = Actor(role=Role.RUNNER)
@@ -186,7 +190,7 @@ async def test_wait_registers_before_slot_is_freed_and_early_result_is_not_lost(
     first, second = await worker(hub), await worker(hub)
     _, parent_actor = await claim(hub, parent, first, run)
     _, helper_actor = await claim(hub, dependency, second, run)
-    parked = await command(hub, "task.wait", {"predicate": predicate(dependency), "checkpoint": checkpoint()}, parent_actor)
+    parked = await legacy_wait(hub, {"predicate": predicate(dependency), "checkpoint": checkpoint()}, parent_actor)
     result = await submit(hub, helper_actor, result="ready")
     await accept(hub, result["artifact_id"])
     await close_task(hub, dependency["id"], result["artifact_id"])
@@ -211,7 +215,7 @@ async def test_dependency_handoff_preserves_parent_without_global_slot_gate(file
     _, original = await claim(hub, parent, first, run)
     path = hub.workspace(first["id"]) / "progress.txt"
     path.write_text("preserve this", encoding="utf-8")
-    wait = await command(hub, "task.wait", {"predicate": predicate(helper), "checkpoint": checkpoint()}, original)
+    wait = await legacy_wait(hub, {"predicate": predicate(helper), "checkpoint": checkpoint()}, original)
     _, helper_actor = await claim(hub, helper, second, run)
     await quiet(hub, first["id"])
     output = await submit(hub, helper_actor, result="done")
@@ -233,7 +237,7 @@ async def test_wait_accepts_preexisting_result_without_missing_wake(file_hub):
     await accept(hub, result["artifact_id"])
     await close_task(hub, dep["id"], result["artifact_id"])
     _, parent_actor = await claim(hub, parent, second, run)
-    await command(hub, "task.wait", {"predicate": predicate(dep), "checkpoint": checkpoint()}, parent_actor)
+    await legacy_wait(hub, {"predicate": predicate(dep), "checkpoint": checkpoint()}, parent_actor)
     assert (await hub.list_continuations())[0]["state"] == "eligible"
 
 
@@ -251,7 +255,7 @@ async def test_a_new_wait_replaces_the_workers_earlier_waits_on_the_task(file_hu
             "origin_attempt,created_at) VALUES(?,?,?,?,?,?,'waiting',?,0)",
             (continuation, parent["id"], parent["revision"], worker_id, json.dumps(predicate(first)),
              json.dumps(checkpoint()), attempt["id"])))
-    later = await command(hub, "task.wait", {"predicate": predicate(second), "checkpoint": checkpoint()}, actor)
+    later = await legacy_wait(hub, {"predicate": predicate(second), "checkpoint": checkpoint()}, actor)
     states = {item["id"]: item["state"] for item in await hub.list_continuations()}
     assert states == {earlier: "superseded_by_worker", others: "waiting", later["continuation_id"]: "waiting"}
 
@@ -261,7 +265,7 @@ async def test_startup_keeps_only_each_workers_newest_wait_on_a_task(file_hub):
     parent, dependency = await publish(hub, "Parent"), await publish(hub, "Dependency")
     run, author = await start(hub), await worker(hub)
     _, actor = await claim(hub, parent, author, run)
-    kept = await command(hub, "task.wait", {"predicate": predicate(dependency), "checkpoint": checkpoint()}, actor)
+    kept = await legacy_wait(hub, {"predicate": predicate(dependency), "checkpoint": checkpoint()}, actor)
     await quiet(hub, author["id"])
     older = str(uuid4())  # Left by code that kept a worker's earlier waits.
     await hub.db.call(lambda c: c.execute(
@@ -283,7 +287,7 @@ async def test_candidate_wrong_policy_and_qualified_acceptance_do_not_wake(file_
     dep, parent = await publish(hub, "Dependency"), await publish(hub, "Parent")
     run, first, second = await start(hub), await worker(hub), await worker(hub)
     _, parent_actor = await claim(hub, parent, first, run)
-    await command(hub, "task.wait", {"predicate": predicate(dep), "checkpoint": checkpoint()}, parent_actor)
+    await legacy_wait(hub, {"predicate": predicate(dep), "checkpoint": checkpoint()}, parent_actor)
     await quiet(hub, first["id"])
     _, dep_actor = await claim(hub, dep, second, run)
     output = await submit(hub, dep_actor)
@@ -310,7 +314,7 @@ async def test_a_wake_up_reads_only_the_requirements_that_may_hold(file_hub):
     for mode in ("all", "any"):
         parents[mode], waiter = await publish(hub, f"Parent waiting for {mode}"), await worker(hub)
         _, parent_actor = await claim(hub, parents[mode], waiter, run)
-        await command(hub, "task.wait", {"predicate": {"mode": mode, "requirements": requirements},
+        await legacy_wait(hub, {"predicate": {"mode": mode, "requirements": requirements},
                                          "checkpoint": checkpoint()}, parent_actor)
         await quiet(hub, waiter["id"])
     _, dependency_actor = await claim(hub, dependencies[0], author, run)
@@ -399,7 +403,7 @@ async def test_withdrawal_makes_a_wait_on_the_artifact_reconsider(hub):
     await accept(hub, source["id"])
     task, run, w = await publish(hub), await start(hub), await worker(hub)
     _, actor = await claim(hub, task, w, run)
-    await command(hub, "task.wait", {
+    await legacy_wait(hub, {
         "predicate": {"mode": "all", "requirements": [{"key": "input", "artifact_id": source["id"],
                                                     "policy": "general.manual@1"}]},
         "checkpoint": checkpoint()}, actor)
@@ -440,7 +444,59 @@ async def test_a_recorded_replacement_meets_requirements_naming_the_artifact_it_
         await record(original["id"], replacement["id"], actor=RUNNER)
     assert await record(original["id"], replacement["id"]) == {
         "original_id": original["id"], "replacement_id": replacement["id"]}
-    assert await hub.db.call(met) == (True, {("artifact", original["id"], "general.manual@1")})
+    assert await hub.db.call(met) == (True, {("artifact", original["id"])})
+
+
+async def test_a_requirement_names_no_policy_and_a_former_policy_is_ignored(hub):
+    # In the Linux pilot workers named the task's acceptance_policy for every requirement, while
+    # a proof task's outputs were mostly definitions and statements: such a wait never held.
+    artifact = await command(hub, "artifact.register", {"kind": "statement", "data": {"lean": 1}})
+    plain = {"key": "statement", "artifact_id": artifact["id"]}
+    wrong = {**plain, "policy": "lean.proof@1"}  # As a stored predicate, or a habit, still names one.
+    assert Requirement.model_validate(wrong).model_dump() == Requirement.model_validate(plain).model_dump()
+    assert "policy" not in Requirement.model_validate(wrong).model_dump()
+
+    def met(c):
+        return [hub._requirement(c, r) for r in (plain, wrong)], hub._possible_requirements(c, [plain, wrong])
+    assert await hub.db.call(met) == ([False, False], set())
+    await accept(hub, artifact["id"])  # Under its own policy, general.manual@1.
+    assert await hub.db.call(met) == ([True, True], {("artifact", artifact["id"])})
+    await accept(hub, artifact["id"], policy="other.policy@1", verdict="rejected")
+    assert await hub.db.call(met) == ([True, True], {("artifact", artifact["id"])})  # Unrelated: still accepted.
+    # A task contract takes the former field and ignores it, in its schema too.
+    contract = {"title": "T", "objective": "O", "requirements": [wrong]}
+    Draft202012Validator(TaskContract.model_json_schema()).validate(contract)
+    assert TaskContract.model_validate(contract).requirements[0].model_dump() == {
+        "key": "statement", "task_id": None, "task_revision": None, "artifact_id": artifact["id"]}
+
+
+def test_a_former_requirement_policy_is_no_change_of_substance():
+    import sqlite3
+
+    from formal_geyser.coordination.collaboration import (
+        AT_LEAST_SUBSTANCE_SQL,
+        SAME_SUBSTANCE_SQL,
+        contract_substance,
+    )
+    stored = {"title": "T", "objective": "O", "requirements": [
+        {"key": "k", "task_id": "t1", "task_revision": 1, "artifact_id": None, "policy": "lean.proof@1"}]}
+    revised = {"title": "T2", "objective": "O", "requirements": [
+        {"key": "k", "task_id": "t1", "task_revision": 1, "artifact_id": None}]}
+    more = {**revised, "requirements": [*revised["requirements"], {"key": "j", "task_id": "t2", "task_revision": 1,
+                                                                   "artifact_id": None}]}
+    assert contract_substance(stored) == contract_substance(revised) != contract_substance(more)
+    c = sqlite3.connect(":memory:")
+    c.execute("CREATE TABLE r(id INTEGER, contract_json TEXT)")
+    for number, contract in enumerate((stored, revised, more)):
+        c.execute("INSERT INTO r VALUES(?,?)", (number, json.dumps(contract, sort_keys=True)))
+
+    def holds(sql, a, b):
+        return c.execute("SELECT " + sql.format(a="a", b="b") + " FROM r a, r b WHERE a.id=? AND b.id=?",
+                         (a, b)).fetchone()[0] == 1
+    assert holds(SAME_SUBSTANCE_SQL, 1, 0) and holds(SAME_SUBSTANCE_SQL, 0, 1)
+    assert not holds(SAME_SUBSTANCE_SQL, 2, 0)
+    assert holds(AT_LEAST_SUBSTANCE_SQL, 1, 0) and holds(AT_LEAST_SUBSTANCE_SQL, 2, 0)
+    assert not holds(AT_LEAST_SUBSTANCE_SQL, 0, 2)
 
 
 async def rejected_candidate(hub, run):
@@ -466,7 +522,7 @@ async def test_a_requirement_naming_a_corrected_candidate_is_met_by_its_newest_v
     second = (await submit(hub, actor, replaces=first, attempt=2))["artifact_id"]
     assert await hub.db.call(met) == (False, set())  # The correction still awaits its review.
     await accept(hub, second)
-    assert await hub.db.call(met) == (True, {("artifact", first, requirement["policy"])})
+    assert await hub.db.call(met) == (True, {("artifact", first)})
     dependent, other = await publish(hub, "Dependent task", requirements=[requirement]), await worker(hub)
     _, actor = await claim(hub, dependent, other, run)
     result = (await submit(hub, actor, attempt=3))["artifact_id"]
@@ -510,7 +566,7 @@ async def test_a_wait_naming_a_rejected_candidate_follows_its_corrections(file_h
     async def wait_on_first(objective):
         dependent, waiter = await publish(hub, "Dependent task", objective=objective), await worker(hub)
         _, actor = await claim(hub, dependent, waiter, run)
-        await command(hub, "task.wait", {"predicate": {"mode": "all", "requirements": [requirement]},
+        await legacy_wait(hub, {"predicate": {"mode": "all", "requirements": [requirement]},
                                          "checkpoint": checkpoint()}, actor)
         await quiet(hub, waiter["id"])
         return dependent["id"]
@@ -897,7 +953,7 @@ async def test_resumed_context_exposes_exact_artifact_from_old_revision(file_hub
     initial = await hub.context(w2["id"])
     await command(hub, "context.ack", {"worker_id": w2["id"], "packet_id": initial["packet_id"]}, actor)
     await command(hub, "task.revise", {"task_id": provider["id"], "contract": contract("Provider revised")})
-    waiting = await command(hub, "task.wait", {
+    waiting = await legacy_wait(hub, {
         "predicate": {"requirements": [{"key": "result", "artifact_id": result["artifact_id"],
                                         "policy": provider["contract"]["acceptance_policy"]}]},
         "checkpoint": checkpoint()}, actor)

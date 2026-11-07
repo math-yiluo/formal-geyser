@@ -418,7 +418,7 @@ async def test_terminal_after_compaction_sends_nothing_and_the_conversation_cont
 
 @pytest.mark.parametrize("tool_result", [True, False])
 async def test_compaction_refresh_preserves_waiting_message_execution_mode(project, monkeypatch, tool_result):
-    pause = ScriptedHarness([ScriptedTurn([ScriptedAction("taskhub_call", {"operation": 'pause', "arguments": {"reason": "Preserve progress until actionable work is available.", **({
+    pause = ScriptedHarness([ScriptedTurn([ScriptedAction("taskhub_call", {"operation": 'pause', "arguments": {"predicate": {"external_response_id": "unanswered-request"}, "reason": "Preserve progress until actionable work is available.", **({
         "reason": "Await a concrete user instruction.",
         "checkpoint": {"summary": "Inspection preserved.", "next_action": "Read a directed message."},
     })}})])])

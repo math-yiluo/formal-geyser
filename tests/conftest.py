@@ -265,3 +265,36 @@ def local_operator_client(request, monkeypatch):
     """In-process API clients send no token; the real check has its own tests (real_operator)."""
     if request.node.get_closest_marker("real_operator") is None:
         monkeypatch.setattr("formal_geyser.coordination.api.operator_request", lambda request, token: True)
+
+
+# models.py gives no role a model or effort: a real project chooses each when it is initialized.
+# The tests' projects take the efforts and the Dispatcher model the code chose for every project
+# before 2026-11-07, so their native turns are unchanged.
+def _chosen_defaults():
+    from formal_geyser.coordination.models import (
+        ClaudeConfig,
+        CodexConfig,
+        DecisionConfig,
+        ProjectConfig,
+    )
+
+    for model, field, value in ((CodexConfig, "effort", "high"), (ClaudeConfig, "effort", "high"),
+                                (DecisionConfig, "model", "gpt-6.1-sol"), (DecisionConfig, "effort", "high")):
+        model.model_fields[field].default = value
+        model.model_rebuild(force=True)
+    ProjectConfig.model_rebuild(force=True)
+
+
+_chosen_defaults()
+
+
+@pytest.fixture(autouse=True)
+def choices_made(request):
+    """Runs start without every role's model and the answer deadline chosen; the requirement
+    itself has its own tests (choices_required). Its own patch outlives a test's monkeypatch.undo()."""
+    if request.node.get_closest_marker("choices_required") is not None:
+        yield
+        return
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("formal_geyser.coordination.hub.Hub._require_choices", lambda self, c: None)
+        yield

@@ -28,8 +28,8 @@ Definitions and statements must correspond to their Markdown and cited original
 sources. Derived/internal artifacts need an explicit provenance rationale. Proof Markdown explains the implemented Lean proof, whose
 route may differ from the literature.
 
-Proof tasks describe their target in prose, name the target statement's
-declaration, and pin the environment. A proof record names that Library
+Proof tasks describe their target in prose, name the target statement by its
+full Lean declaration name (not its module path), and pin the environment. A proof record names that Library
 statement in `statement_declaration`; it must already be in the Library at your
 workspace base.
 Validation builds your workspace over its Library base, checks that the theorem's

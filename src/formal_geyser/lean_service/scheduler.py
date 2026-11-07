@@ -93,6 +93,8 @@ class Policy:
     # The most threads for an Integrator job: it mostly restores Lake's cached modules (in the Linux
     # pilot a median 0.06 cores, at most 1.35), so the rest of the machine stays with other work.
     integrator_threads: int = 6
+    # The most threads for an official validation, for the same reason (LeanServiceConfig).
+    validation_threads: int = 4
     pressure_cooldown_seconds: float = 30.0  # Before a job suspended for memory resumes.
 
 

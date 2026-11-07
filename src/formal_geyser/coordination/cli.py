@@ -37,6 +37,7 @@ from .models import (
     ValidationReport,
 )
 from .plugins import load_plugin
+from .runtime.process import raise_open_files_limit
 from .storage import atomic_write
 
 # The service's interpreter switch interval, in seconds (Python's default is 0.005); see serve.
@@ -505,6 +506,7 @@ def serve(
             raise ValueError("The operator service must bind a loopback IP address")
         load_config(ctx.obj.root)
         cgroups.root()  # Workers' process trees need it: a system without one fails at once.
+        raise_open_files_limit()  # Every worker's process holds pipes.
         # The coordination thread runs many short SQLite statements, each releasing the
         # interpreter lock; taking it back can wait a whole switch interval while another
         # thread runs Python (the agents' tool work). At the default 5 ms, a 0.3 s admission
@@ -896,11 +898,21 @@ def backend_rotation(
     _emit(_perform(lambda: _command(ctx, "runtime.set_rotation_mode", {"mode": mode})))
 
 
+@backend_app.command("waker-model")
+def backend_waker_model(
+    ctx: typer.Context,
+    model: Annotated[str, typer.Argument(help="Codex model for wake decisions")],
+    effort: Annotated[str, typer.Option(help="low, medium, high, xhigh or max")],
+):
+    """Use this model for the wake decisions started from now on."""
+    _emit(_perform(lambda: _command(ctx, "runtime.set_waker_model", {"model": model, "effort": effort})))
+
+
 @backend_app.command("decision-model")
 def backend_decision_model(
     ctx: typer.Context,
     model: Annotated[str, typer.Argument(help="Codex model for assignment and recruitment decisions")],
-    effort: Annotated[str, typer.Option(help="low, medium, high, xhigh or max")] = "high",
+    effort: Annotated[str, typer.Option(help="low, medium, high, xhigh or max")],
 ):
     """Use this cheap model for the assignment and recruitment decisions started from now on."""
     _emit(_perform(lambda: _command(ctx, "runtime.set_decision_model", {"model": model, "effort": effort})))

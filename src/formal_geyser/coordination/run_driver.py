@@ -37,7 +37,7 @@ WAKE_COMMANDS = frozenset({
     "request.resolve", "message.delivery.resolve", "worker.resume_work", "task.resume_work",
     "task.invitation.update", "task.invitation.withdraw", "task.complete.declare",
     "task.complete.feedback", "task.complete.feedback_unavailable", "task.complete.finalize", "task.complete.cancel",
-    "task.leave", "helper.reconcile", "task.claim",
+    "task.leave", "task.invite_back", "helper.reconcile", "task.claim",
 })
 # The operator's commands that claim work for a worker. Only a pass launches the claim: in the
 # Linux pilot a task.join left Worker 303's claim running for eight hours without an activation.

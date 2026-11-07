@@ -17,6 +17,8 @@ from tests.coordination.lifecycle_helpers import (
 from tests.coordination.publication_helpers import approve, file_payload, new_hub
 from tests.coordination.test_interruptions import interrupted
 
+from .wait_helpers import legacy_wait
+
 OP = Actor(role=Role.OPERATOR)
 RUNNER = Actor(role=Role.RUNNER)
 
@@ -78,7 +80,7 @@ async def test_revision_reconsiders_saved_wait_without_satisfying_dependency(cas
     predicate = {"mode": "all", "requirements": [{"key": "result", "task_id": dependency["id"],
                  "task_revision": 1, "policy": "general.peer@1"}]}
     checkpoint = {"summary": "The required result is still missing.", "next_action": "Reconsider the revised task."}
-    waiting = await command(hub, "task.pause", {"reason": "Blocked", "checkpoint": checkpoint,
+    waiting = await legacy_wait(hub, {"reason": "Blocked", "checkpoint": checkpoint,
                             "predicate": predicate}, worker(attempt))
     if already_quiet:
         await quiet(hub, attempt)
@@ -110,7 +112,7 @@ async def test_departure_ends_continuation_and_makes_the_worker_idle_for_new_wor
     await open_collaboration(hub, task["id"])
     await claim(hub, task, run, plan="Preserve the remaining execution.")
     dependency = await publish(hub, "Independent prerequisite")
-    waiting = await command(hub, "task.pause", {"reason": "Waiting for prerequisite", "predicate": {
+    waiting = await legacy_wait(hub, {"reason": "Waiting for prerequisite", "predicate": {
         "requirements": [{"key": "result", "task_id": dependency["id"], "task_revision": 1,
                           "policy": "general.peer@1"}]}}, worker(attempt))
     await quiet(hub, attempt)
@@ -276,7 +278,7 @@ async def test_workspace_conflict_holds_only_one_member_and_preserves_original_r
 @pytest.mark.parametrize("activation", ["continuation", "message"])
 async def test_workspace_failure_preserves_resume_or_message_and_dispatches_other_work(case, activation):
     hub, task, run, first, clock = case
-    await command(hub, "task.pause", {"reason": "Retain saved work."}, worker(first))
+    await legacy_wait(hub, {"reason": "Retain saved work."}, worker(first))
     await quiet(hub, first)
     if activation == "continuation":
         await revise(hub, task)
@@ -300,7 +302,7 @@ async def test_workspace_failure_preserves_resume_or_message_and_dispatches_othe
 @pytest.mark.asyncio
 async def test_workspace_hold_while_assigning_an_idle_worker_recovers_without_task_membership(case):
     hub, task, run, first, _ = case
-    await command(hub, "task.pause", {"reason": "Save work before permanent departure."}, worker(first))
+    await legacy_wait(hub, {"reason": "Save work before permanent departure."}, worker(first))
     await quiet(hub, first)
     await command(hub, "task.leave", {"task_id": task["id"], "worker_id": first["worker_id"],
                   "permanent": True, "reason": "The executor permanently leaves."})
@@ -417,7 +419,7 @@ async def test_lost_declarer_cancellation_requires_evidence_then_fresh_declarati
     with pytest.raises(HubError) as active:
         await command(hub, "task.complete.cancel", recovery)
     assert active.value.code == "QUIESCENCE_REQUIRED"
-    await command(hub, "task.pause", {"reason": "Retain declarer work before recovery"}, worker(first))
+    await legacy_wait(hub, {"reason": "Retain declarer work before recovery"}, worker(first))
     await quiet(hub, first)
     with pytest.raises(HubError) as missing:
         await command(hub, "task.complete.cancel", {"declaration_id": declaration["id"]})
@@ -434,7 +436,7 @@ async def test_lost_declarer_cancellation_requires_evidence_then_fresh_declarati
 
 async def test_post_claim_checkout_failure_preserves_wait_and_admits_other_work(case, monkeypatch):
     hub, task, run, first, clock = case
-    await command(hub, "task.pause", {"reason": "Retain the original checkpoint."}, worker(first))
+    await legacy_wait(hub, {"reason": "Retain the original checkpoint."}, worker(first))
     await quiet(hub, first)
     await revise(hub, task)
     other = await publish(hub, "Other work remains possible during a disk fault")

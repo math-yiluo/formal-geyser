@@ -21,6 +21,7 @@ from tests.coordination.test_lifecycle_repairs import (
     quiet,
     worker,
 )
+from tests.coordination.wait_helpers import legacy_wait
 
 
 @pytest.fixture
@@ -217,7 +218,7 @@ async def test_failed_root_drain_preserves_committed_voluntary_wait(case):
     hub, task, run, author = case
     waiting_task = await publish(hub, "Retain its voluntary wait")
     waiting = await claim(hub, waiting_task, run)
-    wait = await command(hub, "task.pause", {"reason": "Save work until prerequisites arrive"}, worker(waiting))
+    wait = await legacy_wait(hub, {"reason": "Save work until prerequisites arrive"}, worker(waiting))
     artifact_id = await accepted(hub, author, run)
     completion = await declaration(hub, task, author, [artifact_id])
     await finalize(hub, completion, author)

@@ -273,7 +273,7 @@ async def test_ack_failure_after_native_start_cannot_confirm_omission_state(proj
 
 async def test_waiting_message_turn_is_targeted_and_does_not_silently_resume(project):
     await tick(project)
-    pause = ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {
+    pause = ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {"predicate": {"external_response_id": "unanswered-request"}, 
         "reason": "Await human guidance.",
         "checkpoint": {"summary": "Paused with preserved work.", "next_action": "Read a concrete user message."}}})
     _, _, result = await tick(project, scripted(pause))
@@ -293,7 +293,7 @@ async def test_waiting_message_turn_is_targeted_and_does_not_silently_resume(pro
 
 async def test_a_message_turn_keeps_the_work_baseline_and_the_workers_own_pause_is_no_news(project):
     await tick(project)
-    pause = ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {
+    pause = ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {"predicate": {"external_response_id": "unanswered-request"}, 
         "reason": "Await human guidance.",
         "checkpoint": {"summary": "Paused with preserved work.", "next_action": "Read a concrete user message."}}})
     _, _, result = await tick(project, scripted(pause))

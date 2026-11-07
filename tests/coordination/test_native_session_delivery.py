@@ -146,7 +146,7 @@ async def test_success_continues_original_thread_and_recruitment_helper_never_be
         run = await command(hub, "run.start")
         main = ScriptedHarness([ScriptedTurn([])])
         choice = ScriptedHarness([ScriptedTurn([], visible_output='{"decision":false}')])
-        continuation = ScriptedHarness([ScriptedTurn([ScriptedAction("taskhub_call", {"operation": 'pause', "arguments": {"reason": "Preserve progress until actionable work is available.", **({"checkpoint": {"summary": "Saved work", "next_action": "Await new information"}})}})])])
+        continuation = ScriptedHarness([ScriptedTurn([ScriptedAction("taskhub_call", {"operation": 'pause', "arguments": {"predicate": {"external_response_id": "unanswered-request"}, "reason": "Preserve progress until actionable work is available.", **({"checkpoint": {"summary": "Saved work", "next_action": "Await new information"}})}})])])
         runners = iter([main, choice, continuation])
         runner = WorkerRunner(hub, lambda: next(runners))
         first = await runner.run_once(run["id"])
@@ -181,7 +181,7 @@ async def test_directed_reply_turn_preserves_wait_and_never_spawns_a_worker(tmp_
     try:
         await command(hub, "task.publish", {"contract": {"title": "Waiting task", "objective": "Preserve context while waiting", "payload": {}}})
         run = await command(hub, "run.start")
-        waiting = ScriptedHarness([ScriptedTurn([ScriptedAction("taskhub_call", {"operation": 'pause', "arguments": {"reason": "Preserve progress until actionable work is available.", **({"checkpoint": {"summary": "Saved", "next_action": "Wait"}})}})])])
+        waiting = ScriptedHarness([ScriptedTurn([ScriptedAction("taskhub_call", {"operation": 'pause', "arguments": {"predicate": {"external_response_id": "unanswered-request"}, "reason": "Preserve progress until actionable work is available.", **({"checkpoint": {"summary": "Saved", "next_action": "Wait"}})}})])])
         reply = ScriptedHarness([ScriptedTurn([])])
         factory = iter([waiting, reply])
         runner = WorkerRunner(hub, lambda: next(factory))
@@ -286,7 +286,7 @@ async def test_full_human_message_reference_needs_only_one_reply_turn(tmp_path):
     harnesses = []
 
     def factory():
-        actions = [] if harnesses else [ScriptedAction("taskhub_call", {"operation": 'pause', "arguments": {"reason": "Preserve progress until actionable work is available.", **({
+        actions = [] if harnesses else [ScriptedAction("taskhub_call", {"operation": 'pause', "arguments": {"predicate": {"external_response_id": "unanswered-request"}, "reason": "Preserve progress until actionable work is available.", **({
             "checkpoint": {"summary": "Saved waiting state", "next_action": "Wait for directed input"}})}})]
         harness = ScriptedHarness([ScriptedTurn(actions)])
         harnesses.append(harness)

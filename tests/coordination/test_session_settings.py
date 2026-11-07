@@ -19,6 +19,7 @@ from formal_geyser.coordination.models import (
     ConcurrencyConfig,
     ProjectConfig,
     Role,
+    RoleModelConfig,
 )
 from formal_geyser.coordination.runtime import (
     ScriptedHarness,
@@ -32,6 +33,7 @@ from tests.coordination.test_collaborative_core import claim, publish
 
 CONFIG = ProjectConfig(codex=CodexConfig(model="gpt-6-astra", effort="xhigh", review_effort="max", integrator_effort="max"),
                        claude=ClaudeConfig(model="claude-opus-5-5", effort="xhigh"),
+                       reviewers=RoleModelConfig(model="gpt-6-astra"), integrator=RoleModelConfig(model="gpt-6-astra"),
                        assignment=AssignmentConfig(worker_backends=["codex"], reviewer_backend="codex"),
                        concurrency=ConcurrencyConfig(codex=60, claude=12))
 
@@ -79,6 +81,7 @@ async def test_a_role_choice_applies_to_new_conversations_only(hub):
                                                           "apply_to_existing": True})
     assert models["worker"]["codex"] == {"model": "gpt-6.1-sol", "effort": "high", "source": "operator",
                                          "kept_by_existing": 0}
+    # Reviewers keep their own: [reviewers] model and the project's review_effort.
     assert models["review"] == {"codex": {"model": "gpt-6-astra", "effort": "max", "source": "config",
                                           "kept_by_existing": 0}}
     # The running conversation keeps its own; the next one starts with the choice.
@@ -91,6 +94,27 @@ async def test_a_role_choice_applies_to_new_conversations_only(hub):
     await command(hub, "runtime.set_role_model", {"role": "worker", "backend": "codex", "model": None, "effort": None,
                                                   "apply_to_existing": True})
     assert (await hub.session_settings(worker["id"]))["model"] == "gpt-6-astra"
+
+
+async def test_each_role_has_its_own_choice_and_none_takes_anothers(hub, tmp_path_factory):
+    models = (await hub.backend_status())["role_models"]
+    assert models["integrator"] == {"codex": {"model": "gpt-6-astra", "effort": "max", "source": "config",
+                                              "kept_by_existing": 0}}
+    models = await command(hub, "runtime.set_role_model", {"role": "integrator", "backend": "codex",
+                                                          "model": "gpt-6.1-terra", "effort": "medium"})
+    assert (models["integrator"]["codex"]["model"], models["review"]["codex"]["model"]) == ("gpt-6.1-terra", "gpt-6-astra")
+    with pytest.raises(HubError):  # The Integrator runs on Codex.
+        await command(hub, "runtime.set_role_model", {"role": "integrator", "backend": "claude", "model": "claude-opus-5-5"})
+    # Where only the workers are chosen, reviewers and the Integrator have nothing.
+    other = tmp_path_factory.mktemp("plain")
+    initialize(other, ProjectConfig(codex=CodexConfig(model="gpt-6-astra", effort="xhigh")))
+    plain = Hub(other)
+    try:
+        status = (await plain.backend_status())["role_models"]
+        for role in ("review", "integrator"):
+            assert status[role]["codex"] == {"model": None, "effort": None, "source": None, "kept_by_existing": 0}
+    finally:
+        await plain.close()
 
 
 async def test_a_role_choice_reaches_existing_workers_only_when_applied_to_them(hub):
@@ -125,12 +149,13 @@ async def test_a_role_choice_reaches_existing_workers_only_when_applied_to_them(
                                                           "effort": "low", "apply_to_existing": True})
     assert models["worker"]["codex"]["kept_by_existing"] == 0
     assert {await started(item) for item in (old, newer, elsewhere)} == {("gpt-7", "low")}
-    # Reviewers and the Integrator keep their own efforts the same way.
+    # Reviewers keep their own efforts the same way; the Integrator's choice is its own.
     reviewer = await command(hub, "worker.register", {"kind": "review"})
-    await command(hub, "worker.register", {"kind": "integrator"})
+    integrator = await command(hub, "worker.register", {"kind": "integrator"})
     models = await command(hub, "runtime.set_role_model", {"role": "review", "backend": "codex",
                                                           "model": "gpt-6-astra", "effort": "high"})
-    assert models["review"]["codex"]["kept_by_existing"] == 2
+    assert models["review"]["codex"]["kept_by_existing"] == 1
+    assert await started(integrator) == ("gpt-6-astra", "max")
     assert await started(reviewer) == ("gpt-6-astra", "max")
     assert await started(await command(hub, "worker.register", {"kind": "review"})) == ("gpt-6-astra", "high")
     with pytest.raises(HubError):

@@ -79,6 +79,20 @@ def _size(path: Path) -> int:
     return total
 
 
+def _slots(namespace: Path) -> list[Path]:
+    """The namespace's build slots, most recently used first; cleared slots come last."""
+    return sorted((p for p in namespace.iterdir() if p.name.isdecimal() and p.is_dir()
+                   and not p.is_symlink()),
+                  key=lambda p: (p / "last-used").stat().st_mtime
+                  if (p / "last-used").exists() else 0, reverse=True)
+
+
+def _used(slot: Path) -> float:
+    """When a build last held the slot; a cleared slot counts from its clearing."""
+    marker = slot / "last-used"
+    return marker.stat().st_mtime if marker.exists() else slot.stat().st_mtime
+
+
 @contextmanager
 def _idle_slots(root: Path, namespace: Path):
     """Hold only one idle namespace at a time, including older slot-only locks."""
@@ -86,10 +100,7 @@ def _idle_slots(root: Path, namespace: Path):
         if not locks.enter_context(lock_file(root / "locks" / (namespace.name + ".lock"))):
             yield None
             return
-        slots = sorted((p for p in namespace.iterdir() if p.name.isdecimal() and p.is_dir()
-                        and not p.is_symlink()),
-                       key=lambda p: (p / "last-used").stat().st_mtime
-                       if (p / "last-used").exists() else 0, reverse=True)
+        slots = _slots(namespace)
         for slot in slots:
             if not locks.enter_context(lock_file(slot / "build.lock")):
                 yield None
@@ -113,10 +124,44 @@ def _clear_slot(root: Path, slot: Path) -> None:
             path.unlink()
 
 
+def _trim_active(root: Path, namespace: Path, *, now: float, max_idle: int,
+                 idle_seconds: float, errors: list[str],
+                 slot_limit: int | None = None) -> tuple[int, int]:
+    """Clear old idle slots of a namespace that builds are using: (slots, bytes) removed.
+
+    Its builds hold the namespace lock shared while they run, and with one pinned environment
+    some build always does, so the namespace lock is not taken here and the artifact cache
+    stays. Each slot is locked exclusively, without blocking, only while it is looked at or
+    cleared: a slot a build holds is skipped, and a build that finds a slot held here takes
+    the next free one rather than wait. The `max_idle` most recently used idle slots stay
+    warm; another idle slot is cleared once it has gone unused for `idle_seconds`. A slot past
+    `slot_limit` is cleared as soon as it is idle: builds no longer take it."""
+    cleared = removed = kept = 0
+    for slot in _slots(namespace):
+        try:
+            with lock_file(slot / "build.lock") as idle:
+                if not idle or all(p.name == "build.lock" for p in slot.iterdir()):
+                    continue  # A build holds it, or nothing is left to clear.
+                if slot_limit is not None and int(slot.name) >= slot_limit:
+                    size = _size(slot)
+                    _clear_slot(root, slot)
+                    cleared, removed = cleared + 1, removed + size
+                elif kept < max_idle:
+                    kept += 1
+                elif now - _used(slot) > idle_seconds:
+                    size = _size(slot)
+                    _clear_slot(root, slot)
+                    cleared, removed = cleared + 1, removed + size
+        except (OSError, ValueError) as error:
+            errors.append(str(error))
+    return cleared, removed
+
+
 def collect(root: Path, *, now=None, max_bytes=MAX_CACHE_BYTES,
             max_idle=MAX_IDLE_SLOTS, idle_seconds=IDLE_SECONDS, force=False,
-            active_namespace: str | None = None) -> dict:
-    """Best-effort GC. Active namespaces are never evicted, even above the target."""
+            active_namespace: str | None = None, slot_limit: int | None = None) -> dict:
+    """Best-effort GC. Active namespaces are never evicted, even above the target; only their
+    old idle slots are cleared, one slot lock at a time (_trim_active)."""
     now = time.time() if now is None else now
     root.mkdir(parents=True, exist_ok=True)
     status = root / "retention.json"
@@ -167,8 +212,7 @@ def collect(root: Path, *, now=None, max_bytes=MAX_CACHE_BYTES,
                         active.add(namespace.name)
                         continue
                     for i, slot in enumerate(slots):
-                        used = (slot / "last-used").stat().st_mtime if (slot / "last-used").exists() else slot.stat().st_mtime
-                        if i >= max_idle or now - used > idle_seconds or over_budget:
+                        if i >= max_idle or now - _used(slot) > idle_seconds or over_budget:
                             size = _size(slot)
                             _clear_slot(root, slot)
                             total -= size
@@ -179,9 +223,22 @@ def collect(root: Path, *, now=None, max_bytes=MAX_CACHE_BYTES,
                             total -= size
             except (OSError, ValueError) as error:
                 errors.append(str(error))
+        # An active namespace is never evicted or sized, but its idle slots still expire.
+        slots_cleared = slot_bytes = 0
+        for namespace in namespaces:
+            if namespace.name not in active:
+                continue
+            try:
+                cleared, size = _trim_active(root, namespace, now=now, max_idle=max_idle,
+                                             idle_seconds=idle_seconds, errors=errors,
+                                             slot_limit=slot_limit)
+                slots_cleared, slot_bytes = slots_cleared + cleared, slot_bytes + size
+            except (OSError, ValueError) as error:
+                errors.append(str(error))
         result = {"checked_at": now, "bytes": max(0, total),
-                  "removed_bytes": max(0, before - total), "target_bytes": max_bytes,
+                  "removed_bytes": max(0, before - total) + slot_bytes, "target_bytes": max_bytes,
                   "size_scope": "observed_idle_namespaces",
-                  "active_namespaces_skipped": len(active), "errors": errors}
+                  "active_namespaces_skipped": len(active),
+                  "active_slots_cleared": slots_cleared, "errors": errors}
         status.write_text(json.dumps(result), encoding="utf-8")
         return result

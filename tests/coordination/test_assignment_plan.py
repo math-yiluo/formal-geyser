@@ -90,7 +90,8 @@ async def test_reviewers_can_rotate_conservatively_while_workers_rotate_aggressi
 def test_reviewers_and_the_integrator_can_have_their_own_effort():
     codex = CodexConfig(effort="xhigh", review_effort="max", integrator_effort="max")
     assert [codex.effort_for(kind) for kind in ("ordinary", "review", "integrator")] == ["xhigh", "max", "max"]
-    assert ClaudeConfig(effort="xhigh").effort_for("review") == "xhigh"  # Unset follows the backend's effort.
+    # Unset is unchosen: a reviewer no longer takes the workers' effort.
+    assert ClaudeConfig(effort="xhigh").effort_for("review") is None
 
 
 async def test_an_activation_opens_its_harness_for_the_agents_role(tmp_path, monkeypatch):

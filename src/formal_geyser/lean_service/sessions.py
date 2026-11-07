@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
+from .. import offload
 from ..coordination.runtime.process import OwnedProcessHost, ProcessHostError
 from ..coordination.storage import digest
 from ..lake_build import _synchronize, environment_key
@@ -171,6 +172,17 @@ class Session:
 
 def _uri(path: Path) -> str:
     return path.resolve().as_uri()
+
+
+def _prepared_session(root: Path, sources: dict[str, bytes], key: str, libraries: list[Path], module: str) -> str:
+    """Project the sources into a session's slot and digest the project modules `module` imports.
+    Both read the whole Library, so a check runs them in one bookkeeping call (offload)."""
+    from .executor import project_closure
+
+    _synchronize(root, sources, key, libraries)
+    imported = project_closure(sources, [module]) - {module}
+    return digest({path: hashlib.sha256(body).hexdigest() for path, body in sources.items()
+                   if module_name(path) in imported})
 
 
 def _header(source: bytes) -> str:
@@ -336,15 +348,11 @@ class SessionPool:
     async def _elaborate(self, session: Session, sources: dict[str, bytes], module: str, relative: str,
                          libraries: list[Path], time_limit: float | None = None,
                          paused: Callable[[], float] | None = None) -> dict:
-        from .executor import project_closure
-
         started = time.monotonic()
-        await asyncio.to_thread(_synchronize, session.root, sources, session.environment_key, libraries)
+        dependencies = await offload.call(_prepared_session, session.root, sources, session.environment_key,
+                                          libraries, module)
         text = sources[relative].decode("utf-8-sig", errors="replace")
         header = _header(sources[relative])
-        imported = project_closure(sources, [module]) - {module}
-        dependencies = digest({path: hashlib.sha256(body).hexdigest() for path, body in sources.items()
-                               if module_name(path) in imported})
         uri = _uri(session.root / "source" / relative)
         document = session.documents.get(uri)
         reason = None

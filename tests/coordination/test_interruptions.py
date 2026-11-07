@@ -261,7 +261,7 @@ async def test_runtime_operator_pause_then_resume_original_thread_with_increment
 
     def factory():
         harness = PausedHarness() if not harnesses else ScriptedHarness([
-            ScriptedTurn(actions=[ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {
+            ScriptedTurn(actions=[ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {"predicate": {"external_response_id": "unanswered-request"}, 
                 "reason": "The recovered configuration is saved for later work.",
                 "checkpoint": {"summary": "Recovered the saved configuration and collected all results.",
                                "next_action": "Continue from the saved configuration."}}})],
@@ -317,7 +317,7 @@ async def test_missing_input_task_does_not_block_independent_ready_work(hub):
     good = await command(hub, "task.publish", {"contract": {
         "title": "Independent work", "objective": "Produce a standalone software result.", "priority": 1}})
     runner = WorkerRunner(hub, lambda: ScriptedHarness([ScriptedTurn(actions=[
-        ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {
+        ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {"predicate": {"external_response_id": "unanswered-request"}, 
             "reason": "The independent task is assigned and preserved for later work.",
             "checkpoint": {
                 "summary": "Took the independent work despite an unrelated missing input.",

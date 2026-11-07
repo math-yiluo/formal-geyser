@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 from .errors import HubError
@@ -26,6 +29,8 @@ CREATE INDEX IF NOT EXISTS native_validation_retry ON native_call_receipts(valid
  WHERE validation_state='completed' AND validation_retry_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS native_validation_open ON native_call_receipts(validation_state)
  WHERE validation_state IN ('pending','queued');
+CREATE INDEX IF NOT EXISTS native_validation_running ON native_call_receipts(validation_state)
+ WHERE validation_state='running';
 """
 
 RETRY_BASE_MS = 5 * 60 * 1000
@@ -516,9 +521,53 @@ class GatewayReceipts:
             return {**row, "validation_state": state, "validation_run_id": run_id}
         return await self.db.call(read, write=True)
 
+    @contextmanager
+    def attached_validation(self, artifact_id: str) -> Iterator[None]:
+        """While this TaskHub waits for a validation's result (runner._validate), whatever runner
+        or worker turn waits: only such a wait leaves its validation 'running'."""
+        attached = self.__dict__.setdefault("_attached_validations", Counter())
+        attached[artifact_id] += 1
+        try:
+            yield
+        finally:
+            attached[artifact_id] -= 1
+            if attached[artifact_id] <= 0:
+                del attached[artifact_id]
+
+    def _requeue_stranded_validations(self, c, run_id, attached) -> None:
+        """A 'running' validation that no wait in this TaskHub holds any more goes back as a restart
+        would put it (_recover_native_validations). Its wait ended before it could record why: in
+        the Linux pilot, on a full disk, the report of a finished check could not be kept, nor the
+        state changed, and two validations stayed 'running' with their results in the Lean service."""
+        survive = None
+        for row in c.execute("SELECT n.validation_artifact_id,n.worker_id,n.validation_report_json "
+                             "FROM native_call_receipts n JOIN workers w ON w.id=n.worker_id "
+                             "WHERE n.validation_state='running' AND w.run_id=?", (run_id,)).fetchall():
+            if row["validation_artifact_id"] in attached:
+                continue
+            if row["validation_report_json"] is not None:
+                state, reason = "pending", None
+            else:
+                if survive is None:
+                    survive = self._validations_survive()
+                state, reason = (("queued", "Its wait ended without a result; asking again attaches to the check")
+                                 if survive else
+                                 ("uncertain", "Its wait ended without a result; confirm its checker stopped"))
+            c.execute("UPDATE native_call_receipts SET validation_state=?,validation_reason=? "
+                      "WHERE validation_artifact_id=? AND validation_state='running'",
+                      (state, reason, row["validation_artifact_id"]))
+            self._event(c, "validation.stranded", row["validation_artifact_id"], {"state": state},
+                        worker_id=row["worker_id"])
+            if state == "uncertain":
+                self._wake(c)
+
     async def pending_native_validations(self, run_id, *, worker_id=None):
+        # Taken with the call, before any validation that starts later can reach the database.
+        attached = frozenset(self.__dict__.get("_attached_validations", ()))
+
         def read(c):
             scope = self._admission_scope(c, run_id)
+            self._requeue_stranded_validations(c, run_id, attached)
             self._queue_due_validations(c, run_id, scope)
             # A queued validation is attached to again whatever its author does, paused or
             # quarantined included; the author's own activation only finishes interrupted ones first.

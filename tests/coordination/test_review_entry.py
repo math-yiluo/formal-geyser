@@ -30,6 +30,8 @@ from formal_geyser.coordination.storage import canonical, digest
 from tests.coordination.lifecycle_helpers import select_review
 from tests.coordination.publication_helpers import file_payload, new_hub
 
+from .wait_helpers import legacy_wait
+
 
 async def command(hub, name, payload=None, actor=None):
     return await hub.execute(Command(name=name, key=uuid4().hex, payload=payload or {}),
@@ -240,7 +242,7 @@ async def test_exact_details_stay_stable_across_new_reviewer_attempts_but_track_
     await command(case.hub, "review.accept", {**initial["review_request"]["basis"],
         "rationale": "Inspect the immutable fixture.", "evidence": ["Checked the exact record."],
     }, actor(case.reviewer))
-    await command(case.hub, "task.pause", {"checkpoint": {
+    await legacy_wait(case.hub, {"checkpoint": {
         "summary": "The accepted candidate is unchanged.", "next_action": "Resume this review."}},
         actor(case.reviewer))
     await command(case.hub, "runtime.quiescent", {

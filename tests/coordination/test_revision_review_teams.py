@@ -10,6 +10,8 @@ from formal_geyser.coordination.hub import Hub
 from formal_geyser.coordination.models import Actor, Command, ProjectConfig, Role
 from tests.coordination.lifecycle_helpers import open_collaboration
 
+from .wait_helpers import legacy_wait
+
 OP = Actor(role=Role.OPERATOR)
 RUNNER = Actor(role=Role.RUNNER)
 
@@ -54,7 +56,7 @@ async def test_executor_revision_wakes_exact_original_publisher_continuation(hub
     predicate = {"requirements": [{"key": "child", "task_id": child["id"], "task_revision": 1, "policy": "general.peer@1"}]}
     path = hub.workspace(publisher["worker_id"]) / "parent-progress.txt"
     path.write_text("Retain exact original work.", encoding="utf-8")
-    wait = await command(hub, "task.wait", {"checkpoint": checkpoint, "predicate": predicate}, actor(publisher))
+    wait = await legacy_wait(hub, {"checkpoint": checkpoint, "predicate": predicate}, actor(publisher))
     await quiet(hub, publisher)
     before = next(item for item in await hub.list_continuations() if item["id"] == wait["continuation_id"])
     executor = await claim(hub, child, run)

@@ -22,6 +22,8 @@ from formal_geyser.coordination.repository import RepositoryStore
 from tests.coordination.lifecycle_helpers import finish_ordinary, resolve_recruitment, select_review
 from tests.coordination.publication_helpers import publish_batch
 
+from .wait_helpers import legacy_wait
+
 OPERATOR = Actor(role=Role.OPERATOR)
 RUNNER = Actor(role=Role.RUNNER)
 VALIDATOR = Actor(role=Role.VALIDATOR)
@@ -141,7 +143,7 @@ async def test_acceptance_ownership_survives_release_and_cannot_be_rewritten(rev
     with pytest.raises(HubError) as error:
         await command(hub, "review.accept", decision(case, rationale="A replacement decision."), worker(case.reviewer))
     assert error.value.code == "REVIEW_ALREADY_ACCEPTED"
-    await command(hub, "task.pause", {"checkpoint": CHECKPOINT}, worker(case.reviewer))
+    await legacy_wait(hub, {"checkpoint": CHECKPOINT}, worker(case.reviewer))
     await quiet(hub, case.reviewer)
     other = await command(hub, "worker.register")
     with pytest.raises(HubError) as error:

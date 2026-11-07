@@ -33,8 +33,9 @@ trees; use Git branches. Package and dependency versions stay as locked.
 | Task 0 | The root task that preserves the user's original request. Its completion stops autonomous work. |
 | Worker | A persistent execution identity (`Worker 0`, `Worker 1`, …) with one workspace, at most one current task, and one current native conversation (a new one for each new task and after each rotation). |
 | Reviewer | A disposable execution identity (`Reviewer 1`, …) that executes exactly one review task. Never reused. |
-| Helper | A disposable decision: whether a task recruits, or which idle worker takes an open task. Runs on the decision model in a new conversation with no tools. Not a worker; it only decides. |
+| Helper | A disposable decision: whether a task recruits, which idle worker takes an open task, or which subscribed waits a publication ends. Runs on the decision model (wake decisions on the Waker's) in a new conversation with no tools. Not a worker; it only decides. |
 | Dispatcher | The system identity that owns assignment decisions. It never executes a task. |
+| Waker | The system identity that owns wake decisions: after each publication of Lean, whether what a subscribed task published meets a waiting worker's need. It never executes a task. |
 | Membership | A worker's standing in a task team. Distinct from active execution and from waiting. |
 | Artifact | A mathematical contribution: a definition, proposition statement, or proof, submitted as a same-stem `.lean` + `.md` pair. Once published it is history; the Library keeps no per-artifact identity. |
 | Note | Any other contribution (public wiki pages, reports). |
@@ -134,6 +135,15 @@ trees; use Git branches. Package and dependency versions stay as locked.
   restarts a stopped project or rehabilitates an old receipt.
 - **Retirement.** An ordinary task is retired when all executors permanently leave
   or its saved execution cannot be recovered; publishers and dependents are notified.
+- **Invited back.** While a task has an executor, that executor or the operator can bring
+  back a worker that left it (`task.invite_back`, with a reason). Only a former executor
+  returns, so a task still has at most two executors over its lifetime. The worker becomes a
+  member again, like a paused member whose wait has just ended: a `reconsider` continuation
+  (`invited_back`) from its last attempt's checkpoint and files, which admission resumes;
+  a `task.invited_back` event tells it who invited it and why. A worker that is in a turn,
+  recovering, holding an interrupted turn, or working on another unfinished task cannot
+  be invited (`WORKER_BUSY`): the inviter messages it instead. A done or retired task, and
+  a membership ended by completion, take no one back.
 - **Planning DAGs.** Two project-wide planning graphs (definitions and proofs) belong
   to no task. Every active worker and reviewer may maintain them through `dag_update`
   (the Integrator only reads them); they are never acceptance evidence. An update
@@ -280,9 +290,18 @@ trees; use Git branches. Package and dependency versions stay as locked.
   about the review starts a new conversation from it. In Test 2, 91 operator notices to
   finished reviewers resumed their whole old conversations, about 65M tokens. Each
   integration batch starts a new conversation.
-- **Decisions** (recruitment and assignment) run on the decision model, by default
-  `gpt-6.1-sol` with high effort, which the operator can change at runtime
-  (`runtime.set_decision_model`, `taskctl backend decision-model`). Each runs in a new
+- **Choices before a run.** No role has a default model or effort, and no role takes
+  another's: workers on each backend Claude workers can start on, reviewers, the
+  Integrator, the Dispatcher and the Waker each have their own, as does the answer
+  deadline. Each is chosen in project.toml (`[codex]`/`[claude]` for workers,
+  `[reviewers]`, `[integrator]`, `[decisions]`, `[waker]`, `[waits]`) or by the operator in
+  Project setup's Agents and sessions panel. TaskHub starts without them, but a run
+  starts or resumes (`run.start`, `run.resume`, `worker.resume`, `group.resume`) only once
+  every one is chosen (`CHOICES_REQUIRED` lists what is missing; `GET /v1/runtime/backend`
+  reports it as `missing_choices`).
+- **Decisions** (recruitment and assignment) run on the Dispatcher's model, which the
+  operator can change at runtime (`runtime.set_decision_model`, `taskctl backend
+  decision-model`). Each runs in a new
   Codex conversation with no tools and a minimal self-contained prompt, and answers only
   its schema: `{"worker": one of the offered names or null}` or `{"decision": true or
   false}`. An answer outside the schema counts as none or no and is recorded as invalid.
@@ -312,8 +331,40 @@ trees; use Git branches. Package and dependency versions stay as locked.
   conversation context; the audited 0.160.0 transport requests metadata only,
   avoiding a full-history response that grows past the RPC frame limit.
 - **Sleep and wake.** Workers express intention changes through `pause` (reason,
-  checkpoint, optional dependency predicate) and `resume_work`. Waiting runs no
-  inference. A directed human or eligible peer message steers into an active Codex
+  checkpoint, and a predicate naming what ends it) and `resume_work`. Waiting runs no
+  inference. A pause waits for one of three things; one with none is refused
+  (`WAIT_CONDITION_REQUIRED`), and a member with nothing left to do leaves the task
+  instead; another executor can invite it back. Since 2026-11-07 a pause takes no `requirements` (`PAUSE_REQUIREMENTS_REMOVED`);
+  stored waits keep theirs and wake as before.
+  - *Another task's results:* `subscriptions`, each a fixed task id and its `need`, the
+    results awaited in words. The task must be another open one. After each integration
+    batch that publishes Lean (anything but public notes), the Waker gets one decision
+    covering every wait subscribed to a task that published in it: for each (wait, task)
+    pair, the need and that task's artifacts published to the Library since the wait
+    began (id, kind, declaration, statement declaration, entry module, task title,
+    publication time), read when the decision runs. It answers one boolean per pair. A
+    wake ends the wait (`reconsider`, `subscribed_task_changed`) and tells the worker
+    only that its subscribed task changed; the worker checks the Library itself. An
+    answer outside the schema, or none in time, asks again, five times in all; then the
+    decision waits for the operator as an uncertain helper. A pause that stops it asks
+    again later. A subscribed task that becomes done or retired ends the wait too
+    (`subscribed_task_done`, `subscribed_task_retired`). The Waker's model and effort
+    are chosen like every role's (see Choices before a run).
+  - *Its own submission's result:* `validations`, `completion_declaration_id`.
+  - *A person's answer:* `answers`, ids of questions the worker asked in peer talk, or
+    `external_response_id`, the operator's answer to its request. Each such wait gets a
+    deadline from the answer deadline (`waits.answer_deadline_minutes`, or the operator's
+    `runtime.set_answer_deadline`); the driver ends overdue ones
+    (`reconsider`, `answer_deadline`), reading the deadlines at most once a minute.
+
+  `mode` combines all but subscriptions, each of which ends the wait by itself.
+- **No wait cycles.** Task A waits on task B when a waiting worker of A subscribes to B,
+  when a wait recorded before 2026-11-07 names B in a requirement, or when A's contract
+  requires B while A is open. The graph is derived from these records whenever a
+  subscription is made (`wait_graph.py`), so it never drifts. A subscription to the
+  waiting task itself, or one that would close a cycle, is refused
+  (`SUBSCRIPTION_CYCLE`), naming the cycle's tasks by id and title.
+- **Messages and waits.** A directed human or eligible peer message steers into an active Codex
   turn (a Claude worker receives it at its next turn or when it calls `sync`), or
   wakes a sleeping worker for one message-handling turn in its current conversation
   (a new one if a rotation is due), after which it returns to waiting unless it
@@ -321,7 +372,11 @@ trees; use Git branches. Package and dependency versions stay as locked.
   combined; transport receipts never wake anyone. A satisfied recorded predicate
   resumes work; a message claiming success is not proof. A wait on a candidate that can
   no longer be accepted (rejected, withdrawn or superseded) is reconsidered, whoever
-  waits.
+  waits. A requirement, in a predicate or a task contract, names an artifact or a task
+  revision and no policy: it holds once the artifact's newest version is accepted, or the
+  task is completed with an accepted output, whatever kind (definition, statement, proof)
+  it is. A former `policy` in a stored or supplied requirement is ignored, also in
+  comparisons of task substance.
 
 ## 6. Review, integration, and publication
 
@@ -531,7 +586,10 @@ trees; use Git branches. Package and dependency versions stay as locked.
   The existing inspector checks each submitted declaration's allowed assumptions.
 - **Incremental builds.** Each instance retains `.task-based/objects/lake/workspaces/`
   and `.task-based/objects/lake/cache/`. A free persistent slot owns one build at a time;
-  concurrent checks use separate slots. The Lean service (below) runs every build and
+  concurrent checks use separate slots, at most `[lean_service] build_slots` (8) of them:
+  each holds a full copy of the Library's build, so a build past the limit waits, first come
+  first served, for a slot to free, and an idle slot past the limit is cleared as soon as it
+  is idle. The Lean service (below) runs every build and
   chooses its `LEAN_NUM_THREADS`; unexpected resource failures remain unavailable. Lake owns
   module traces and artifact reuse. Registered prebuilt libraries are supplied
   through local prebuilt-only Lake package descriptors, never downloaded or rebuilt by validation. Exact compiler,
@@ -540,7 +598,12 @@ trees; use Git branches. Package and dependency versions stay as locked.
   source or incomplete/corrupted outputs discard stale local build outputs. A slot
   reuses its earlier compiled outputs while each keeps the size, timestamps and file
   ID recorded in the slot's receipt; an output whose identity differs must match its
-  recorded hash, or the slot's outputs are discarded.
+  recorded hash, or the slot's outputs are discarded. Retention
+  ([lake-validation.md](docs/lake-validation.md#retention)) clears the slots and caches of
+  idle namespaces by slot count, age and a soft size target. In a namespace builds are
+  using, the only one with a single pinned environment, it keeps the two most recently
+  used idle slots warm and clears every other idle slot after 24 hours unused, one slot
+  lock at a time; it never clears a slot a build holds or that namespace's artifact cache.
 - **Failure verdicts.** Reported source/type/target findings reject. Environment
   loading failures, process crashes, memory exhaustion, interrupted checks and
   incomplete reports are unavailable. An inconclusive recheck never permanently
@@ -616,6 +679,9 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
   exits. TaskHub restarts and deployments leave it, its jobs and its warm pages in
   place; `formalizectl lean-service start|stop|restart|status|telemetry` manage it. Its jobs,
   results, estimates and machine samples are in `.task-based/lean-service/service.sqlite3`.
+  Each check's reading, syncing and hashing of the Library's sources and build outputs runs in
+  a pool of bookkeeping processes (`bookkeeping_processes`), not in the server's own
+  interpreter, which that work alone otherwise saturates.
 - **Two lanes, differing in what a result is for, not in speed.** A development check
   (`lean_check`, `formalizectl check`) reads an agent's working files in place, builds them
   in a service slot (no outputs in the source tree), answers only its caller, has no
@@ -639,7 +705,9 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
   the last measured peak of jobs on the same modules (else of its lane). A head job that
   does not fit gets an EASY-backfill reservation. Below the low memory watermark nothing
   starts; below the critical one the newest job of the lowest class is suspended. A build
-  gets threads by its size, a single-file check one or two; after its build a job keeps one.
+  gets threads by its size, a validation at most four (Lake restores nearly all of it from its
+  cache), a single-file check one or two; a validation's build that has run two minutes keeps
+  only the threads its CPU shows it uses, plus one, and after its build a job keeps one.
 - **Resident sessions.** A development check of one module, without inspections, goes to its
   worker's resident session: a Lean language server (`lean --server`) for that workspace in a
   directory of its own, sandboxed like every Lean process. It opens the module once, and Lake
@@ -655,6 +723,16 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
   keeps what ended processes used, and private memory sampled every second. Suspended time does not count
   against a check's timeout. Telemetry (queue and running time, CPU, peak memory,
   suspensions, restarts, machine samples) is kept 90 days, results 7.
+- **Faults clear themselves.** A job becomes running only once its cgroup, its scratch
+  directory and its run all exist; a start that fails before then (a full disk, say) leaves it
+  queued, holding nothing, and it is tried again from one second, doubling to a minute, while
+  other jobs start. Stopping or ending a job is carried out to its end even if it is cancelled
+  again meanwhile, and a job whose run ended without either is stopped at the next decision as
+  a cancelled run is (normally queued again). A job record the store cannot write is written
+  again every second, from the job's state as it is then, until it can be; the service's own
+  state does not wait for it. A job's next process waits only while the job is suspended: a
+  freeze that fails, even part-way, is undone and the job runs on, or, if what froze cannot be
+  thawed, its run is stopped and it is queued again.
 - **Warm library pages.** The service maps the `.olean` import closure of the library modules
   recent checks used, most used first within `warm_gib`, and touches every page every few
   minutes, so imports find them in memory (a cold typical check took 182 s, warm 13.6 s).
@@ -663,7 +741,12 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
   again whatever its author does, recording the receipt when it finishes. The predicate
   `validations` wakes a paused author on the result; a resumption after long idleness
   rotates to a new conversation as usual. A pause or TaskHub restart during a validation
-  leaves it queued, not uncertain. The workers' shell has no Lean or Lake command, only the
+  leaves it queued, not uncertain. So does a finished check whose report cannot be kept (a
+  full disk): asking again attaches to the service's result. A validation stays `running`
+  only while a wait in this TaskHub holds it; one that no wait holds any more (its wait could
+  not even record why it ended) goes back on the driver's next pass as a restart would put
+  it, queued here, and the driver attaches again to a validation whose attempt failed once it
+  is queued or pending again. The workers' shell has no Lean or Lake command, only the
   readable Mathlib sources (`LEAN_SRC_PATH`).
 - **Exceptions.** Installing the toolchain and Mathlib (initialization) and asking a compiler
   its version while registering an environment run before any check and outside the service.
@@ -685,7 +768,15 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
   is its own message.
   All project talk histories are readable; new sends still require the sender's
   current execution fence. Replies steer active Codex recipients, reach active Claude recipients at
-  their next turn or `sync`, or wake one answer turn. Peer text is
+  their next turn or `sync`, or wake one answer turn. A peer message is a notice (the
+  default), a question, or an answer naming its question (`peer_message_kinds`; a
+  message without a row is a notice). Only the worker asked answers, and the answer
+  goes to the asker. A notice does not wake an ordinary worker that paused, and a
+  worker that pauses stops being woken by notices it has not read: it reads them when
+  it next works. Questions, answers and operator messages wake as before, and the
+  Integrator and reviewers are woken by every message. An agreed division of work is
+  recorded with publication, the collaborator invitation or a submission's coauthors,
+  not in messages alone. Peer text is
   collaboration between equals, never a command or review approval, and never
   enters public exports. A message cannot resume a user-paused run.
 - **Delivery.** Messages are delivered as complete file references with SHA-256;
@@ -895,7 +986,8 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
   last value visibly marked stale.
 - **Dashboard** (`taskctl serve`, loopback, signed in with the operator token): workers and
   reviewers in separate collapsible groups, and the Integrator with the Dispatcher; each
-  worker's sessions; the task browser; human requests; project setup (Task 0, model, effort).
+  worker's sessions; the task browser; human requests; project setup (Task 0 and, in the
+  Agents and sessions panel it keeps after the first run, the agents' models and sessions).
   A person's page shows one turn at a time, chosen from a turn list (by default the
   latest), as a single chronological stream: what the worker said and sent on the
   left, and what it received on the right (a condensed system prompt, and human and
@@ -906,6 +998,29 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
   requests are pinned above the stream and highlighted where they were asked. Message
   bodies are read from correspondence and peer-talk files only. Viewing never starts
   a model or acknowledges messages.
+- **Task center** (the dashboard's Tasks dialog): the list of tasks on the left and the
+  selected task on the right, each scrolling on its own; in a narrow window the task takes
+  the list's place, with a way back. Everything in it only reads.
+  - *Overview* is the publication tree of work tasks: each under the task in whose attempt
+    it was published (`task_origins`, recorded by `task.publish`; tasks published before it
+    existed were filled once at startup from their `task.publish` call receipts), a repair
+    task under the task it repairs, Task 0 first. Reviews are counted on their task, never
+    listed. Finished subtrees can be hidden; open ones expanded; a search shows matches with
+    the tasks above them. It reads every work task compactly, at most every 30 s.
+  - *Dependencies* draws, after Geyser's task graph, the open tasks joined by unmet links:
+    a requirement of a task's current contract, and a waiting worker's subscription, stored
+    requirement or request to the operator. Met links are shown on request. Unmet links
+    that form a cycle are reported as a deadlock, and tasks that reach the operator through
+    unmet links as waiting on the operator. Selecting a task dims all but its neighbours.
+    Waits on a worker's own submission or on a peer's answer involve no other task and are
+    listed apart.
+  - *All, Running, Task pool, History* page work tasks, reviews or both (work tasks by
+    default), newest, oldest or by title, and hold still while tasks arrive: a page lists
+    only tasks published before the view was first read, and offers the newer ones.
+  - *The selected task* shows its state and executors, then its relations (where it came
+    from, what it needs and what needs it, waits within it, the tasks published from it, its
+    reviews), its objective rendered from Markdown as text, its evidence, admission, and its
+    revisions and records.
 - **CLI:** `taskctl` (coordination) and `formalizectl` (Lean domain).
 - **Git sharing** (optional): reviewed source, public wiki, and generated state under
   `taskhub/` on one branch. Private notes, messages, transcripts, credentials, and live

@@ -28,12 +28,15 @@ def _quote(text: str) -> str:
 def wait_text(predicate: dict[str, Any]) -> str:
     """A pause's predicate in words."""
     parts = []
-    for item in predicate.get("requirements", []):
+    for item in predicate.get("requirements", []):  # Recorded before pauses took subscriptions instead.
         if item.get("artifact_id"):
-            parts.append(f"artifact `{item['artifact_id']}` accepted under {item.get('policy', 'its policy')}")
+            parts.append(f"artifact `{item['artifact_id']}` accepted")
         elif item.get("task_id"):
             parts.append(f"task `{item['task_id']}` (revision {item.get('task_revision')}) completed")
+    parts += [f"a change to task `{item['task_id']}` that meets: {item['need']}"
+              for item in predicate.get("subscriptions", [])]
     parts += [f"the machine validation of `{artifact}`" for artifact in predicate.get("validations", [])]
+    parts += [f"the answer to your question `{question}`" for question in predicate.get("answers", [])]
     if predicate.get("external_response_id"):
         parts.append(f"the answer to request `{predicate['external_response_id']}`")
     if predicate.get("completion_declaration_id"):

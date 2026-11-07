@@ -7,17 +7,20 @@ No dependency checkout or third-party build runs from a validation workspace.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import os
 import time
+import weakref
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Iterator, Sequence
 
 import portalocker
 
-from .coordination.storage import collected_thread_call, digest
+from . import offload
+from .coordination.storage import digest
 from .lake_cache import collect, lock_file
 from .lake_cache import remove_tree as _remove_tree
 from .paths import module_name, module_path, relative_path, safe_child
@@ -28,6 +31,7 @@ METHOD = "lake-build"
 RECIPE_VERSION = 2  # Bump only when build semantics or cache compatibility changes.
 REPLAY_VERSION = 1  # Bump only when what a recorded kernel replay establishes changes.
 OLEAN_PARTS = (".olean", ".olean.server", ".olean.private")
+SLOT_POLL_SECONDS = 0.5  # While another process holds a slot under the limit.
 
 
 def _replay_keys(build_directory: Path, sources: dict[str, bytes], modules: Sequence[str],
@@ -88,8 +92,9 @@ def timed(timings: dict[str, float], step: str) -> Iterator[None]:
 
 async def _disk(function, *args):
     """Keep a slot locked until a cancelled filesystem mutation has finished, however often the
-    build is cancelled meanwhile."""
-    return await collected_thread_call(function, *args)
+    build is cancelled meanwhile. Run in the Lean service's bookkeeping processes when it has
+    them (offload), else in a thread."""
+    return await offload.call(function, *args)
 
 
 @asynccontextmanager
@@ -105,12 +110,15 @@ async def _namespace_lock(root: Path, namespace: str):
 
 
 @asynccontextmanager
-async def _maintenance(root: Path, namespace: str):
-    """Size and collect older caches alongside the build, under its namespace lock."""
+async def _maintenance(root: Path, namespace: str, slot_limit: int | None = None):
+    """Size and collect older caches, and the old idle slots of the build's own namespace,
+    alongside the build, under its namespace lock. Past `slot_limit`, idle slots are cleared
+    at once: no build takes them again."""
     status = {"state": "scheduled"}
     async def run():
         try:
-            return await _disk(lambda: collect(root, active_namespace=namespace))
+            return await _disk(functools.partial(collect, root, active_namespace=namespace,
+                                                 slot_limit=slot_limit))
         except (OSError, ValueError) as error:
             return {"error": str(error)}  # Retention cannot invalidate mathematics.
     task = asyncio.create_task(run())
@@ -134,11 +142,15 @@ def _write(path: Path, body: bytes) -> None:
 
 
 @contextmanager
-def _workspace(root: Path):
-    """Take a free persistent slot; unrelated validations never wait on this lock."""
+def _workspace(root: Path, limit: int | None = None) -> Iterator[Path | None]:
+    """Take a free persistent slot; unrelated validations never wait on this lock. With
+    `limit`, only slots 0 to limit - 1 are taken, and None is given while each is held."""
     root.mkdir(parents=True, exist_ok=True)
     index = 0
     while True:
+        if limit is not None and index >= limit:
+            yield None
+            return
         directory = root / str(index)
         directory.mkdir(exist_ok=True)
         if directory.is_symlink():
@@ -188,6 +200,15 @@ def _sources(directory: Path) -> dict[str, bytes]:
                 raise ValueError("Linked artifact paths are not allowed")
             found.append((relative, path))
     return {relative: Path(path).read_bytes() for relative, path in sorted(found, key=_part_order)}
+
+
+def _same_sources(directory: Path, sources: dict[str, bytes]) -> bool:
+    """Whether the .lean files below `directory` are exactly `sources`."""
+    return _sources(directory) == sources
+
+
+def _has_sources(directory: Path) -> bool:
+    return bool(_sources(directory))
 
 
 def _synchronize(root: Path, sources: dict[str, bytes], environment_key: str, libraries: Sequence[Path]) -> None:
@@ -330,7 +351,7 @@ async def compilation(tooling, source: Path | dict[str, bytes], modules: Sequenc
     with timed(timings, "library_check"):
         libraries = await tooling.library_paths()
     with timed(timings, "sources"):
-        sources = dict(source) if isinstance(source, dict) else await asyncio.to_thread(_sources, source)
+        sources = dict(source) if isinstance(source, dict) else await _disk(_sources, source)
     tooling.check_module_paths(list(sources), libraries)
     for module in modules:
         if module_path(module) not in sources:
@@ -346,13 +367,15 @@ async def compilation(tooling, source: Path | dict[str, bytes], modules: Sequenc
     cache_root = parent / "lake"
     waited = time.monotonic()
     # The namespace lock also protects artifacts accessed through the shared cache.
+    slot_limit = getattr(tooling, "build_slots", None) or None
     async with _namespace_lock(cache_root, namespace):
-        async with _maintenance(cache_root, namespace) as retention, _compilation_slot(cache_root, namespace) as workspace:
+        async with (_maintenance(cache_root, namespace, slot_limit) as retention,
+                    _compilation_slot(cache_root, namespace, slot_limit) as workspace):
             timings["slot"] = round(time.monotonic() - waited, 3)
             # Earlier compiled outputs are reused while each keeps the size, modification time
             # and file ID in the slot's receipt; any other difference re-hashes or discards them.
             with timed(timings, "recover"):
-                known = await _disk(lambda: _recover(workspace))
+                known = await _disk(_recover, workspace)
             with timed(timings, "synchronize"):
                 await _disk(_synchronize, workspace, sources, key, libraries)
             with timed(timings, "outputs"):
@@ -383,7 +406,7 @@ async def compilation(tooling, source: Path | dict[str, bytes], modules: Sequenc
             # Lean may run the sources' own code while it compiles them: it must not have
             # changed the slot's copy, which inspection reads next.
             with timed(timings, "unchanged"):
-                unchanged = await asyncio.to_thread(_sources, workspace / "source") == sources
+                unchanged = await _disk(_same_sources, workspace / "source", sources)
             if not unchanged:
                 report.update(ok=False, reason="Compilation changed a frozen source file")
             tooling.lake_executable()
@@ -430,14 +453,39 @@ async def compilation(tooling, source: Path | dict[str, bytes], modules: Sequenc
             # completed batch member. Its validator checked it before disposal;
             # the shared source projection must remain unchanged until release.
             with timed(timings, "release_check"):
-                changed = unchanged and (await asyncio.to_thread(_sources, workspace / "source") != sources
-                                         or bool(await asyncio.to_thread(_sources, Path(report["build_directory"]))))
+                changed = unchanged and (not await _disk(_same_sources, workspace / "source", sources)
+                                         or await _disk(_has_sources, Path(report["build_directory"])))
             if changed:
                 (workspace / "outputs.json").unlink(missing_ok=True)
                 raise RegistryError("Inspection changed a frozen proof input")
 
 
+_SLOT_GATES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple[str, int], asyncio.Semaphore]] = (
+    weakref.WeakKeyDictionary())
+
+
+def _slot_gate(root: Path, limit: int) -> asyncio.Semaphore:
+    gates = _SLOT_GATES.setdefault(asyncio.get_running_loop(), {})
+    return gates.setdefault((str(root), limit), asyncio.Semaphore(limit))
+
+
 @asynccontextmanager
-async def _compilation_slot(cache_root, namespace):
-    with _workspace(cache_root / "workspaces" / namespace) as workspace:
-        yield workspace
+async def _compilation_slot(cache_root, namespace, limit: int | None = None):
+    """A free slot of the namespace. With `limit`, at most that many builds hold one: every
+    slot holds a full copy of the Library's build (about 9.6 GB in the Linux pilot, where 13
+    builds at once filled the disk), so a build past it waits, first come first served, for
+    one to free. Each slot is still locked on its own, so a slot that another process holds
+    is passed over, and a build waits for the next free one if all are held."""
+    root = cache_root / "workspaces" / namespace
+    if not limit:
+        with _workspace(root) as workspace:
+            assert workspace is not None
+            yield workspace
+        return
+    async with _slot_gate(root, limit):
+        while True:
+            with _workspace(root, limit) as workspace:
+                if workspace is not None:
+                    yield workspace
+                    return
+            await asyncio.sleep(SLOT_POLL_SECONDS)

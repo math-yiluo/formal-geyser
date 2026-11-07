@@ -23,7 +23,7 @@ _REVIEW_OPERATIONS = frozenset({"review"})
 ENDS_TURN = frozenset({"pause", "contribute", "leave_task", "review", "batch_publish", "batch_finish_empty"})
 _REVIEWER_EXCLUDED = frozenset({
     "stage", "contribute", "complete", "withdraw",
-    "invitation_update", "invitation_withdraw", "leave_task", "completion_feedback",
+    "invitation_update", "invitation_withdraw", "leave_task", "invite_back", "completion_feedback",
     "completion_finalize", "wiki_submit", "draft_update",
 })
 _READ_OPERATIONS = frozenset({
@@ -38,7 +38,7 @@ _MESSAGE_OPERATIONS = (_READ_OPERATIONS - _REVIEW_OPERATIONS) | frozenset({
 })
 _CATEGORIES = {
     "tasks": frozenset({
-        "publish", "propose_revision", "invitation_update", "invitation_withdraw", "leave_task",
+        "publish", "propose_revision", "invitation_update", "invitation_withdraw", "leave_task", "invite_back",
         "search", "inspect", "subscribe", "sync",
     }),
     "progress": frozenset({"checkpoint", "resume_work", "pause", "history_search"}),

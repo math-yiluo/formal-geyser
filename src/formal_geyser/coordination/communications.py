@@ -298,7 +298,7 @@ class Communications(GatewayReceipts):
             raise HubError("REQUEST_IDENTITY_CONFLICT", "Request key was reused with different identity or content")
         c.execute("INSERT OR IGNORE INTO external_request_waiters VALUES(?,?)", (row["id"], attempt["worker_id"]))
         return {**dict(row), **content,
-                "wait_predicate": {"requirements": [], "external_response_id": row["id"]}}
+                "wait_predicate": {"external_response_id": row["id"]}}
 
     @COMMUNICATIONS.handles("literature.register")
     def _on_literature_register(self, c, name, p, actor):

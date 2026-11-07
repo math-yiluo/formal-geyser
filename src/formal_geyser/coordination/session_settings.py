@@ -1,6 +1,6 @@
 """What a new conversation starts with: its backend, model and effort.
 
-The operator chooses a model and effort for workers on each backend and for reviewers with the
+The operator chooses a model and effort for workers on each backend, for reviewers and for the
 Integrator (on Codex), the backend of the next new worker, and the backend an existing worker
 moves to, and each account's number of concurrent sessions. Every model, effort and backend
 choice applies only to conversations that begin after it. A role's new model and effort reach
@@ -11,6 +11,9 @@ backend, model and effort it began with for as long as it is continued, after an
 too. A worker moves to its requested backend when its next new conversation begins (a new
 task, a rotation, a new batch) and that account can start a session; until then the request
 waits.
+
+No role takes another's model or effort, and none has a default: each is chosen in project.toml
+or by the operator, and a run starts only once every role has both (Hub._require_choices).
 """
 from __future__ import annotations
 
@@ -25,11 +28,23 @@ from .models import BACKENDS, Actor, Effort, Role
 # session_limits holds each account's limit as the operator set it (-1: no limit). It replaced
 # concurrency_preferences, in which 0 set no limit and -1 could not be stored: that table's rows
 # move to it once, 0 becoming -1, and it stays empty.
+# role_models holds each role's choice. It replaced role_model_preferences, in which reviewers and
+# the Integrator shared the review row: that table's rows move to it once, the review row giving
+# the Integrator its own as well, and it stays empty.
 SESSION_SETTINGS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS role_model_preferences(
  role TEXT NOT NULL CHECK(role IN ('worker','review')),
  backend TEXT NOT NULL CHECK(backend IN ('codex','claude')),
  model TEXT,effort TEXT,updated_at INTEGER NOT NULL,PRIMARY KEY(role,backend));
+CREATE TABLE IF NOT EXISTS role_models(
+ role TEXT NOT NULL CHECK(role IN ('worker','review','integrator')),
+ backend TEXT NOT NULL CHECK(backend IN ('codex','claude')),
+ model TEXT,effort TEXT,updated_at INTEGER NOT NULL,PRIMARY KEY(role,backend));
+INSERT OR IGNORE INTO role_models(role,backend,model,effort,updated_at)
+ SELECT role,backend,model,effort,updated_at FROM role_model_preferences;
+INSERT OR IGNORE INTO role_models(role,backend,model,effort,updated_at)
+ SELECT 'integrator',backend,model,effort,updated_at FROM role_model_preferences WHERE role='review';
+DELETE FROM role_model_preferences;
 CREATE TABLE IF NOT EXISTS session_limits(
  backend TEXT PRIMARY KEY CHECK(backend IN ('codex','claude')),
  sessions INTEGER NOT NULL CHECK(sessions>=-1),updated_at INTEGER NOT NULL);
@@ -47,9 +62,9 @@ CREATE TABLE IF NOT EXISTS worker_kept_models(
  backend TEXT NOT NULL CHECK(backend IN ('codex','claude')),
  model TEXT,effort TEXT,kept_at INTEGER NOT NULL,PRIMARY KEY(worker_id,backend));
 """
-# Reviewers and the Integrator share one choice; they run on Codex.
-ROLES = {"ordinary": "worker", "review": "review", "integrator": "review"}
-ROLE_BACKENDS = {"worker": BACKENDS, "review": ("codex",)}
+# Each role has its own choice; reviewers and the Integrator run on Codex.
+ROLES = {"ordinary": "worker", "review": "review", "integrator": "integrator"}
+ROLE_BACKENDS = {"worker": BACKENDS, "review": ("codex",), "integrator": ("codex",)}
 ROLE_EFFORT_KEYS = {"review": "review_effort", "integrator": "integrator_effort"}
 # Codex lists each model's efforts in its catalog; Claude Code takes these.
 CODEX_EFFORT = re.compile(r"[a-z]{1,20}")
@@ -105,23 +120,34 @@ class SessionSettings:
         return {backend: {"limit": self._session_limit(c, backend),
                           "source": "operator" if backend in saved else "config"} for backend in BACKENDS}
 
+    def _configured_role(self, kind: str, backend: str) -> dict:
+        """What project.toml chooses for this role on this backend: workers in [codex] or
+        [claude], reviewers in [reviewers], the Integrator in [integrator] (or the older
+        review_effort and integrator_effort). None for what it leaves open."""
+        config = self.config.backend_config(backend)
+        if kind in ("review", "integrator"):
+            section = self.config.reviewers if kind == "review" else self.config.integrator
+            return {"model": section.model, "effort": section.effort or config.effort_for(kind)}
+        return {"model": config.model, "effort": config.effort}
+
     def _new_session_settings(self, c, kind: str, backend: str, worker_id: str | None = None) -> dict:
         """The model and effort a new conversation of this role starts with on this backend; for
-        a worker that kept earlier ones, those."""
-        config = self.config.backend_config(backend)
+        a worker that kept earlier ones, those. None where neither the operator nor project.toml
+        chose."""
         role = ROLES.get(kind)
         row = c.execute("SELECT model,effort FROM worker_kept_models WHERE worker_id=? AND backend=?",
                         (worker_id, backend)).fetchone() if worker_id else None
         if row is None and role:
-            row = c.execute("SELECT model,effort FROM role_model_preferences WHERE role=? AND backend=?",
+            row = c.execute("SELECT model,effort FROM role_models WHERE role=? AND backend=?",
                             (role, backend)).fetchone()
-        return {"model": (row["model"] if row else None) or config.model,
-                "effort": (row["effort"] if row else None) or config.effort_for(kind)}
+        configured = self._configured_role(kind, backend)
+        return {"model": (row["model"] if row else None) or configured["model"],
+                "effort": (row["effort"] if row else None) or configured["effort"]}
 
     def _role_models(self, c) -> dict:
         """Each role's model and effort per backend for new conversations: the operator's
         choice, else the project configuration; and how many existing workers keep earlier ones."""
-        saved = {(row["role"], row["backend"]) for row in c.execute("SELECT role,backend FROM role_model_preferences")}
+        saved = {(row["role"], row["backend"]) for row in c.execute("SELECT role,backend FROM role_models")}
         kept: dict[tuple[str, str], int] = {}
         for row in c.execute("SELECT w.kind,k.backend,COUNT(*) AS count FROM worker_kept_models k JOIN workers w "
                              "ON w.id=k.worker_id AND w.backend=k.backend WHERE w.work_intention<>'retired' "
@@ -130,10 +156,28 @@ class SessionSettings:
                 key = (ROLES[row["kind"]], row["backend"])
                 kept[key] = kept.get(key, 0) + row["count"]
         return {role: {backend: {**self._new_session_settings(c, kind, backend),
-                                 "source": "operator" if (role, backend) in saved else "config",
+                                 "source": "operator" if (role, backend) in saved
+                                 else "config" if any(self._configured_role(kind, backend).values()) else None,
                                  "kept_by_existing": kept.get((role, backend), 0)}
                        for backend in ROLE_BACKENDS[role]}
-                for role, kind in (("worker", "ordinary"), ("review", "review"))}
+                for role, kind in (("worker", "ordinary"), ("review", "review"), ("integrator", "integrator"))}
+
+    def _claude_workers_possible(self) -> bool:
+        """Whether Claude workers can start on this machine, so that their model must be chosen."""
+        from .runtime.claude import claude_unavailable
+        return claude_unavailable(self.config.claude) is None
+
+    def _missing_role_choices(self, c) -> list[str]:
+        """The worker, reviewer and Integrator choices still to make, in words."""
+        roles = [("Workers on Codex", "ordinary", "codex"), ("Reviewers", "review", "codex"),
+                 ("The Integrator", "integrator", "codex")]
+        if self._claude_workers_possible():
+            roles.insert(1, ("Workers on Claude", "ordinary", "claude"))
+        missing = []
+        for label, kind, backend in roles:
+            chosen = self._new_session_settings(c, kind, backend)
+            missing += [f"{label}: {field}" for field in ("model", "effort") if not chosen[field]]
+        return missing
 
     async def session_settings(self, worker_id: str) -> dict:
         """The backend, role, model and effort of the worker's next turn: those its current
@@ -165,10 +209,10 @@ class SessionSettings:
         self._role(actor, Role.OPERATOR)
         if name == "runtime.set_role_model":
             role, backend, model, effort = p.get("role"), p.get("backend"), p.get("model"), p.get("effort")
-            if role not in ("worker", "review"):
-                raise HubError("INVALID_INPUT", "Expected the worker or review role", 422)
-            if backend not in ROLE_BACKENDS.get(role, BACKENDS):
-                raise HubError("INVALID_INPUT", "Reviewers and the Integrator run on Codex" if role == "review"
+            if role not in ROLE_BACKENDS:
+                raise HubError("INVALID_INPUT", "Expected the worker, review or integrator role", 422)
+            if backend not in ROLE_BACKENDS[role]:
+                raise HubError("INVALID_INPUT", "Reviewers and the Integrator run on Codex" if role != "worker"
                                else "Expected the codex or claude backend", 422)
             if model is not None and (not isinstance(model, str) or not model.strip() or len(model) > 200
                                       or any(ch.isspace() for ch in model)):
@@ -182,9 +226,9 @@ class SessionSettings:
             kinds = [kind for kind, name in ROLES.items() if name == role]
             before = {kind: self._new_session_settings(c, kind, backend) for kind in kinds}
             if model is None and effort is None:
-                c.execute("DELETE FROM role_model_preferences WHERE role=? AND backend=?", (role, backend))
+                c.execute("DELETE FROM role_models WHERE role=? AND backend=?", (role, backend))
             else:
-                c.execute("INSERT INTO role_model_preferences(role,backend,model,effort,updated_at) VALUES(?,?,?,?,?) "
+                c.execute("INSERT INTO role_models(role,backend,model,effort,updated_at) VALUES(?,?,?,?,?) "
                           "ON CONFLICT(role,backend) DO UPDATE SET model=excluded.model,effort=excluded.effort,"
                           "updated_at=excluded.updated_at", (role, backend, model, effort, self.clock()))
             if existing:

@@ -10,7 +10,6 @@ import asyncio
 import json
 import logging
 import os
-import resource
 import socket
 import subprocess
 import sys
@@ -27,6 +26,7 @@ from pydantic import ValidationError
 from .. import cgroups
 from ..coordination.config import load_config
 from ..coordination.local_operator import issue_token, operator_request
+from ..coordination.runtime.process import raise_open_files_limit
 from ..coordination.storage import atomic_json
 from .client import state_directory
 from .sandbox import CodexSandbox, Unavailable, Unsandboxed
@@ -151,17 +151,10 @@ def build_service(root: Path) -> LeanService:
     return service
 
 
-def _open_files_limit() -> None:
-    """Many Lean processes at once take many pipes: the soft limit rises to the hard one."""
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    if soft < hard and hard != resource.RLIM_INFINITY:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
-
-
 def serve(root: Path) -> int:
     import uvicorn
 
-    _open_files_limit()
+    raise_open_files_limit()  # Many Lean processes at once take many pipes.
     root = root.resolve()
     state = state_directory(root)
     state.mkdir(parents=True, exist_ok=True)

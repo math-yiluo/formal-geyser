@@ -1,5 +1,7 @@
 """Regression coverage for cache retention, exact module identity and assumptions."""
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -130,6 +132,41 @@ async def test_build_protects_own_namespace_over_budget(proof_case, tmp_path, mo
     assert second["cache_retention"]["active_namespaces_skipped"] >= 1
 
 
+async def test_build_clears_an_old_idle_slot_of_its_namespace_and_rebuilds_there(proof_case, tmp_path, monkeypatch):
+    import formal_geyser.lake_build as build
+    hub, _, _ = proof_case
+    env = EnvironmentRecord.model_validate(hub.artifacts["environment-1"]["data"])
+    root = tmp_path / "input"
+    source(root, "Safe.lean", "def safe := 1")
+    tooling = LeanTooling(env, hub.blobs, FakeRunner())
+    first = await tooling.compile(root, ["Safe"])
+    slot = Path(first["workspace"])
+    with lock_file(slot / "build.lock") as held:  # Two builds at once leave two slots.
+        assert held
+        other = Path((await tooling.compile(root, ["Safe"]))["workspace"])
+    assert other != slot and (other / ".lake/build/lib/lean/Safe.olean").exists()
+    stale = time.time() - 25 * 3600
+    os.utime(other / "last-used", (stale, stale))
+    cache = Path(first["cache_directory"])
+    source(cache, "artifact", "cached")
+    original = build.collect
+    monkeypatch.setattr(build, "collect", lambda root, **kwargs: original(root, max_idle=0, force=True, **kwargs))
+    # The only environment's build takes slot 0; its maintenance clears the idle slot.
+    third = await tooling.compile(root, ["Safe"])
+    assert third["ok"] and Path(third["workspace"]) == slot
+    assert third["cache_retention"]["active_slots_cleared"] == 1
+    assert [path.name for path in other.iterdir()] == ["build.lock"]
+    assert (cache / "artifact").exists()
+    # A later build in the cleared slot starts clean and builds the module again.
+    with lock_file(slot / "build.lock") as held:
+        assert held
+        fourth = await tooling.compile(root, ["Safe"])
+    assert fourth["ok"] and Path(fourth["workspace"]) == other
+    assert fourth["built_modules"] == ["Safe"] and not fourth["reused_modules"]
+    assert (other / ".lake/build/lib/lean/Safe.olean").read_text(encoding="utf-8") == "def safe := 1"
+    assert (other / "outputs.json").is_file() and (other / "last-used").is_file()
+
+
 def test_module_name_cache_is_bounded_and_keeps_collision_checks(proof_case, monkeypatch):
     from formal_geyser.tooling import _MODULE_SETS, registered_modules
     hub, _, _ = proof_case
@@ -158,6 +195,27 @@ async def test_real_cross_slot_restoration(real_tooling, tmp_path):
             checked = await real_tooling.inspect(Path(second["build_directory"]), "Safe", "correct")
             assert checked["ok"], checked
     assert not list(root.glob("*.olean*"))  # No copies into the frozen input.
+
+
+async def test_real_build_in_a_cleared_slot(real_tooling, tmp_path):
+    root = tmp_path / "input"
+    source(root, "Safe.lean", "theorem correct : True := True.intro\n")
+    async with real_tooling.compilation(root, ["Safe"]) as first:
+        async with real_tooling.compilation(root, ["Safe"]) as second:
+            assert first["ok"] and second["ok"], (first, second)
+    slot, other = Path(first["workspace"]), Path(second["workspace"])
+    stale = time.time() - 25 * 3600
+    os.utime(other / "last-used", (stale, stale))
+    report = collect(slot.parents[2], max_idle=1, force=True, active_namespace=slot.parent.name)
+    assert report["active_slots_cleared"] == 1 and not report["errors"]
+    assert [path.name for path in other.iterdir()] == ["build.lock"]
+    async with real_tooling.compilation(root, ["Safe"]) as warm:
+        assert Path(warm["workspace"]) == slot and warm["reused_modules"] == ["Safe"], warm
+        async with real_tooling.compilation(root, ["Safe"]) as cold:
+            assert cold["ok"] and Path(cold["workspace"]) == other, cold
+            assert cold["built_modules"] == ["Safe"]
+            checked = await real_tooling.inspect(Path(cold["build_directory"]), "Safe", "correct")
+            assert checked["ok"], checked
 
 
 @pytest.mark.parametrize("proof,prop", [("stop exact False.elim (by contradiction)", "False"),

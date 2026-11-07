@@ -23,6 +23,7 @@ from tests.coordination.test_lifecycle_repairs import (
     revise,
     worker,
 )
+from tests.coordination.wait_helpers import legacy_wait
 
 pytestmark = pytest.mark.asyncio
 
@@ -120,7 +121,7 @@ async def test_operator_pause_preserves_authorized_activation_through_repeated_r
             dependency = await publish(hub, "Unfinished dependency")
             predicate = {"mode": "all", "requirements": [{"key": "result", "task_id": dependency["id"],
                 "task_revision": 1, "policy": "general.peer@1"}]}
-        await command(hub, "task.pause", {"reason": "Await the saved event", "predicate": predicate,
+        await legacy_wait(hub, {"reason": "Await the saved event", "predicate": predicate,
             "checkpoint": {"summary": "Saved plan", "next_action": "Reconsider the exact event"}}, worker(attempt))
         await quiet(hub, attempt)
         if wake_kind == "external_response":
@@ -174,7 +175,7 @@ async def test_completion_peer_follows_ongoing_work_not_attempt_timing(case, pee
     if peer_state == "between_turns":
         await hub.ordinary_turn_completed(peer["worker_id"], peer["id"])
     elif peer_state in {"sleeping", "message", "message_then_work"}:
-        await command(hub, "task.pause", {"reason": "No independent work remains."}, worker(peer))
+        await legacy_wait(hub, {"reason": "No independent work remains."}, worker(peer))
         await quiet(hub, peer)
         if peer_state != "sleeping":
             await command(hub, "message.send", {"worker_id": peer["worker_id"], "text": "A real update.", "message_id": "update"})
@@ -208,7 +209,7 @@ async def test_retained_pending_feedback_reconciles_after_sleeping_message_turn(
     await open_collaboration(hub, task["id"])
     peer = await claim(hub, task, run, plan="Check the evidence.")
     artifact_id = await accepted(hub, author, run)
-    await command(hub, "task.pause", {"reason": "Work is saved."}, worker(peer))
+    await legacy_wait(hub, {"reason": "Work is saved."}, worker(peer))
     await quiet(hub, peer)
     await command(hub, "message.send", {"worker_id": peer["worker_id"], "text": "A real update.", "message_id": "update"})
     message_attempt = await hub.next_assignment(run["id"])

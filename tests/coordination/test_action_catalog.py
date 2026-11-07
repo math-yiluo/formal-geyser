@@ -83,7 +83,8 @@ def test_decision_helpers_have_no_catalog_surface(catalog, capability):
     ("reviewer", "contribute"), ("reviewer", "withdraw"), ("reviewer", "complete"),
     ("reviewer", "completion_feedback"), ("reviewer", "completion_finalize"),
     ("reviewer", "invitation_update"), ("reviewer", "invitation_withdraw"),
-    ("reviewer", "leave_task"), ("reviewer", "wiki_submit"),
+    ("reviewer", "leave_task"), ("reviewer", "invite_back"), ("reviewer", "wiki_submit"),
+    ("message_only", "invite_back"),
     ("message_only", "stage"), ("message_only", "pause"), ("message_only", "review"),
 ])
 def test_unavailable_operations_are_hidden_and_rejected(catalog, capability, operation):
@@ -160,8 +161,7 @@ def test_consolidated_operations_keep_their_required_data(catalog):
     waiting = {"reason": "Need source", "checkpoint": checkpoint,
                "predicate": {"external_response_id": "response-1"}}
     assert catalog.resolve("pause", waiting) == ("taskhub_pause", waiting)
-    assert catalog.resolve("pause", {"reason": "Reconsider later", "checkpoint": checkpoint})
-    for missing in ("reason", "checkpoint"):
+    for missing in ("reason", "checkpoint", "predicate"):  # A pause names what ends it.
         with pytest.raises(ActionError) as failure:
             catalog.resolve("pause", {key: value for key, value in waiting.items() if key != missing})
         assert failure.value.code == "INVALID_ARGUMENTS"
@@ -278,15 +278,15 @@ def test_new_restricted_operations_keep_their_context_boundary(operation, capabi
 
 def test_pause_description_distinguishes_automatic_resumption_and_explicit_resume(catalog):
     description = catalog.describe(operation="pause")["description"]
-    assert "predicate resumes you automatically when it holds" in description
+    assert "The predicate names what ends the pause; a pause without one is refused" in description
     assert "a normal turn end starts the next turn" in description
-    # The predicate's fields and the no-predicate case are explained in its schema.
+    # The predicate's fields are explained in its schema.
     predicate = catalog.describe(operation="pause")["inputSchema"]["properties"]["predicate"]["description"]
-    assert "external_response_id" in predicate and "completion_declaration_id" in predicate
-    assert "Without a predicate the pause lasts until you call resume_work" in predicate
+    for field in ("subscriptions", "validations", "completion_declaration_id", "answers", "external_response_id"):
+        assert field in predicate
+    assert "the waker judges" in predicate and "answer deadline" in predicate
     assert "Messages may trigger reply turns" in description
     assert "resume_work may supersede your own wait" in description
-    assert "without waiving task requirements" in description
     summary = next(item for item in catalog.describe()["operations"] if item["operation"] == "pause")
     assert summary["description"] == description
 

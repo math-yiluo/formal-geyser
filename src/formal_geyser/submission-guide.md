@@ -152,7 +152,10 @@ example `"objective": "objective.md"` beside the task file); a named file that d
 not exist is refused. A proof task uses `acceptance_policy` `lean.proof@1`, pins
 `payload.environment_artifact` (also listed in `inputs`), and names the target
 statement's declaration in its objective, for example under a `## Target
-statement` heading. Task revisions still require the
+statement` heading. Give the declaration's full Lean name as the Library file
+defines it, such as `Langlands.TwistAdmissibilityCompatibility`, not the path of
+its module, such as `Langlands.Representation.Twist.AdmissibilityStatement`.
+Task revisions still require the
 exact current task ID, revision, and revision reason. Changing a proof target requires a real task
 revision and fresh validation; it is not a manifest edit that silently changes
 the requested theorem.

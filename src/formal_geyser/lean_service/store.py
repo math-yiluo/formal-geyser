@@ -12,7 +12,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs(
@@ -94,12 +94,22 @@ class Store:
             self._db.execute(f"INSERT INTO jobs({names}) VALUES({','.join('?' * len(row))})", tuple(row.values()))
 
     def update(self, job_id: str, **fields: Any) -> None:
+        with self._lock:
+            self._update(job_id, fields)
+
+    def write_row(self, job_id: str, row: dict[str, Any], names: Iterable[str]) -> None:
+        """Write these fields of a job as `row` holds them when the write is made, under the lock:
+        of writes in flight at once, whatever their order, the last one made carries the latest
+        values, and a write made again after it failed sets nothing back."""
+        with self._lock:
+            self._update(job_id, {name: row[name] for name in names})
+
+    def _update(self, job_id: str, fields: dict[str, Any]) -> None:
         if "result" in fields:
             result = fields.pop("result")
             fields["result_json"] = None if result is None else json.dumps(result)
         assignments = ",".join(f"{name}=?" for name in fields)
-        with self._lock:
-            self._db.execute(f"UPDATE jobs SET {assignments} WHERE id=?", (*fields.values(), job_id))
+        self._db.execute(f"UPDATE jobs SET {assignments} WHERE id=?", (*fields.values(), job_id))
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         rows = self._rows("SELECT * FROM jobs WHERE id=?", (job_id,))

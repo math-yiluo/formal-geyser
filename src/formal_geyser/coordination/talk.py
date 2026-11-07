@@ -40,6 +40,12 @@ CREATE TABLE IF NOT EXISTS peer_messages(
  UNIQUE(sender_id,client_message_id),CHECK(sender_id<>recipient_id));
 CREATE INDEX IF NOT EXISTS peer_unread_idx ON peer_messages(recipient_id,acknowledged_at,sequence);
 CREATE INDEX IF NOT EXISTS peer_history_idx ON peer_messages(conversation_id,sequence);
+-- A question, or an answer to one (talk.send kind); a message without a row is a notice.
+CREATE TABLE IF NOT EXISTS peer_message_kinds(
+ message_id TEXT PRIMARY KEY REFERENCES peer_messages(id),
+ kind TEXT NOT NULL CHECK(kind IN ('question','answer')),answers TEXT REFERENCES peer_messages(id),
+ CHECK((kind='answer')=(answers IS NOT NULL)));
+CREATE INDEX IF NOT EXISTS peer_answer_idx ON peer_message_kinds(answers) WHERE answers IS NOT NULL;
 CREATE TABLE IF NOT EXISTS peer_append_intents(
  message_id TEXT PRIMARY KEY REFERENCES peer_messages(id),content_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS peer_deliveries(
@@ -65,6 +71,16 @@ def _page_limits(limit: int, max_bytes: int) -> None:
         raise HubError("INVALID_INPUT", "Talk pages require a limit from 1 to 100", 422)
     if type(max_bytes) is not int or not 512 <= max_bytes <= 65536:
         raise HubError("INVALID_INPUT", "Talk page bytes must be from 512 to 65536", 422)
+
+
+MESSAGE_KINDS = ("notice", "question", "answer")
+
+
+def _kind_fields(row) -> dict:
+    """A question's or an answer's kind, and the question an answer answers; nothing for a notice."""
+    if "kind" not in row.keys() or not row["kind"]:
+        return {}
+    return {"kind": row["kind"], **({"answers": row["answers"]} if row["answers"] else {})}
 
 
 def _fields(payload: dict, required: set[str], optional: set[str] | None = None) -> None:
@@ -111,13 +127,22 @@ class PeerTalk:
             return self._peer_ack(c, p["delivery_id"], sender)
         if name != "talk.send":
             raise HubError("UNKNOWN_COMMAND", "Unknown peer-talk operation", 422)
-        _fields(p, {"recipient_id", "message_id", "text"})
-        recipient, client_id, text = p["recipient_id"], p["message_id"], p["text"]
+        _fields(p, {"message_id", "text"}, {"recipient_id", "kind", "answers"})
+        kind, question = p.get("kind", "notice"), p.get("answers")
+        if kind not in MESSAGE_KINDS:
+            raise HubError("INVALID_INPUT", "A message is a notice, a question or an answer", 422)
+        if (kind == "answer") != (question is not None):
+            raise HubError("INVALID_INPUT", "An answer, and only an answer, names the question it answers "
+                           "(answers: the question's message id)", 422)
+        asker = self._asker(c, question, sender) if kind == "answer" else None
+        recipient, client_id, text = p.get("recipient_id") or asker, p["message_id"], p["text"]
         if (not isinstance(recipient, str) or not recipient
                 or not isinstance(client_id, str) or not client_id.strip() or len(client_id) > 200
                 or not isinstance(text, str) or not text.strip()):
             raise HubError("INVALID_INPUT", "Recipient, stable message ID, and text are required", 422)
         recipient = getattr(self, "_resolve_worker_id", lambda _, value: value)(c, recipient)
+        if asker is not None and recipient != asker:
+            raise HubError("INVALID_RECIPIENT", "An answer goes to the worker who asked the question", 422)
         try:
             text_size = len(text.encode("utf-8"))
         except UnicodeError as exc:
@@ -127,13 +152,15 @@ class PeerTalk:
         if recipient == sender:
             raise HubError("INVALID_RECIPIENT", "Messages require another project worker", 422)
         self._get(c, "workers", recipient)
-        request_hash = digest({"recipient_id": recipient, "text": text})
+        # A notice keeps the hash it had before messages had kinds, so its replays still match.
+        request_hash = digest({"recipient_id": recipient, "text": text,
+                               **({"kind": kind, "answers": question} if kind != "notice" else {})})
         prior = c.execute("SELECT * FROM peer_messages WHERE sender_id=? AND client_message_id=?",
                           (sender, client_id)).fetchone()
         if prior is not None:
             if prior["request_hash"] != request_hash:
                 raise HubError("IDEMPOTENCY_CONFLICT", "Message ID was reused with different data")
-            return self._peer_send_receipt(prior)
+            return self._peer_send_receipt(self._peer_message(c, prior["id"]))
         now = self.clock()
         low, high = sorted((sender, recipient))
         conversation_id = uuid5(NAMESPACE_URL, canonical(["peer-talk", low, high])).hex
@@ -150,16 +177,37 @@ class PeerTalk:
             (message_id, conversation_id, sender, recipient, client_id, request_hash,
              hashlib.sha256(encoded.encode("utf-8")).hexdigest(), len(text), now))
         c.execute("INSERT INTO peer_append_intents VALUES(?,?)", (message_id, encoded))
+        if kind != "notice":
+            c.execute("INSERT INTO peer_message_kinds VALUES(?,?,?)", (message_id, kind, question))
         wake = getattr(self, "_wake_for_message", None)
         if wake is not None:
-            wake(c, recipient, message_id)
-        return self._peer_send_receipt(c.execute(
-            "SELECT * FROM peer_messages WHERE id=?", (message_id,)).fetchone())
+            # A notice leaves a waiting recipient waiting: it reads it when it next works.
+            wake(c, recipient, message_id, notice=kind == "notice")
+        answered = getattr(self, "_wake_answered", None)
+        if kind == "answer" and answered is not None:
+            answered(c, question)
+        return self._peer_send_receipt(self._peer_message(c, message_id))
+
+    @staticmethod
+    def _peer_message(c, message_id: str):
+        return c.execute("SELECT m.*,k.kind,k.answers FROM peer_messages m LEFT JOIN peer_message_kinds k "
+                         "ON k.message_id=m.id WHERE m.id=?", (message_id,)).fetchone()
+
+    @staticmethod
+    def _asker(c, question_id, sender) -> str:
+        """Who asked the question `question_id`, which only `sender`, its addressee, may answer."""
+        row = c.execute("SELECT m.sender_id,m.recipient_id FROM peer_messages m JOIN peer_message_kinds k "
+                        "ON k.message_id=m.id AND k.kind='question' WHERE m.id=?", (question_id,)).fetchone()
+        if row is None:
+            raise HubError("NOT_FOUND", "No question has this message id", 404)
+        if row["recipient_id"] != sender:
+            raise HubError("FORBIDDEN", "Only the worker a question was asked of answers it", 403)
+        return str(row["sender_id"])
 
     def _peer_send_receipt(self, row) -> dict:
         return {**{key: row[key] for key in
                    ("id", "conversation_id", "sequence", "sender_id", "recipient_id", "created_at")},
-                "native_message": self._peer_reference(row)}
+                **_kind_fields(row), "native_message": self._peer_reference(row)}
 
     def _peer_reference(self, row) -> dict:
         return {"path": str(self._peer_file(row["conversation_id"], row["id"])),
@@ -269,7 +317,7 @@ class PeerTalk:
     def _peer_chunk(self, row, text: str, offset: int, end: int) -> dict:
         return {"id": row["id"], "conversation_id": row["conversation_id"],
                 "sequence": row["sequence"], "sender_id": row["sender_id"],
-                "sender_role": "worker", "native_message": self._peer_reference(row),
+                "sender_role": "worker", **_kind_fields(row), "native_message": self._peer_reference(row),
                 **{key: row[key] for key in ("sender_display_name", "recipient_display_name") if key in row.keys()},
                 "created_at": row["created_at"], "text": text[offset:end],
                 "offset": offset, "next_offset": end, "complete": end == len(text)}
@@ -345,8 +393,9 @@ class PeerTalk:
 
         def read(c):
             authorize(c)
-            rows = c.execute("SELECT * FROM peer_messages WHERE conversation_id=? AND sequence>? "
-                             "ORDER BY sequence LIMIT ?",
+            rows = c.execute("SELECT m.*,k.kind,k.answers FROM peer_messages m LEFT JOIN peer_message_kinds k "
+                             "ON k.message_id=m.id WHERE m.conversation_id=? AND m.sequence>? "
+                             "ORDER BY m.sequence LIMIT ?",
                              (conversation_id, after_sequence, limit + 1)).fetchall()
             page: dict[str, Any] = {"conversation_id": conversation_id, "messages": [],
                                     "next_after_sequence": after_sequence, "next_offset": offset,
@@ -388,8 +437,8 @@ class PeerTalk:
 
         def prepare(c):
             worker = authorize(c)
-            rows = c.execute("SELECT m.* FROM peer_messages m "
-                             "WHERE m.recipient_id=? "
+            rows = c.execute("SELECT m.*,k.kind,k.answers FROM peer_messages m "
+                             "LEFT JOIN peer_message_kinds k ON k.message_id=m.id WHERE m.recipient_id=? "
                              "AND acknowledged_at IS NULL AND NOT EXISTS("
                              "SELECT 1 FROM peer_delivery_items i JOIN message_delivery_holds h "
                              "ON h.delivery_id=i.delivery_id AND h.kind='peer' "

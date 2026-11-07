@@ -233,7 +233,8 @@ async def test_reconciled_message_hold_wakes_remaining_text_without_a_new_messag
         attempt = await hub.next_assignment(run["id"])
         worker = Actor(role=Role.WORKER, worker_id=attempt["worker_id"], attempt_id=attempt["id"],
                        fencing_token=attempt["fencing_token"])
-        await command("task.pause", {"reason": "Waiting for direction"}, worker)
+        await command("task.pause", {"reason": "Waiting for direction",
+                                     "predicate": {"external_response_id": "unanswered-request"}}, worker)
         await command("runtime.quiescent", {"worker_id": worker.worker_id,
                       "snapshot": hub.blobs.snapshot(hub.workspace(worker.worker_id))}, runner)
         await command("message.send", {"worker_id": worker.worker_id, "message_id": "one", "text": "Long guidance. " * 500})

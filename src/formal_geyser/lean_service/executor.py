@@ -21,6 +21,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field, ValidationError, model_validator
 
+from .. import offload
 from ..coordination.models import StrictModel
 from ..coordination.snapshot_limits import MAX_SNAPSHOT_FILES
 from ..coordination.storage import SKIPPED_DIRECTORIES, BlobStore, digest
@@ -151,6 +152,34 @@ def working_sources(directory: Path, *, max_files: int, max_bytes: int) -> dict[
             total += len(body)
             result[relative] = body
     return result
+
+
+def prepared_sources(blobs: str, snapshot: str | None, directory: str | None, overlay: str | None,
+                     max_files: int, max_bytes: int, modules: list[str]) -> tuple[dict[str, bytes], dict[str, Any],
+                                                                                 dict[str, float]]:
+    """A check's sources, their digest and library imports, the places that turn the heartbeat
+    limit off, and each step's seconds. It reads and scans the whole Library, so run_check runs
+    it in one bookkeeping call (offload)."""
+    timings: dict[str, float] = {}
+    with timed(timings, "sources"):
+        if snapshot is not None:
+            sources = snapshot_sources(BlobStore(Path(blobs)), snapshot, max_files=max_files, max_bytes=max_bytes)
+        else:
+            sources = working_sources(Path(str(directory)), max_files=max_files, max_bytes=max_bytes)
+            if overlay is not None:
+                sources.update(working_sources(Path(overlay), max_files=max_files, max_bytes=max_bytes))
+                if len(sources) > max_files or sum(len(body) for body in sources.values()) > max_bytes:
+                    raise RegistryError("The Lean sources exceed the snapshot limits")
+    for module in modules:
+        if module_path(module) not in sources:
+            raise RegistryError(f"Missing source module: {module}")
+    found: dict[str, Any] = {}
+    with timed(timings, "digest"):
+        found["sources_sha256"] = digest({path: hashlib.sha256(body).hexdigest() for path, body in sources.items()})
+        found["library_imports"] = sorted(library_imports(sources))
+    with timed(timings, "heartbeats"):
+        found["unlimited"] = unlimited_heartbeats(sources, modules)
+    return sources, found, timings
 
 
 def project_closure(sources: dict[str, bytes], modules: list[str]) -> set[str]:
@@ -357,13 +386,14 @@ def definitive(result: dict) -> bool:
 
 async def run_check(request: CheckRequest, *, runner, threads: int = 1, scratch: Path | None = None,
                     sessions=None, owner: str | None = None, time_limit: float | None = None,
-                    time_limit_reason: str | None = None) -> dict:
+                    time_limit_reason: str | None = None, build_slots: int | None = None) -> dict:
     """The check's result; a rejection of the input is a result too. A development check of one
     module goes to the owner's resident session when `sessions` can serve it. Sources that turn
     Lean's heartbeat limit off are refused unrun. `time_limit` is the seconds of the check's own
     time, its suspended time not counted: whichever of its Lean processes, or its session check,
     is running when it runs out is stopped, and the check ends unavailable with
-    `time_limit_reason`. Cancelled because one of its processes held too much memory (the
+    `time_limit_reason`. Its build waits for one of `build_slots` build slots (None: no limit).
+    Cancelled because one of its processes held too much memory (the
     runner's `memory_stop`), it ends unavailable with what it had found by then. Its `timings` give
     the seconds of each step; the compilation's own steps are in `compilation.timings`."""
     paused = getattr(runner, "paused_seconds", None)
@@ -379,34 +409,23 @@ async def run_check(request: CheckRequest, *, runner, threads: int = 1, scratch:
         environment = EnvironmentRecord.model_validate(request.environment)
         blobs = BlobStore(Path(request.blobs))
         tooling = LeanTooling(environment, blobs, runner, scratch=scratch,
-                              budget=remaining if time_limit is not None else None)
+                              budget=remaining if time_limit is not None else None,
+                              build_slots=build_slots)
         with timed(timings, "doctor"):
             result["doctor"] = await _doctor(tooling)
         if not result["doctor"]["ok"]:
             result["definitive"] = False
             return result
         limits = environment.limits
-        with timed(timings, "sources"):
-            if request.snapshot is not None:
-                sources = await asyncio.to_thread(snapshot_sources, blobs, request.snapshot,
-                                                  max_files=limits.snapshot_file_limit, max_bytes=limits.snapshot_bytes)
-            else:
-                sources = await asyncio.to_thread(working_sources, Path(str(request.directory)),
-                                                  max_files=limits.snapshot_file_limit, max_bytes=limits.snapshot_bytes)
-                if request.overlay is not None:
-                    sources.update(await asyncio.to_thread(working_sources, Path(request.overlay),
-                                   max_files=limits.snapshot_file_limit, max_bytes=limits.snapshot_bytes))
-                    if (len(sources) > limits.snapshot_file_limit
-                            or sum(len(body) for body in sources.values()) > limits.snapshot_bytes):
-                        raise RegistryError("The Lean sources exceed the snapshot limits")
-        for module in request.modules:
-            if module_path(module) not in sources:
-                raise RegistryError(f"Missing source module: {module}")
-        with timed(timings, "digest"):
-            result["sources_sha256"] = digest({path: hashlib.sha256(body).hexdigest() for path, body in sources.items()})
-            result["library_imports"] = sorted(library_imports(sources))
-        with timed(timings, "heartbeats"):
-            unlimited = await asyncio.to_thread(unlimited_heartbeats, sources, request.modules)
+        preparing = time.monotonic()
+        sources, found, steps = await offload.call(
+            prepared_sources, request.blobs, request.snapshot, request.directory, request.overlay,
+            limits.snapshot_file_limit, limits.snapshot_bytes, list(request.modules))
+        # Handing the sources back counts toward reading them.
+        steps["sources"] = round(steps["sources"] + max(0.0, time.monotonic() - preparing - sum(steps.values())), 3)
+        timings.update(steps)
+        result["sources_sha256"], result["library_imports"] = found["sources_sha256"], found["library_imports"]
+        unlimited = found["unlimited"]
         if unlimited:
             result["compilation"] = _refused(request, sources, unlimited, reason=UNLIMITED_HEARTBEATS)
             result["inspections"] = []

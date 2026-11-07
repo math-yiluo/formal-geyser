@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {test} = require('node:test');
 const vm = require('node:vm');
-const {ProjectSetupStore} = require('../../src/formal_geyser/coordination/dashboard.js');
+const {ProjectSetupStore, AGENT_ROWS} = require('../../src/formal_geyser/coordination/dashboard.js');
 
 function deferred() {
   let resolve, reject;
@@ -388,13 +388,15 @@ class Element {
   }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
+  querySelectorAll() { return []; }
 }
 const source = fs.readFileSync(path.resolve(__dirname, '../../src/formal_geyser/coordination/dashboard.js'), 'utf8');
 function setupRenderer(store) {
   const nodes = new Map();
   const el = id => { if (!nodes.has(id)) nodes.set(id, new Element('div')); return nodes.get(id); };
   el('setup-dialog').open = true;
-  const context = vm.createContext({setupStore: store, el, node: (tag, text) => new Element(tag, text)});
+  // No run yet: the Agents and sessions panel shows, its Worker · Codex row being the setup choice.
+  const context = vm.createContext({setupStore: store, el, node: (tag, text) => new Element(tag, text), data: {runs: []}, AGENT_ROWS});
   const first = source.indexOf('  function setupOptions('), last = source.indexOf('  async function finishSetup(', first);
   assert.ok(first >= 0 && last > first);
   vm.runInContext(source.slice(first, last), context);
@@ -404,18 +406,24 @@ function setupRenderer(store) {
 test('ordinary status refresh renders fields in place and preserves a draft and dropdown nodes', async () => {
   const {store} = harness(); await store.show(); store.setGoal('An unfinished goal.'); store.selectEffort('quick');
   const {el, render} = setupRenderer(store); render();
-  const goal = el('setup-goal'), modelOption = el('setup-model').children[0], effortOption = el('setup-effort').children[0];
+  const model = el('agent-worker-codex-model'), effort = el('agent-worker-codex-effort');
+  const goal = el('setup-goal'), modelOption = model.children[0], effortOption = effort.children[0];
   await store.refresh(); render();
   assert.equal(el('setup-goal'), goal); assert.equal(goal.value, 'An unfinished goal.'); assert.equal(goal.readOnly, false);
-  assert.equal(el('setup-model').children[0], modelOption); assert.equal(el('setup-effort').children[0], effortOption);
-  assert.equal(el('setup-effort').value, 'quick'); assert.equal(el('setup-start').disabled, false);
+  assert.equal(model.children[0], modelOption); assert.equal(effort.children[0], effortOption);
+  assert.equal(model.value, 'catalog-model'); assert.equal(model.disabled, false);
+  assert.equal(effort.value, 'quick'); assert.equal(el('setup-start').disabled, false);
+  assert.equal(el('agent-settings').classes.has('hidden'), false); assert.equal(el('agent-settings-setup').classes.has('hidden'), false);
+  // No worker exists yet: nothing offers to change existing workers.
+  for (const [role, backend] of AGENT_ROWS) assert.equal(el('agent-' + role + '-' + backend + '-existing-row').classes.has('hidden'), true);
+  assert.equal(el('setup-model-state').textContent, 'Main model from the profile. · A quick check.');
 });
 
 test('the setup view shows unavailable settings, profile sign-in guidance, and read-only recovery controls', async () => {
   const missing = harness(state({settings: {model: 'not-in-catalog', effort: 'removed'}}));
   await missing.store.show(); missing.store.setGoal('A valid goal.');
   const unavailable = setupRenderer(missing.store); unavailable.render();
-  assert.match(unavailable.el('setup-model').children[0].textContent, /not-in-catalog.*unavailable/);
+  assert.match(unavailable.el('agent-worker-codex-model').children[0].textContent, /not-in-catalog.*unavailable/);
   assert.match(unavailable.el('setup-model-state').textContent, /Choose a model/);
   assert.equal(unavailable.el('setup-start').disabled, true);
   const auth = harness(state(), models({authentication_required: true})); await auth.store.show();
@@ -424,14 +432,18 @@ test('the setup view shows unavailable settings, profile sign-in guidance, and r
   assert.equal(signIn.el('setup-start').disabled, true); assert.equal(signIn.el('setup-model-retry').classes.has('hidden'), false);
   const locked = harness(prepared()); await locked.store.show();
   const recovery = setupRenderer(locked.store); recovery.render();
-  assert.equal(recovery.el('setup-goal').readOnly, true); assert.equal(recovery.el('setup-model').disabled, true);
+  // Once a run exists the panel's rows are the ordinary role choices, not this setup choice.
+  assert.equal(recovery.el('setup-goal').readOnly, true); assert.equal(recovery.el('agent-worker-codex-model').children.length, 0);
   assert.equal(recovery.el('setup-start').classes.has('hidden'), true);
   assert.equal(recovery.el('setup-drive').classes.has('hidden'), false); assert.equal(recovery.el('setup-drive').disabled, false);
 });
 
 test('setup markup has labelled native fields and keeps all existing task views and history controls', () => {
   const html = fs.readFileSync(path.resolve(__dirname, '../../src/formal_geyser/coordination/dashboard.html'), 'utf8');
-  for (const id of ['setup-goal', 'setup-model', 'setup-effort']) assert.ok(html.includes('for="' + id + '"'));
+  assert.ok(html.includes('for="setup-goal"'));
+  // The model and effort are chosen only in Agents and sessions, before the first run as after it.
+  assert.ok(!html.includes('id="setup-model"') && !html.includes('id="setup-effort"'));
+  for (const id of ['agent-worker-codex-model', 'agent-worker-codex-effort', 'agent-settings-setup']) assert.ok(html.includes('id="' + id + '"'));
   assert.match(html, /id="setup-goal"[^>]*maxlength="20000"/);
   for (const id of ['tasks-all', 'tasks-running', 'tasks-pool', 'tasks-history', 'session-select', 'transcript', 'compose', 'notice']) {
     assert.ok(html.includes('id="' + id + '"'));

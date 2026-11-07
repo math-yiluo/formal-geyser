@@ -48,7 +48,7 @@ async def test_an_operator_claim_is_launched_once_by_the_pass(hub):
     claim = await command(hub, "task.claim", {"task_id": task["id"], "revision": 1,
                                               "worker_id": worker["id"], "run_id": run["id"]})
     assert await hub.unlaunched_claim(claim["id"])
-    pause = ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {
+    pause = ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {"predicate": {"external_response_id": "unanswered-request"}, 
         "reason": "Nothing more to do in this test.", "checkpoint": {"summary": "Done", "next_action": "Wait"}}})
     harnesses = []
 

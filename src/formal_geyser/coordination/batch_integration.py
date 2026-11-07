@@ -82,6 +82,7 @@ class BatchIntegration:
     _batch_admission_hint: tuple | None = None
     if TYPE_CHECKING:
         _workspace_snapshot: Any
+        _wake_after_batch: Any
         _release_conversation: Any
         db: Any
         clock: Any
@@ -1145,6 +1146,9 @@ class BatchIntegration:
             # The delay counts from the last batch of mathematics: public notes, which go at
             # once, would otherwise hold mathematics back each time (Linux pilot, 2026-10-22).
             c.execute("UPDATE integrator_control SET last_finished_at=? WHERE id=1", (self.clock(),))
+        if state == "published":
+            # The waits subscribed to the tasks it published Lean from are judged now.
+            self._wake_after_batch(c, batch["id"], attempt["run_id"])
         c.execute("UPDATE attempts SET state='integrated' WHERE id=?", (attempt["id"],))
         c.execute(
             "UPDATE workers SET state='suspended',work_intention='waiting',active_attempt=NULL WHERE id=?",

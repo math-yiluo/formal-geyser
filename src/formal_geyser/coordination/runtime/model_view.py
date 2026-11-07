@@ -161,6 +161,10 @@ def message_view(envelope: dict) -> list[dict]:
                 item.setdefault("sender", name)
         if message.get("sender_role") == "operator":
             item.setdefault("sender", "User")
+        if message.get("kind") == "question":  # Answered with talk_send kind answer, answers this id.
+            item.update(kind="question", question_id=message["id"])
+        elif message.get("kind") == "answer":
+            item.update(kind="answer", answers=message["answers"])
         if message.get("native_message"):
             item["file"] = file_reference(message["native_message"])
         elif "text" in message:

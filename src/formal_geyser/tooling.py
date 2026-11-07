@@ -323,8 +323,10 @@ def lean_version(executable: Path) -> str:
 class LeanTooling:
     def __init__(self, environment: EnvironmentRecord, blobs=None, runner=None, *,
                  isolate_library_checks: bool = True, scratch: Path | None = None,
-                 budget: Callable[[], float] | None = None):
+                 budget: Callable[[], float] | None = None, build_slots: int | None = None):
         self.environment = environment
+        # The most Lake builds that hold a build slot at once (lake_build); None: no limit.
+        self.build_slots = build_slots
         # The seconds the check has left, if its Lean service lane limits its time.
         self.budget = budget
         self.blobs = blobs

@@ -48,6 +48,70 @@ def test_workspace_locks_are_exclusive_without_a_global_limit(tmp_path):
         assert reused == one
 
 
+def test_a_slot_limit_gives_no_slot_while_each_one_under_it_is_held(tmp_path):
+    with _workspace(tmp_path, 2) as one, _workspace(tmp_path, 2) as two:
+        assert (one.name, two.name) == ("0", "1")
+        with _workspace(tmp_path, 2) as third:
+            assert third is None
+    assert not (tmp_path / "2").exists()  # No slot past the limit is made.
+    with _workspace(tmp_path, 2) as again:
+        assert again.name == "0"
+
+
+async def until(condition, seconds=5.0):
+    async def poll():
+        while not condition():
+            await asyncio.sleep(0.01)
+    await asyncio.wait_for(poll(), seconds)
+
+
+async def test_builds_past_the_slot_limit_wait_for_a_slot_first_come_first_served(tmp_path):
+    from formal_geyser.lake_build import _compilation_slot
+
+    taken, releases = [], {}
+
+    async def build(name):
+        async with _compilation_slot(tmp_path, "n" * 20, 1) as slot:
+            releases[name] = asyncio.Event()
+            taken.append((name, slot.name))
+            await releases[name].wait()
+
+    tasks = {"first": asyncio.create_task(build("first"))}
+    await until(lambda: taken)
+    for name in ("second", "third"):
+        tasks[name] = asyncio.create_task(build(name))
+        await asyncio.sleep(0.05)
+    assert taken == [("first", "0")]  # The others wait: one slot only.
+    for name, after in (("first", "second"), ("second", "third")):
+        releases[name].set()
+        await tasks[name]
+        await until(lambda: len(taken) == len(releases))
+        assert taken[-1] == (after, "0")
+    releases["third"].set()
+    await tasks["third"]
+    assert sorted(path.name for path in (tmp_path / "workspaces" / ("n" * 20)).iterdir()) == ["0"]
+
+
+async def test_a_build_under_the_slot_limit_waits_for_a_slot_held_elsewhere(tmp_path, monkeypatch):
+    from formal_geyser import lake_build
+
+    monkeypatch.setattr(lake_build, "SLOT_POLL_SECONDS", 0.01)
+    root = tmp_path / "workspaces" / ("m" * 20)
+    taken = []
+
+    async def build():
+        async with lake_build._compilation_slot(tmp_path, "m" * 20, 1) as slot:
+            taken.append(slot.name)
+
+    with _workspace(root) as held:  # As another process would hold it.
+        assert held.name == "0"
+        waiting = asyncio.create_task(build())
+        await asyncio.sleep(0.1)
+        assert not taken and not (root / "1").exists()
+    await asyncio.wait_for(waiting, 5)
+    assert taken == ["0"]
+
+
 async def test_changed_lake_cannot_silently_change_the_environment(proof_case, tmp_path):
     hub, _, _ = proof_case
     env = EnvironmentRecord.model_validate(hub.artifacts["environment-1"]["data"])

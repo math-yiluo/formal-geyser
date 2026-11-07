@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import resource
 import shutil
 import signal
 import time
@@ -13,6 +14,15 @@ from typing import Mapping, Sequence
 from uuid import uuid4
 
 from ... import cgroups
+
+
+def raise_open_files_limit() -> None:
+    """Raise this process's soft open-file limit to the hard one. Each owned process holds
+    three pipes: in the Linux pilot on 2026-11-02 TaskHub's 158 worker processes kept about
+    750 descriptors open, and every stage failed at the default soft limit of 1,024."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft < hard and hard != resource.RLIM_INFINITY:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
 
 
 class ProcessHostError(RuntimeError):

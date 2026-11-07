@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -61,6 +62,8 @@ ADMISSION_INTERVAL_SECONDS = 1.0
 # One pass admits for at most this long before recovery, validation retries and decision
 # helpers get their turn; the next pass starts at once.
 ADMISSION_PASS_SECONDS = 30.0
+# Before the driver attaches again to a validation whose attempt failed.
+VALIDATION_RETRY_SECONDS = 30.0
 # Library checkouts prepared at once by activations; more would only queue on the thread pool.
 WORKSPACE_PREPARATIONS = 4
 # How often the control checks of turns and validations under way are read, all at once.
@@ -181,6 +184,7 @@ HUB_COMMANDS = {
     "taskhub_subscribe": "task.subscribe",
     "taskhub_resume_work": "worker.resume_work",
     "taskhub_leave_task": "task.leave",
+    "taskhub_invite_back": "task.invite_back",
     "taskhub_withdraw": "artifact.withdraw",
     "taskhub_invitation_update": "task.invitation.update",
     "taskhub_invitation_withdraw": "task.invitation.withdraw",
@@ -1392,6 +1396,12 @@ class WorkerRunner(DecisionHelpers):
             return await self._validate(task, artifact_id)
 
     async def _validate(self, task: dict, artifact_id: str) -> dict:
+        # While it is attached, no pass of the driver takes its validation for stranded.
+        attached = getattr(self.hub, "attached_validation", None)
+        with attached(artifact_id) if attached is not None else contextlib.nullcontext():
+            return await self._validate_attached(task, artifact_id)
+
+    async def _validate_attached(self, task: dict, artifact_id: str) -> dict:
         phase = await self.hub.native_validation(artifact_id)
         if phase and phase["validation_result_json"] is not None:
             return json.loads(phase["validation_result_json"])
@@ -1433,7 +1443,11 @@ class WorkerRunner(DecisionHelpers):
                         await asyncio.shield(self.hub.native_validation_uncertain(artifact_id, str(exc) or type(exc).__name__))
                 raise
             if phase:
-                await self.hub.retain_native_validation_report(artifact_id, report.model_dump(mode="json"))
+                try:
+                    await self.hub.retain_native_validation_report(artifact_id, report.model_dump(mode="json"))
+                except BaseException as exc:
+                    await self._report_not_kept(artifact_id, exc)
+                    raise
         try:
             return await self._command(
                 "artifact.accept", {"artifact_id": artifact_id, **report.model_dump()},
@@ -1447,6 +1461,22 @@ class WorkerRunner(DecisionHelpers):
                 # not an unknown process, and cannot pause unrelated work.
                 await self.hub.block_native_validation(artifact_id, exc.message)
             raise
+
+    async def _report_not_kept(self, artifact_id: str, exc: BaseException) -> None:
+        """The check ended, but its report could not be kept (a full disk, say). A plugin's own
+        service still has the result, so asking again attaches to it; a local checker needs
+        confirmed recovery, as after any unexpected failure. If even that cannot be written, the
+        driver finds the validation stranded once the database takes writes again."""
+        try:
+            if getattr(self.plugin, "validations_survive_interruption", False):
+                await asyncio.shield(self.hub.native_validation_queued(
+                    artifact_id, "Its report could not be kept (" + (str(exc) or type(exc).__name__)[:300]
+                    + "); asking again attaches to the check"))
+            else:
+                await asyncio.shield(self.hub.native_validation_uncertain(artifact_id, str(exc) or type(exc).__name__))
+        except Exception as error:
+            logger.warning("Validation %s stays running until the driver finds it stranded: %s: %s",
+                           artifact_id, type(error).__name__, str(error)[:300])
 
     async def _original_validation(self, task, artifact, phase):
         if phase is None:
@@ -1595,7 +1625,8 @@ class WorkerRunner(DecisionHelpers):
         assignments: deque[dict] = deque()
         validation_attempts: set[tuple[str, int]] = set()
         # A queued validation the driver could not attach to yet (its author drains, say) is
-        # tried again after a while; every other generation is attempted once per drive.
+        # tried again after a while, and so is one whose attempt failed once it is pending or
+        # queued again; every other generation is attempted once per drive.
         queued_retry_at: dict[tuple[str, int], float] = {}
         state = "idle"
 
@@ -1632,6 +1663,12 @@ class WorkerRunner(DecisionHelpers):
                             "attempt_id": claim["id"], "worker_id": claim.get("worker_id"),
                             "task_id": claim.get("task_id")})
                     if admitting:
+                        overdue = getattr(self.hub, "end_overdue_waits", None)
+                        if overdue is not None:
+                            try:
+                                await overdue()  # Waits for an answer past their deadline end.
+                            except Exception as error:
+                                logger.warning("Answer deadlines deferred: %s", type(error).__name__)
                         recover_quiet = getattr(self.hub, "recover_quiet_runtime_failures", None)
                         if recover_quiet is not None:
                             try:
@@ -1676,7 +1713,8 @@ class WorkerRunner(DecisionHelpers):
                                     more = True
                                     break
                         for intent in [*(await self.hub.due_recruitment_intents(run_id)),
-                                       *(await self.hub.due_assignment_intents(run_id))]:
+                                       *(await self.hub.due_assignment_intents(run_id)),
+                                       *(await self.hub.due_wake_intents(run_id))]:
                             if intent["id"] not in self._helpers:
                                 self._helpers.add(intent["id"])
                                 launch(self.run_helper(intent), {"helper_id": intent["id"],
@@ -1731,9 +1769,14 @@ class WorkerRunner(DecisionHelpers):
                     if result is None:
                         continue
                     completed_steps += 1
-                    if identity.get("validation_state") == "queued" and result.get("validation_pending"):
-                        queued_retry_at[(identity["validation_artifact_id"],
-                                         identity.get("validation_generation", 0))] = time.monotonic() + 10
+                    if identity.get("validation_artifact_id") is not None:
+                        generation = (identity["validation_artifact_id"], identity.get("validation_generation", 0))
+                        if identity.get("validation_state") == "queued" and result.get("validation_pending"):
+                            queued_retry_at[generation] = time.monotonic() + 10
+                        elif result.get("directive") == "recovery_required":
+                            # It failed before its validation could record why (a full disk, say):
+                            # attached again once it is pending or queued again.
+                            queued_retry_at[generation] = time.monotonic() + VALIDATION_RETRY_SECONDS
                     if result.get("assignment") is not None:
                         assignments.append(result.pop("assignment"))
                     queued = "VALIDATION_QUEUED" in {result.get("code"), result.get("validation", {}).get("code")}

@@ -80,7 +80,7 @@ def allocate_reviewer_number(connection) -> int:
 def is_reserved_identity(reference: Any) -> bool:
     """Whether a reference occupies either generated project-name namespace."""
     return isinstance(reference, str) and bool(
-        reference.casefold() in {"integrator", "dispatcher"} or WORKER_ALIAS.fullmatch(reference)
+        reference.casefold() in {"integrator", "dispatcher", "waker"} or WORKER_ALIAS.fullmatch(reference)
         or REVIEWER_ALIAS.fullmatch(reference))
 
 
@@ -91,6 +91,9 @@ def worker_identity(record: dict) -> dict:
     if record.get("kind") == "dispatcher":
         # The system identity that owns assignment decisions; it never executes a task.
         return {**record, "display_name": "Dispatcher"}
+    if record.get("kind") == "waker":
+        # The system identity that owns wake decisions (waker.py); it never executes a task.
+        return {**record, "display_name": "Waker"}
     if record.get("reviewer_number") is not None:
         return {**record, "display_name": f"Reviewer {record['reviewer_number']}"}
     if record.get("worker_number") is not None and record.get("kind") != "review":
@@ -146,7 +149,7 @@ class WorkerNames:
     def _resolve_worker_id(self, c, reference: str) -> str:
         if not isinstance(reference, str) or not reference:
             raise HubError("INVALID_WORKER", "Select an agent ID, Worker N name, or Reviewer N name", 422)
-        if reference.casefold() in {"integrator", "dispatcher"}:
+        if reference.casefold() in {"integrator", "dispatcher", "waker"}:
             kind = reference.casefold()
             row = c.execute("SELECT id FROM workers WHERE kind=?", (kind,)).fetchone()
             if row is None:

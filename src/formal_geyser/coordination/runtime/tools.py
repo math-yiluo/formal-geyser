@@ -65,23 +65,35 @@ def operation_tools() -> list[dict[str, Any]]:
                   {"checkpoint": Checkpoint.model_json_schema()}, ["checkpoint"]),
         _function("taskhub_resume_work", "Resume useful work after a waiting message turn; normal automatic continuation then applies.", {}, []),
         _function("taskhub_pause", "Checkpoint and pause the task. Pause instead of ending "
-                  "turns while blocked; a normal turn end starts the next turn. A predicate resumes you automatically "
-                  "when it holds. Messages may trigger reply turns; resume_work may supersede your own wait without "
-                  "waiving task requirements. The runtime drains this turn.",
+                  "turns while blocked; a normal turn end starts the next turn. The predicate names what ends the "
+                  "pause; a pause without one is refused. Messages may "
+                  "trigger reply turns; resume_work may supersede your own wait. The runtime drains this turn.",
                   {"checkpoint": Checkpoint.model_json_schema(), "reason": {"type": "string", "minLength": 1},
                    "predicate": {**Predicate.model_json_schema(), "description": (
-                       "Optional. requirements entries {key, artifact_id or task_id+task_revision, policy} hold once "
-                       "that artifact is accepted under exactly that policy; external_response_id is the id returned by "
-                       "request; completion_declaration_id awaits its feedback if you declared it, else its decision; validations lists staged "
-                       "candidate ids and holds once each one's machine validation has a result, whatever the verdict; "
-                       "mode is all (default) or any. "
-                       "Without a predicate the pause lasts until you call resume_work in a message turn or the operator "
-                       "resumes. Pausing keeps membership and context and cancels unused recruitment.")}},
-                  ["checkpoint", "reason"]),
-        _function("taskhub_leave_task", "Permanently leave your ordinary-task executor membership with a reason. This abandons your execution relationship, preserves history and work, and retires the task if all executors leave. Use pause for a temporary suspension. Leaving the current assignment drains this turn.",
+                       "subscriptions [{task_id, need}] wait on another open task: after each publication from it, the "
+                       "waker judges whether what it published to the Library since you paused meets need, and wakes "
+                       "you to check; a subscription to your own task, or one closing a cycle of tasks waiting on each "
+                       "other, is refused, and the wait also ends when the task is done or retired. validations lists "
+                       "your staged candidate ids and holds once each one's machine validation has a result, whatever "
+                       "the verdict; completion_declaration_id awaits its feedback if you declared it, else its "
+                       "decision; answers lists the ids of questions you asked with talk_send, and external_response_id "
+                       "is the id returned by request; a wait for an answer also ends at the project's answer deadline. "
+                       "mode (all, the default, or any) combines all but subscriptions, each of which ends the wait by "
+                       "itself. Pausing keeps membership and context and cancels unused recruitment.")}},
+                  ["checkpoint", "reason", "predicate"]),
+        _function("taskhub_leave_task", "Leave your ordinary-task executor membership with a reason. This ends your execution relationship, preserves history and work, and retires the task if all executors leave; while another executor remains, it can invite you back (invite_back). Use pause for a temporary suspension. Leaving the current assignment drains this turn.",
                   {"task_id": {"type": "string", "minLength": 1},
                    "reason": {"type": "string", "minLength": 1, "maxLength": 4000}},
                   ["task_id", "reason"]),
+        _function("taskhub_invite_back", "Invite a worker that left this task back to it, with the reason it will "
+                  "read. You must be a current executor; only a former executor of the task can return. It resumes "
+                  "the task in its next turn, from its saved checkpoint and files. A worker busy on another task "
+                  "cannot be invited: message it with talk_send instead.",
+                  {"task_id": {"type": "string", "minLength": 1},
+                   "worker_id": {"type": "string", "minLength": 1,
+                                 "description": "The worker that left, by ID or name, such as Worker 12."},
+                   "reason": {"type": "string", "minLength": 1, "maxLength": 4000}},
+                  ["task_id", "worker_id", "reason"]),
         _function("taskhub_invitation_update", "Edit the already authorized, unused collaborator invitation.",
                   {**task_revision, "invitation": {"type": "string", "minLength": 1}}, ["task_id", "revision", "invitation"]),
         _function("taskhub_invitation_withdraw", "Permanently cancel an unused collaborator invitation.",
@@ -223,12 +235,19 @@ def operation_tools() -> list[dict[str, Any]]:
         _function("taskhub_fetch", "Read a candidate or accepted artifact by its exact ID.",
                   {"artifact_id": {"type": "string"}}, ["artifact_id"]),
         _function("taskhub_talk_send", "Message any project worker or reviewer. Each pair of workers shares one conversation; "
-                  "name any task or artifact you mean in the text. An active recipient gets the message during its turn "
-                  "where its runtime supports that, otherwise at its next turn; an idle recipient gets one reply turn. "
-                  "Text is limited to 16 KiB.",
-                  {"recipient_id": {"type": "string", "description": "Stable project worker name, for example Worker 1."},
+                  "name any task or artifact you mean in the text. A notice (the default kind) informs; a question asks, "
+                  "and you can pause on its id (answers); an answer replies to a question you were asked and goes to "
+                  "its asker. A notice does not wake a recipient that paused: it reads it when it next works. An active "
+                  "recipient gets a message during its turn where its runtime supports that, otherwise at its next turn; "
+                  "an idle one, or a paused one asked or answered, gets one reply turn. Text is limited to 16 KiB.",
+                  {"recipient_id": {"type": "string", "description": "Stable project worker name, for example Worker 1. "
+                                    "An answer goes to the asker without it."},
                    "message_id": {"type": "string", "minLength": 1, "description": MESSAGE_ID},
-                   "text": {"type": "string", "minLength": 1}}, ["recipient_id", "text"]),
+                   "text": {"type": "string", "minLength": 1},
+                   "kind": {"type": "string", "enum": ["notice", "question", "answer"],
+                            "description": "notice (default), question, or answer (with answers)."},
+                   "answers": {"type": "string", "minLength": 1,
+                               "description": "For an answer: the id of the question it answers."}}, ["text"]),
         _function("taskhub_talk_read", "List your peer conversations, or supply conversation_id to read any project conversation's message history.",
                   {"conversation_id": {"type": "string", "minLength": 1},
                    "after_id": {"type": "string", "description": "Conversation-list cursor; omit when reading one conversation."},

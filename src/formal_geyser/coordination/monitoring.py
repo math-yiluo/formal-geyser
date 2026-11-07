@@ -105,19 +105,18 @@ def _requirement_holds(connection: sqlite3.Connection, requirement: dict) -> boo
         )
     return connection.execute(
         "SELECT 1 FROM artifacts a JOIN evidence e ON e.artifact_id=a.id WHERE "
-        + where + completion + " AND a.status='accepted' AND e.policy=? AND e.verdict='accepted' "
+        + where + completion + " AND a.status='accepted' AND e.verdict='accepted' "
         "AND e.qualifications_json='[]' AND e.sequence=(SELECT MAX(e2.sequence) "
         "FROM evidence e2 WHERE e2.artifact_id=a.id AND e2.policy=e.policy) LIMIT 1",
-        (*arguments, requirement["policy"]),
+        arguments,
     ).fetchone() is not None
 
 
 def _blocked_requirement(connection: sqlite3.Connection, requirement: dict) -> dict | None:
     if _requirement_holds(connection, requirement):
         return None
-    reason = {key: requirement.get(key) for key in
-              ("key", "task_id", "task_revision", "artifact_id", "policy")}
-    reason["code"] = "policy_receipt_missing"
+    reason = {key: requirement.get(key) for key in ("key", "task_id", "task_revision", "artifact_id")}
+    reason["code"] = "acceptance_missing"
     if requirement.get("artifact_id") is not None:
         row = connection.execute(
             "SELECT status FROM artifacts WHERE id=?", (requirement["artifact_id"],)
@@ -249,9 +248,7 @@ def _read_interruptions(connection: sqlite3.Connection, project: Path) -> dict:
                     else artifact["task_id"] == requirement.get("task_id")
                     and artifact["task_revision"] == requirement.get("task_revision")
                 )
-                if matches and _requirement_holds(
-                    connection, {"artifact_id": ref, "policy": requirement["policy"]}
-                ):
+                if matches and _requirement_holds(connection, {"artifact_id": ref}):
                     return True
             return False
 
@@ -273,8 +270,9 @@ def _read_interruptions(connection: sqlite3.Connection, project: Path) -> dict:
             ).fetchone()
             if prior:
                 predicate = json.loads(prior["predicate_json"])
-                checks = [bound(req) for req in predicate["requirements"]]
-                if not checks or not (all(checks) if predicate["mode"] == "all" else any(checks)):
+                # A wait on subscriptions, validations or an answer has no requirement to re-check.
+                checks = [bound(req) for req in predicate.get("requirements", [])]
+                if checks and not (all(checks) if predicate.get("mode", "all") == "all" else any(checks)):
                     reasons.append("original_wait_evidence_changed")
             else:
                 reasons.append("original_wait_unavailable")
@@ -527,9 +525,9 @@ def _read_continuations(connection: sqlite3.Connection, tasks: list[dict],
     task_map = {task["id"]: task for task in tasks}
     for continuation in continuations:
         predicate = json.loads(continuation.pop("predicate_json"))
-        reasons = _blocked_reasons(connection, predicate["requirements"])
+        reasons = _blocked_reasons(connection, predicate.get("requirements", []))
         continuation["wait_mode"] = predicate.get("mode", "all")
-        if continuation["wait_mode"] == "any" and len(reasons) < len(predicate["requirements"]):
+        if continuation["wait_mode"] == "any" and len(reasons) < len(predicate.get("requirements", [])):
             reasons = []
         continuation["blocked_reasons"] = reasons
         task = task_map.get(continuation["task_id"])

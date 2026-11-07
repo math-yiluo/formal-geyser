@@ -187,7 +187,7 @@ async def test_lost_reply_does_not_override_workers_explicit_wait(runtime, monke
     class WaitingHarness(ScriptedHarness):
         async def run_turn(self, prompt, *, on_started, on_tool, **kwargs):
             await on_started("wait-before-transport-failure")
-            result = await on_tool("taskhub_call", {"operation": "pause", "arguments": {
+            result = await on_tool("taskhub_call", {"operation": "pause", "arguments": {"predicate": {"external_response_id": "unanswered-request"}, 
                 "checkpoint": {"summary": "I am voluntarily waiting", "next_action": "Reconsider when useful"},
                 "reason": "I am voluntarily waiting for a useful development"}}, "explicit-wait")
             assert result.get("runtime_directive") == "drain_for_wait", result

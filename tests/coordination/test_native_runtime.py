@@ -277,7 +277,7 @@ async def test_initial_and_followup_private_delivery_are_recipient_only_and_expl
             assert await acknowledged(late["id"]) is not None
             delivered, _ = await runner._native_packet(await hub.context(receiver["id"]), recipient_attempt)
             assert "private_talk" not in delivered
-            result = await tool(on_tool, "pause", {"checkpoint": CHECKPOINT, "reason": "Private message check is complete."})
+            result = await tool(on_tool, "pause", {"predicate": {"external_response_id": "unanswered-request"}, "checkpoint": CHECKPOINT, "reason": "Private message check is complete."})
             await self.close()
             return TurnOutcome(turn, "interrupted", True, True, result["runtime_directive"])
 
@@ -477,7 +477,7 @@ async def test_new_reviewer_accepts_then_batch_publishes_without_private_files(n
                 return TurnOutcome(turn, "completed", True, True)
             else:
                 resumed = True
-                result = await tool(on_tool, "pause", {"checkpoint": CHECKPOINT, "reason": "Await further useful work."})
+                result = await tool(on_tool, "pause", {"predicate": {"external_response_id": "unanswered-request"}, "checkpoint": CHECKPOINT, "reason": "Await further useful work."})
             await self.close()
             return TurnOutcome(turn, "interrupted", True, True, result["runtime_directive"])
 

@@ -13,6 +13,7 @@ from jsonschema import validate
 from ..errors import HubError
 from ..faults import ACCOUNT_HOLDS
 from ..storage import canonical
+from ..waker import wake_schema
 from .diagnostics import normalize_error
 from .handoff import handoff_path, sections
 from .helper_entries import assignment_entry, recruitment_entry
@@ -30,7 +31,8 @@ RECRUITMENT_SCHEMA = {
     "properties": {"decision": {"type": "boolean"}},
     "required": ["decision"],
 }
-DECISION_SCHEMAS = {"assignment": ASSIGNMENT_SCHEMA, "recruitment": RECRUITMENT_SCHEMA}
+# A wake decision's schema names the pairs it is offered (waker.wake_schema).
+DECISION_SCHEMAS = {"assignment": ASSIGNMENT_SCHEMA, "recruitment": RECRUITMENT_SCHEMA, "wake": wake_schema([])}
 # A pause stopped the decision before it answered: it is asked again, and it is no failure.
 RUN_CONTROL = "run_control"
 # The handoff sections a recruitment decision reads, when the first executor wrote them.
@@ -46,7 +48,8 @@ def decision_schema(intent: dict) -> dict:
         return DECISION_SCHEMAS[intent["kind"]]
     names = [item["name"] for item in intent["candidates"]["workers"]]
     return {**ASSIGNMENT_SCHEMA, "properties": {"worker": {"type": ["string", "null"], "enum": [*names, None]}}}
-# An answer outside its schema, or none within the time limit, means a new worker, or no collaborator.
+# An answer outside its schema, or none within the time limit, means a new worker, or no collaborator;
+# a wake decision has no default: the waker is asked again (waker.Waker._complete_wake).
 DEFAULT_DECISIONS: dict[str, dict[str, Any]] = {"assignment": {"worker": None}, "recruitment": {"decision": False}}
 # How long a decision turn may run. A pause stops the turn and its clock; it is asked again later.
 DECISION_SECONDS = 600.0
@@ -103,7 +106,11 @@ class DecisionHelpers:
         _action_arguments: Any
         activity: Any
 
-    async def _commit_helper(self, intent: dict, decision: dict) -> dict:
+    async def _commit_helper(self, intent: dict, decision: dict | None) -> dict:
+        if intent["kind"] == "wake":
+            result = await self.hub.complete_wake(intent["id"], decision)
+            return {"helper_id": intent["id"], "directive": "wake_decided", "result": result}
+        assert decision is not None
         if intent["kind"] == "recruitment":
             result = await self.hub.decide_recruitment(
                 intent["id"], decision["decision"], INVITATION if decision["decision"] else "")
@@ -146,7 +153,7 @@ class DecisionHelpers:
             return control["state"] == "running"
         return control["assignment_open"] and intent["source_worker_id"] not in control["paused_workers"]
 
-    async def _commit_saved(self, intent: dict, decision: dict) -> dict:
+    async def _commit_saved(self, intent: dict, decision: dict | None) -> dict:
         """Commit a decision whose native turn has ended. While its worker may not run, the
         saved decision waits and is committed once it may, without another model call."""
         deferred = {"helper_id": intent["id"], "directive": "helper_deferred"}
@@ -170,7 +177,9 @@ class DecisionHelpers:
             return None
         return await self.hub.db.read(read)  # Polled while the decision runs: off the writer.
 
-    async def _decision_packet(self, intent: dict) -> tuple[dict, dict]:
+    async def _decision_packet(self, intent: dict) -> tuple[dict | None, dict]:
+        if intent["kind"] == "wake":
+            return None, await self.hub.wake_packet(intent)
         task = await self.hub.task(intent["source_task_id"])
         if intent["kind"] == "assignment":
             return task, assignment_entry(task, intent["candidates"])
@@ -184,7 +193,7 @@ class DecisionHelpers:
                 intent["state"] == "running" and not intent.get("raw_result_json")):
             raise HubError("HELPER_RECONCILIATION_REQUIRED", "Do not replay a running or held helper")
         if intent["kind"] not in DECISION_SCHEMAS:
-            raise HubError("INVALID_INPUT", "Only assignment and recruitment decisions run", 422)
+            raise HubError("INVALID_INPUT", "Only assignment, recruitment and wake decisions run", 422)
         self._helpers.add(intent["id"])
         return await DecisionTurn(self, intent).run()
 
@@ -212,6 +221,7 @@ class DecisionTurn:
         self.timed_out = False
         self.previous_total: int | None = None
         self.charged_total = 0
+        self.packet: tuple[dict | None, dict] | None = None  # A wake decision's, read before its schema.
         # Decisions use the cheap decision model on the Codex account, whatever the worker's backend.
         self.backend = "codex"
 
@@ -228,7 +238,14 @@ class DecisionTurn:
             if intent["kind"] == "assignment" and not await self.hub.assignment_offer_open(intent):
                 # Its task changed meanwhile: the decision ends without a model call.
                 return await runner._commit_helper(intent, {"worker": None})
-            schema = decision_schema(intent)
+            if intent["kind"] == "wake":
+                self.packet = await runner._decision_packet(intent)
+                names = [pair["pair"] for pair in self.packet[1]["pairs"]]
+                if not names:  # Every wait it was to judge ended meanwhile.
+                    return await runner._commit_helper(intent, {})
+                schema = wake_schema(names)
+            else:
+                schema = decision_schema(intent)
             prompt = await self._open(schema)
             cancelled = await self._cancelled_before_input()
             if cancelled is not None:
@@ -248,7 +265,7 @@ class DecisionTurn:
     async def _open(self, schema: dict) -> str:
         """Start the decision's own new conversation and prepare its single input."""
         runner, hub, intent, helper_id, worker_id = self.runner, self.hub, self.intent, self.helper_id, self.worker_id
-        preferences = await hub.decision_preferences()
+        preferences = await (hub.waker_preferences() if intent["kind"] == "wake" else hub.decision_preferences())
         self.harness = harness = await runner._new_harness(self.backend, model=preferences["model"],
                                                            effort=preferences["effort"], decision=True)
         diagnostic_setter = getattr(harness, "set_diagnostic_handler", None)
@@ -260,7 +277,7 @@ class DecisionTurn:
         activity_setter = getattr(harness, "set_activity_handler", None)
         if activity_setter is not None:
             activity_setter(self._activity)
-        task, packet = await runner._decision_packet(intent)
+        task, packet = self.packet or await runner._decision_packet(intent)
         turn_options = getattr(harness, "set_turn_options", None)
         if turn_options:
             turn_options(output_schema=schema)  # The answer is one JSON object of this schema.
@@ -286,8 +303,8 @@ class DecisionTurn:
         # The prompt carries no identifiers; the transcript still links the decision to its task.
         self.input_id = runner.transcripts.prepare_input(worker_id, session.thread_id, "taskhub",
             prompt, helper_id=helper_id, kind=intent["kind"],
-            task={"id": task["id"], "revision": task["revision"], "title": task["contract"]["title"],
-                  "kind": task["contract"]["kind"]})
+            **({"task": {"id": task["id"], "revision": task["revision"], "title": task["contract"]["title"],
+                         "kind": task["contract"]["kind"]}} if task is not None else {}))
         if turn_options:
             turn_options(output_schema=schema, client_input_id=self.input_id)
         return prompt
@@ -390,7 +407,7 @@ class DecisionTurn:
             except (ValueError, TypeError, SchemaError):
                 default = "invalid_output"
         if default is not None:
-            decision = dict(DEFAULT_DECISIONS[intent["kind"]])
+            decision = None if intent["kind"] == "wake" else dict(DEFAULT_DECISIONS[intent["kind"]])
             logger.warning("Decision %s: %s; using %s", self.helper_id, default.replace("_", " "), decision)
             await runner.activity.emit("decision_timed_out" if default == "timed_out" else "decision_invalid",
                                        **self.identity, turn_id=outcome.turn_id)

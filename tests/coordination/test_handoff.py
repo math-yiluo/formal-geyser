@@ -70,7 +70,9 @@ def test_a_wait_reads_as_words_in_the_state_file():
     from formal_geyser.coordination.runtime.state_packet import wait_text
     assert wait_text({"mode": "any", "requirements": [{"key": "a", "artifact_id": "a1", "policy": "general.peer@1"}],
                       "validations": ["c2"]}) == (
-        "artifact `a1` accepted under general.peer@1 or the machine validation of `c2`")
+        "artifact `a1` accepted or the machine validation of `c2`")
+    assert wait_text({"subscriptions": [{"task_id": "t1", "need": "a proof of S"}]}) == (
+        "a change to task `t1` that meets: a proof of S")
 
 
 def test_a_review_has_its_own_sections(workspace):

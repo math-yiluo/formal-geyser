@@ -10,7 +10,7 @@ import logging
 import sqlite3
 from typing import TYPE_CHECKING, Any
 
-from .collaboration import Collaboration, new_id
+from .collaboration import Collaboration, contract_substance, new_id
 from .commands import CommandTable
 from .errors import HubError
 from .models import BACKENDS, Actor, Checkpoint, Role, TaskContract, file_name_fields
@@ -70,6 +70,8 @@ class Lifecycle(Collaboration):
         prepare_assignment_workspace: Any
         discard_workspace: Any
         _withdraw: Any
+        _end_closed_subscriptions: Any
+        _wake_again: Any
         _normalize_worker_fields: Any
         _reconcile_native_validations: Any
         _native_validation_held: Any
@@ -124,6 +126,7 @@ class Lifecycle(Collaboration):
             "task.set_pinned": (Role.OPERATOR,),
             "task.claim": (Role.OPERATOR, Role.RUNNER),
             "task.join": (Role.OPERATOR,),
+            "task.invite_back": (Role.OPERATOR, Role.WORKER),
             "task.subscribe": (Role.OPERATOR, Role.WORKER),
             "task.complete.feedback_unavailable": (Role.OPERATOR, Role.RUNNER),
             "task.complete.cancel": (Role.OPERATOR,),
@@ -1220,9 +1223,12 @@ class Lifecycle(Collaboration):
         self._notify(c, task_id, worker_id, "workspace_recovery_required")
         return worker is not None
 
-    def _wake_for_message(self, c, worker_id, message_id):
+    def _wake_for_message(self, c, worker_id, message_id, *, notice=False):
+        """A message turns the idle or waiting `worker_id` to it, except a peer's notice to an
+        ordinary worker that waits (paused): that one reads it when its wait ends. The Integrator
+        and reviewers are woken by every message."""
         worker = self._get(c, "workers", worker_id)
-        if worker["work_intention"] == "retired":
+        if worker["work_intention"] == "retired" or notice and worker["kind"] == "ordinary" and worker["work_intention"] == "waiting":
             return
         c.execute("INSERT OR IGNORE INTO worker_wake_messages VALUES(?,?,?)", (worker_id, message_id, self.clock()))
         c.execute("UPDATE workers SET pending_wake=1 WHERE id=?", (worker_id,))
@@ -2146,6 +2152,7 @@ class Lifecycle(Collaboration):
             self._release_ended_member(c, task_id, member["worker_id"])
         c.execute("UPDATE continuations SET state='satisfied_externally' WHERE task_id=? AND state IN ('waiting','eligible','reconsider')", (task_id,))
         self._invalidate_interruptions(c, task_id, "satisfied_externally")
+        self._end_closed_subscriptions(c, task_id, "subscribed_task_done")
         self._wake(c)
         self._event(c, "task.completed", task_id, task_id=task_id)
         for drain in c.execute("SELECT d.declaration_id,d.snapshot_json FROM completion_drains d "
@@ -2418,6 +2425,7 @@ class Lifecycle(Collaboration):
                     c.execute("UPDATE tasks SET state='retired' WHERE id=?", (task["id"],))
                     self._invalidate_reviews(c, task["id"], "host_execution_unrecoverable")
                     self._reconsider_dependents(c, task["id"], "dependency_retired")
+                    self._end_closed_subscriptions(c, task["id"], "subscribed_task_retired")
                 else:
                     self._recompute_task(c, task["id"])
                 self._wake(c)
@@ -2605,6 +2613,8 @@ class Lifecycle(Collaboration):
             if paused and helper["kind"] == "recruitment":
                 c.execute("UPDATE task_lifecycle SET decision_helper_id=NULL WHERE decision_helper_id=? "
                           "AND recruitment_decision='pending'", (helper["id"],))
+            if paused and helper["kind"] == "wake":
+                self._wake_again(c, helper)  # Asked again once the run goes on.
             self._event(c, "helper.cancelled", helper["id"], {
                 "reason": p["reason"], "inference_dispatched": p["inference_dispatched"],
                 "terminal_observed": p["terminal_observed"], "process_quiet": True},
@@ -2722,7 +2732,8 @@ class Lifecycle(Collaboration):
         from .plugins import load_plugin
         load_plugin(contract.domain).validate_contract(contract)
         result = self._apply_revision(c, task, contract.model_dump())
-        material = any(task["contract"][key] != result["contract"][key] for key in ("objective", "constraints", "requirements", "acceptance_policy"))
+        before, after = contract_substance(task["contract"]), contract_substance(result["contract"])
+        material = any(before.get(key) != after.get(key) for key in ("objective", "constraints", "requirements", "acceptance_policy"))
         c.execute("INSERT INTO task_revision_history VALUES(?,?,?,?,?,?,?)", (task["id"], result["revision"], task["revision"],
                   actor.worker_id or "operator", reason, int(material), self.clock()))
         c.execute("UPDATE task_completion_declarations SET state='invalidated',decision_reason='task_revision_changed' "
@@ -2743,9 +2754,15 @@ class Lifecycle(Collaboration):
         attempt, task = self._active(c, actor)
         self._cancel_recruitment(c, task["id"], "explicit_task_pause")
         c.execute("UPDATE workers SET work_intention='waiting' WHERE id=?", (attempt["worker_id"],))
+        # Notices it has not read yet no longer turn it to them (_wake_for_message).
+        if self._get(c, "workers", attempt["worker_id"])["kind"] == "ordinary" and c.execute("DELETE FROM worker_wake_messages WHERE worker_id=? AND message_id IN (SELECT m.id FROM "
+                     "peer_messages m WHERE m.recipient_id=? AND NOT EXISTS(SELECT 1 FROM peer_message_kinds k "
+                     "WHERE k.message_id=m.id))", (attempt["worker_id"], attempt["worker_id"])).rowcount:
+            self._refresh_message_wake(c, attempt["worker_id"])
         if name == "task.pause":
             checkpoint = p.get("checkpoint", {"summary": p.get("reason", "Paused"), "next_action": "Reconsider saved work when actionable"})
-            return self._dispatch_core(c, "task.wait", {"checkpoint": checkpoint, "predicate": p.get("predicate", {"requirements": []})}, actor)
+            # No predicate is no condition: task.wait refuses it (WAIT_CONDITION_REQUIRED).
+            return self._dispatch_core(c, "task.wait", {"checkpoint": checkpoint, "predicate": p.get("predicate") or {}}, actor)
         return None
 
     @LIFECYCLE.handles("task.resume_work", "worker.resume_work")
@@ -2881,8 +2898,84 @@ class Lifecycle(Collaboration):
             self._invalidate_reviews(c, task["id"], "host_executors_left")
             self._notify(c, task["id"], task["id"], p["reason"])
             self._reconsider_dependents(c, task["id"], "dependency_retired")
+            self._end_closed_subscriptions(c, task["id"], "subscribed_task_retired")
             self._refresh_waits(c)
         return self._task(c, task["id"])
+
+    @LIFECYCLE.handles("task.invite_back")
+    def _on_task_invite_back(self, c, name, p, actor):
+        """A current executor, or the operator, invites a worker that left the task back to it. It
+        becomes a member again, like a paused member whose wait has just ended: its next turn
+        resumes the task from its saved checkpoint and files, and reads who invited it and why.
+        Only a former executor returns, so the task's two executors over its lifetime stay two."""
+        task = self._task(c, p["task_id"])
+        if task["contract"]["kind"] in REVIEW_KINDS:
+            raise HubError("REVIEW_PROTOCOL", "A review has exactly one executor and never invites one back")
+        if task["state"] in TERMINAL:
+            raise HubError("TASK_TERMINAL", "A done or retired task takes no executor back", 409)
+        if actor.role == Role.WORKER:
+            self._active(c, actor)
+            if not c.execute("SELECT 1 FROM task_members WHERE task_id=? AND worker_id=? AND executor=1 "
+                             "AND membership_state='member'", (task["id"], actor.worker_id)).fetchone():
+                raise HubError("EXECUTOR_REQUIRED", "Only a current executor of this task may invite a worker back", 403)
+        else:
+            self._role(actor, Role.OPERATOR)
+        reason = p.get("reason")
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 4000:
+            raise HubError("REASON_REQUIRED", "Say why the worker is invited back, in at most 4000 characters", 422)
+        self._normalize_worker_fields(c, p, "worker_id")
+        invitee = self._get(c, "workers", p["worker_id"])
+        label = worker_identity(dict(invitee)).get("display_name", invitee["id"])
+        member = c.execute("SELECT * FROM task_members WHERE task_id=? AND worker_id=? AND executor=1",
+                           (task["id"], invitee["id"])).fetchone()
+        if member is None or member["membership_state"] == "member":
+            raise HubError("FORMER_EXECUTOR_REQUIRED", f"{label} is " + ("still an executor of this task" if member else
+                           "not a former executor of this task") + ": only a worker that left it can be invited back", 409)
+        if member["membership_state"] != "left":
+            raise HubError("MEMBERSHIP_ENDED", f"{label}'s membership ended with the task's completion and cannot return", 409)
+        busy = self._invitation_blocker(c, invitee, task["id"])
+        if busy:
+            raise HubError("WORKER_BUSY", f"{label} {busy}, so it cannot come back now. Message it with talk_send, "
+                           "or invite it again later.", 409)
+        attempt = c.execute("SELECT * FROM attempts WHERE task_id=? AND worker_id=? AND execution_mode<>'message_only' "
+                            "ORDER BY created_at DESC,rowid DESC LIMIT 1", (task["id"], invitee["id"])).fetchone()
+        snapshot = (attempt["snapshot"] if attempt else None) or member["snapshot"]
+        if attempt is None or attempt["ended_at"] is None or not snapshot:
+            raise HubError("WORKER_BUSY", f"{label}'s last turn on this task has not finished saving its files; "
+                           "invite it again later", 409)
+        checkpoint = (attempt["checkpoint_json"] or member["checkpoint_json"]
+                      or canonical({"summary": "You left this task: " + (member["work_reason"] or "no reason recorded"),
+                                    "next_action": "Read why you were invited back, then continue the task."}))
+        cid = new_id()
+        c.execute("INSERT INTO continuations(id,task_id,task_revision,preferred_worker,predicate_json,checkpoint_json,"
+                  "snapshot,state,wake_reason,origin_attempt,created_at) VALUES(?,?,?,?,?,?,?,'reconsider','invited_back',?,?)",
+                  (cid, task["id"], task["revision"], invitee["id"], canonical({"mode": "all"}), checkpoint, snapshot,
+                   attempt["id"], self.clock()))
+        c.execute("UPDATE task_members SET membership_state='member',runnable=0,work_reason='invited_back' "
+                  "WHERE task_id=? AND worker_id=?", (task["id"], invitee["id"]))
+        c.execute("UPDATE workers SET current_task_id=?,work_intention='waiting' WHERE id=?", (task["id"], invitee["id"]))
+        inviter = "the operator" if actor.role != Role.WORKER else worker_identity(
+            dict(self._get(c, "workers", actor.worker_id))).get("display_name", actor.worker_id)
+        self._event(c, "task.invited_back", task["id"], {"invited_by": inviter, "reason": reason, "continuation_id": cid},
+                    task["id"], invitee["id"])
+        return {"task_id": task["id"], "worker_id": invitee["id"], "continuation_id": cid, "invited_by": inviter}
+
+    def _invitation_blocker(self, c, worker, task_id):
+        """Why `worker` cannot return to `task_id` now (a few words), or None when it can."""
+        if worker["kind"] != "ordinary":
+            return "is not an ordinary worker"
+        if worker["work_intention"] == "retired" or worker["state"] == "retired":
+            return "is retired"
+        if worker["state"] == "recovery_required":
+            return "is recovering an interrupted execution"
+        if worker["active_attempt"] or worker["state"] in {"preparing", "running", "draining"}:
+            return "is in a turn"
+        if c.execute("SELECT 1 FROM interruption_checkpoints WHERE worker_id=? AND state='parked'", (worker["id"],)).fetchone():
+            return "holds an interrupted turn to resume"
+        if worker["current_task_id"] and worker["current_task_id"] != task_id and \
+                self._get(c, "tasks", worker["current_task_id"])["state"] not in TERMINAL:
+            return "is working on another unfinished task"
+        return None
 
     @LIFECYCLE.handles("run.resume")
     def _before_run_resume(self, c, name, p, actor):
@@ -2996,6 +3089,7 @@ class Lifecycle(Collaboration):
             for member in c.execute("SELECT worker_id FROM task_members WHERE task_id=?", (p["task_id"],)).fetchall():
                 self._release_ended_member(c, p["task_id"], member["worker_id"])
             self._reconsider_dependents(c, p["task_id"], "dependency_retired")
+            self._end_closed_subscriptions(c, p["task_id"], "subscribed_task_retired")
         if name == "worker.recover" and result.get("directive") == "recovered":
             c.execute("UPDATE workers SET state='suspended' WHERE id=? AND active_attempt IS NULL AND state='idle' "
                       "AND EXISTS(SELECT 1 FROM interruption_checkpoints i WHERE i.worker_id=workers.id AND i.state='parked')",

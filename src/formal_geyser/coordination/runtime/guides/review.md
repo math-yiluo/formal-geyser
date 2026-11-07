@@ -31,8 +31,9 @@ suggestions; never repair incorrect mathematics and approve the replacement.
 Missing sources or unavailable checks leave the review unresolved: ask for a
 source with `request` (`kind: "literature"`) and pause with
 `{"external_response_id": "<request id>"}` until it arrives. You may ask the author
-or other workers with `talk_send` and pause without a predicate for the reply;
-their answers never supply independent approval.
+or other workers with `talk_send` (`kind: "question"`) and pause with
+`{"answers": ["<question id>"]}` for the reply; their answers never supply
+independent approval.
 
 Your verdict's fields become your review report
 (`.private/reviews/<review task>/report.md`): make the rationale, evidence and

@@ -16,6 +16,8 @@ from formal_geyser.coordination.models import (
 from tests.coordination.lifecycle_helpers import finish_ordinary, open_collaboration, select_review
 from tests.coordination.publication_helpers import approve, file_payload, new_hub
 
+from .wait_helpers import legacy_wait
+
 OP = Actor(role=Role.OPERATOR)
 RUNNER = Actor(role=Role.RUNNER)
 VALIDATOR = Actor(role=Role.VALIDATOR)
@@ -76,14 +78,14 @@ async def review(hub, attempt, verdict="approve", **changes):
         return await approve(hub, attempt, payload)
     if payload["verdict"] == "request_changes":
         return await command(hub, "review.reject", {**payload, "suggestions": ["Correct the unsupported result."]}, worker_actor(attempt))
-    return await command(hub, "task.pause", {
+    return await legacy_wait(hub, {
         "reason": "Resolve the explicit verification uncertainty before deciding the review.",
         "checkpoint": {"summary": json.dumps(payload), "next_action": "Resolve the missing evidence and retain this candidate binding."},
     }, worker_actor(attempt))
 
 
 async def wait_for(hub, attempt, artifact_id):
-    return await command(hub, "task.wait", {
+    return await legacy_wait(hub, {
         "checkpoint": {"summary": "Candidate staged; awaiting independent publication.", "next_action": "Use peer feedback before continuing.", "input_refs": []},
         "predicate": {"requirements": [{"key": "candidate", "artifact_id": artifact_id, "policy": "general.peer@1"}]},
     }, worker_actor(attempt))
@@ -399,7 +401,7 @@ async def test_affiliated_review_gets_a_new_reviewer_and_preserves_the_peer_conv
     same_team_packet = await hub.context(peer["worker_id"])
     assert same_team_packet["context_epoch"] == host_packet["context_epoch"]
     assert same_team_packet["task"]["id"] == task["id"]
-    await command(hub, "task.pause", {"reason": "Preserve original work while considering an independent task."}, worker_actor(peer))
+    await legacy_wait(hub, {"reason": "Preserve original work while considering an independent task."}, worker_actor(peer))
     await quiet(hub, peer)
     # A worker paused mid-task is not idle: the independent task gets a new worker at once.
     joined = await hub.next_assignment(run["id"])

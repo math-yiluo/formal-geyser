@@ -54,6 +54,8 @@ from .session_settings import SESSION_SETTINGS_SCHEMA, SessionSettings, bound_se
 from .shared_dags import SharedDags
 from .storage import BlobStore, Database, canonical, collected_thread_call, digest
 from .talk import PeerTalk
+from .wait_graph import path_between, wait_edges
+from .waker import WAKER_PREFERENCES_SCHEMA, Waker
 from .worker_names import (
     WorkerNames,
     allocate_reviewer_number,
@@ -83,14 +85,22 @@ def uid() -> str:
     return str(uuid4())
 
 
-def _requirement_key(requirement: dict) -> tuple[str, str, str] | None:
-    """What Hub._possible_requirements finds for a requirement: its artifact, else its task, with
-    its policy (None: neither is named, so it is always checked)."""
+def _requirement_key(requirement: dict) -> tuple[str, str] | None:
+    """What Hub._possible_requirements finds for a requirement: its artifact, else its task (None:
+    neither is named, so it is always checked). A stored requirement's former `policy` is ignored."""
     if requirement.get("artifact_id"):
-        return "artifact", requirement["artifact_id"], requirement["policy"]
+        return "artifact", requirement["artifact_id"]
     if requirement.get("task_id"):
-        return "task", requirement["task_id"], requirement["policy"]
+        return "task", requirement["task_id"]
     return None
+
+
+# The evidence that decides whether accepted artifact `a` meets a requirement: the newest of each
+# policy it has, of which one accepted without qualifications suffices, as for the artifact's own
+# acceptance (artifact.accept): a rejection under an unrelated policy leaves it accepted. In the
+# Linux pilot no accepted artifact had evidence under two policies.
+LATEST_EVIDENCE_SQL = ("e.sequence=(SELECT MAX(e2.sequence) FROM evidence e2 "
+                       "WHERE e2.artifact_id=a.id AND e2.policy=e.policy)")
 
 
 def control_applies(alias: str, group: str = "NULL") -> str:
@@ -143,7 +153,7 @@ RUN_STOP_REASONS = {"run.pause": "operator_pause", "run.pause_after_turn": "oper
                     "run.stop": "operator_stop"}
 
 
-class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsolation, WorkerNames, SharedDags, NativeWorkflow, Communications, PeerTalk, RepositoryCoordination, Rotation, ClaudeProfiles, CodexProfiles, SessionSettings, Lifecycle):
+class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsolation, WorkerNames, SharedDags, NativeWorkflow, Communications, PeerTalk, RepositoryCoordination, Rotation, ClaudeProfiles, CodexProfiles, SessionSettings, Waker, Lifecycle):
     def __init__(
         self, root: Path, config: ProjectConfig | None = None,
         clock: Callable[[], int] | None = None,
@@ -167,9 +177,10 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         # revision files are recorded and written after commit, never inside the transaction.
         self._defer_archive_moves = threading.local()
         self.draft_files.ensure()
-        self.db = Database(self.state_dir / "state.sqlite3", SCHEMA + COMMUNICATION_SCHEMA + LIFECYCLE_SCHEMA + BATCH_SCHEMA + ROTATION_SCHEMA + SESSION_SETTINGS_SCHEMA + CLAUDE_PROFILES_SCHEMA + CODEX_PROFILES_SCHEMA + WORKSPACE_RETENTION_SCHEMA, on_open=self._recover_startup,
+        self.db = Database(self.state_dir / "state.sqlite3", SCHEMA + COMMUNICATION_SCHEMA + LIFECYCLE_SCHEMA + BATCH_SCHEMA + ROTATION_SCHEMA + SESSION_SETTINGS_SCHEMA + CLAUDE_PROFILES_SCHEMA + CODEX_PROFILES_SCHEMA + WORKSPACE_RETENTION_SCHEMA + WAKER_PREFERENCES_SCHEMA, on_open=self._recover_startup,
                            before_call=self._clear_native_read_cache, before_read=self._clear_native_read_cache)
         self.clock = clock or (lambda: int(time.time() * 1000))
+        self._overdue_check_at = 0.0  # end_overdue_waits: when it next reads the database.
 
     @property
     def _native_read_cache(self) -> dict:
@@ -211,6 +222,8 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
             self._reconcile_drafts(c)
             self._reconcile_dags(c)
             self._supersede_stacked_waits(c)
+            from .task_graph import backfill_task_origins
+            backfill_task_origins(c, self.clock())
             c.execute("COMMIT")
         except BaseException:
             c.execute("ROLLBACK")
@@ -450,10 +463,8 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         where, args = self._requirement_where(self._named_requirement(c, req))
         rows = c.execute(
             "SELECT a.id,e.verdict,e.qualifications_json FROM artifacts a JOIN evidence e "
-            "ON e.artifact_id=a.id WHERE "+where+
-            " AND a.status='accepted' AND e.policy=? AND e.sequence=("
-            "SELECT MAX(e2.sequence) FROM evidence e2 WHERE e2.artifact_id=a.id AND e2.policy=e.policy)",
-            (*args, req["policy"]),
+            "ON e.artifact_id=a.id WHERE " + where + " AND a.status='accepted' AND " + LATEST_EVIDENCE_SQL,
+            args,
         ).fetchall()
         return any(r["verdict"] == "accepted" and not json.loads(r["qualifications_json"])
                    and self._available_artifact(c, r["id"]) for r in rows)
@@ -464,9 +475,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
             where, args = self._requirement_where(self._named_requirement(c, req))
             rows = c.execute(
                 "SELECT a.id,e.verdict,e.qualifications_json FROM artifacts a JOIN evidence e ON e.artifact_id=a.id WHERE "
-                + where + " AND a.status='accepted' AND e.policy=? AND e.sequence=("
-                "SELECT MAX(e2.sequence) FROM evidence e2 WHERE e2.artifact_id=a.id AND e2.policy=e.policy)",
-                (*args, req["policy"])).fetchall()
+                + where + " AND a.status='accepted' AND " + LATEST_EVIDENCE_SQL, args).fetchall()
             found.extend(r["id"] for r in rows
                          if r["verdict"] == "accepted" and not json.loads(r["qualifications_json"])
                          and self._available_artifact(c, r["id"]))
@@ -476,7 +485,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         """Whether `waiter`'s wait predicate holds; its checks stop once the answer is known. `possible`
         (_possible_requirements): the requirements that may hold; the others fail unread."""
         if possible is not None and predicate["mode"] == "all" and any(
-                key is not None and key not in possible for key in map(_requirement_key, predicate["requirements"])):
+                key is not None and key not in possible for key in map(_requirement_key, predicate.get("requirements", []))):
             return False
 
         def requirement(r):
@@ -488,7 +497,11 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
             return self._requirement(c, r)
 
         def results():
-            yield from map(requirement, predicate["requirements"])
+            # Subscriptions are not among them: only the waker ends one (_end_subscription_wait),
+            # whatever the mode. These combine by the mode.
+            yield from map(requirement, predicate.get("requirements", []))
+            for question_id in predicate.get("answers", []):
+                yield self._answered(c, question_id)
             if predicate.get("external_response_id"):
                 yield self._external_wait_satisfied(c, predicate)
             for artifact_id in predicate.get("validations", []):
@@ -500,18 +513,18 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
                 # giver included, for the decision alone: a given feedback would wake it at once.
                 yield bool(declaration and (declaration["state"] != "pending" or (
                     declaration["feedback_state"] != "pending" and declaration["declarer_id"] == waiter)))
-        if not (predicate["requirements"] or predicate.get("external_response_id") or predicate.get("validations")
-                or predicate.get("completion_declaration_id")):
+        if not (predicate.get("requirements", []) or predicate.get("answers") or predicate.get("external_response_id")
+                or predicate.get("validations") or predicate.get("completion_declaration_id")):
             return False
         return all(results()) if predicate["mode"] == "all" else any(results())
 
     @staticmethod
-    def _possible_requirements(c, requirements) -> set[tuple[str, str, str]]:
+    def _possible_requirements(c, requirements) -> set[tuple[str, str]]:
         """The requirements that may hold now, as _requirement_key: a version of the named
         artifact (NEXT_VERSION_SQL), or a reviewed one of the named task once it is done, is
-        accepted and has accepted evidence under the policy (what _requirement_where asks, but
-        for the newest version and the revisions). One statement for all of them;
-        Hub._requirement is several for each."""
+        accepted and has accepted evidence (what _requirement_where asks, but for the newest
+        version and the revisions). One statement for all of them; Hub._requirement is several
+        for each."""
         artifacts = sorted({r["artifact_id"] for r in requirements if r.get("artifact_id")})
         tasks = sorted({r["task_id"] for r in requirements if not r.get("artifact_id") and r.get("task_id")})
         if not artifacts and not tasks:
@@ -520,9 +533,9 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
             # CROSS JOIN keeps the versions outermost: planned freely, it read all evidence.
             "WITH RECURSIVE chain(named,id,depth) AS (SELECT value,value,0 FROM json_each(?) "
             "UNION ALL SELECT chain.named," + NEXT_VERSION_SQL + ") "
-            "SELECT 'artifact',chain.named,e.policy FROM chain CROSS JOIN artifacts a ON a.id=chain.id "
+            "SELECT 'artifact',chain.named FROM chain CROSS JOIN artifacts a ON a.id=chain.id "
             "CROSS JOIN evidence e ON e.artifact_id=a.id WHERE a.status='accepted' AND e.verdict='accepted' "
-            "UNION SELECT 'task',a.task_id,e.policy FROM tasks t JOIN artifacts a ON a.task_id=t.id "
+            "UNION SELECT 'task',a.task_id FROM tasks t JOIN artifacts a ON a.task_id=t.id "
             "JOIN evidence e ON e.artifact_id=a.id WHERE t.id IN (SELECT value FROM json_each(?)) AND t.state='done' "
             "AND a.status='accepted' AND e.verdict='accepted' "
             "AND EXISTS(SELECT 1 FROM candidate_bindings cb WHERE cb.artifact_id=a.id)",
@@ -568,7 +581,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         # statements and 3 s a call, though almost none of them could hold.
         rows = c.execute("SELECT * FROM continuations WHERE state='waiting'").fetchall()
         predicates = [json.loads(row["predicate_json"]) for row in rows]
-        possible = self._possible_requirements(c, [r for predicate in predicates for r in predicate["requirements"]])
+        possible = self._possible_requirements(c, [r for predicate in predicates for r in predicate.get("requirements", [])])
         for row, predicate in zip(rows, predicates):
             if self._satisfied(c, predicate, waiter=row["preferred_worker"], possible=possible):
                 c.execute("UPDATE continuations SET state='eligible',wake_reason='requirements_satisfied' WHERE id=?", (row["id"],))
@@ -763,7 +776,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
             return None
         scope = self._controlled_workers(c, run_id, "resumed")
         if self._assignment_open(run, self._group_controls(c, run_id)):
-            scope |= {row["id"] for row in c.execute("SELECT id FROM workers WHERE kind='dispatcher'")}
+            scope |= {row["id"] for row in c.execute("SELECT id FROM workers WHERE kind IN ('dispatcher','waker')")}
         return scope
 
     def _scope_admits(self, c, run_id, scope, worker_id):
@@ -842,7 +855,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         input_refs.update(self._requirement_artifacts(c, task["contract"]["requirements"]))
         if continuation_id:
             continuation = self._get(c, "continuations", continuation_id)
-            input_refs.update(self._requirement_artifacts(c, json.loads(continuation["predicate_json"])["requirements"]))
+            input_refs.update(self._requirement_artifacts(c, json.loads(continuation["predicate_json"]).get("requirements", [])))
         if frozen_inputs is not None:
             input_refs = set(frozen_inputs)
         c.execute("UPDATE attempts SET input_refs_json=? WHERE id=?", (canonical(sorted(input_refs)), aid))
@@ -1258,6 +1271,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
     def _on_run_start(self, c, name, p, actor):
         self._role(actor, Role.OPERATOR)
         self._execution_environment(c)
+        self._require_choices(c)
         if c.execute("SELECT 1 FROM runs WHERE state='running'").fetchone():
             raise HubError("RUN_ACTIVE", "Pause or stop the active run before creating another")
         limits = Limits.model_validate({**self.config.limits.model_dump(), **p.get("limits", {})})
@@ -1272,6 +1286,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         self._role(actor, Role.OPERATOR)
         if name == "run.resume":
             self._execution_environment(c)
+            self._require_choices(c)
         rid = p["run_id"]
         run = self._get(c, "runs", rid)
         transitions = {
@@ -1332,6 +1347,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
             if worker["work_intention"] == "retired" or worker["state"] == "retired":
                 raise HubError("WORKER_RETIRED", "A retired worker conversation cannot execute again")
             self._execution_environment(c)
+            self._require_choices(c)
         # A person already paused keeps the pause it has when asked to pause after its turn.
         if not after_turn or self._effective_run_state(c, run, worker["id"]) == "running":
             c.execute("DELETE FROM worker_controls WHERE worker_id=?", (worker["id"],))
@@ -1375,6 +1391,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         wanted = "resumed" if name == "group.resume" else "paused"
         if wanted == "resumed":
             self._execution_environment(c)
+            self._require_choices(c)
         backend, kinds = CONTROL_GROUPS[group]
         members = "SELECT id FROM workers WHERE backend=? AND kind IN (" + ",".join("?" * len(kinds)) + ")"
         narrower = [item for item, (other, part) in CONTROL_GROUPS.items() if other == backend and set(part) < set(kinds)]
@@ -1419,7 +1436,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         if is_reserved_identity(wid):
             raise HubError("INVALID_ID", "Worker N and Reviewer N are reserved for generated display names", 422)
         kind = p.get("kind", "ordinary")
-        if not isinstance(kind, str) or kind not in {"ordinary", "review", "integrator", "dispatcher"}:
+        if not isinstance(kind, str) or kind not in {"ordinary", "review", "integrator", "dispatcher", "waker"}:
             raise HubError("INVALID_INPUT", "Expected ordinary worker or review actor", 422)
         number = allocate_worker_number(c) if kind == "ordinary" else None
         reviewer_number = allocate_reviewer_number(c) if kind == "review" else None
@@ -1478,11 +1495,55 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
     def _on_integrator_batch(self, c, name, p, actor):
         return self._batch_rule_command(c, name, p, actor)
 
+    @CORE.handles("runtime.set_answer_deadline")
+    def _on_runtime_set_answer_deadline(self, c, name, p, actor):
+        # Applies to waits for an answer recorded from now on.
+        self._role(actor, Role.OPERATOR)
+        minutes = p.get("minutes")
+        if type(minutes) is not int or not 1 <= minutes <= 30 * 24 * 60:
+            raise HubError("INVALID_INPUT", "Expected a whole number of minutes from 1 to 43200", 422)
+        c.execute("INSERT INTO answer_deadline_preferences(id,minutes,updated_at) VALUES(1,?,?) "
+                  "ON CONFLICT(id) DO UPDATE SET minutes=excluded.minutes,updated_at=excluded.updated_at",
+                  (minutes, self.clock()))
+        self._event(c, "runtime.answer_deadline_selected", "runtime", {"minutes": minutes})
+        return self._answer_deadline(c)
+
+    def _answer_deadline(self, c) -> dict:
+        """How many minutes a wait for an answer lasts: the operator's choice, else project.toml;
+        None while neither chose."""
+        row = c.execute("SELECT minutes FROM answer_deadline_preferences WHERE id=1").fetchone()
+        if row is not None:
+            return {"minutes": row["minutes"], "source": "operator"}
+        minutes = self.config.waits.answer_deadline_minutes
+        return {"minutes": minutes, "source": "config" if minutes is not None else None}
+
+    def _missing_choices(self, c) -> list[str]:
+        """What must still be chosen before a run starts, in words: every role's model and effort
+        and the answer deadline. None has a default."""
+        missing = self._missing_role_choices(c)
+        for label, chosen in (("The Dispatcher", self._decision_preferences(c)),
+                              ("The Waker", self._waker_preferences(c))):
+            missing += [f"{label}: {field}" for field in ("model", "effort") if not chosen[field]]
+        if self._answer_deadline(c)["minutes"] is None:
+            missing.append("The answer deadline")
+        return missing
+
+    def _require_choices(self, c) -> None:
+        missing = self._missing_choices(c)
+        if missing:
+            raise HubError("CHOICES_REQUIRED", "Choose these before a run starts or resumes, in Project setup's "
+                           "Agents and sessions panel or in project.toml: " + "; ".join(missing) + ".", 409)
+
+    @CORE.handles("runtime.set_waker_model")
+    def _on_runtime_set_waker_model(self, c, name, p, actor):
+        # Applies to wake decisions started from now on.
+        return self._set_waker_model(c, p, actor)
+
     @CORE.handles("runtime.set_decision_model")
     def _on_runtime_set_decision_model(self, c, name, p, actor):
         # Applies to assignment and recruitment decisions started from now on.
         self._role(actor, Role.OPERATOR)
-        model, effort = p.get("model"), p.get("effort", "high")
+        model, effort = p.get("model"), p.get("effort")  # Both chosen: neither has a default.
         if (not isinstance(model, str) or not model.strip() or len(model) > 200
                 or any(ch.isspace() for ch in model)):
             raise HubError("INVALID_INPUT", "Expected a model name", 422)
@@ -1543,6 +1604,10 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         tid = uid()
         c.execute("INSERT INTO tasks(id,current_revision,state,created_at) VALUES(?,1,'ready',?)", (tid, self.clock()))
         c.execute("INSERT INTO task_revisions VALUES(?,1,?,?)", (tid, body, sha))
+        origin = self._active(c, actor) if actor.role == Role.WORKER else None
+        c.execute("INSERT INTO task_origins VALUES(?,?,?,?,?)", (
+            tid, origin[1]["id"] if origin else None, origin[0]["worker_id"] if origin else None,
+            origin[0]["id"] if origin else None, self.clock()))
         self._persist_task_content(c, tid, 1, contract.model_dump())
         self._init_collaboration(c, tid, actor)
         c.execute("INSERT INTO search_index VALUES(?,?,?,?)", (tid, "task", contract.title, contract.objective))
@@ -1566,21 +1631,115 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
     @CORE.handles("task.wait")
     def _on_task_wait(self, c, name, p, actor):
         a, task = self._active(c, actor)
-        checkpoint, predicate = Checkpoint.model_validate(p["checkpoint"]), Predicate.model_validate(p["predicate"])
+        raw = p.get("predicate")
+        if isinstance(raw, dict) and raw.get("requirements"):
+            raise HubError("PAUSE_REQUIREMENTS_REMOVED", "A pause no longer takes requirements. To wait for another "
+                           "task's results, subscribe to it: {\"subscriptions\": [{\"task_id\": \"<id>\", \"need\": "
+                           "\"<the results you await>\"}]}", 422)
+        if isinstance(raw, dict) and "requirements" in raw:
+            raw = {key: value for key, value in raw.items() if key != "requirements"}
+        checkpoint, predicate = Checkpoint.model_validate(p["checkpoint"]), Predicate.model_validate(raw or {})
+        if not predicate.has_condition():
+            raise HubError("WAIT_CONDITION_REQUIRED", "A pause needs what ends it: a subscription to another task "
+                           "(subscriptions), your own submission's result (validations, completion_declaration_id), or "
+                           "an answer to your question (answers: a worker's; external_response_id: the operator's). If "
+                           "nothing is left for you to do in this task, leave it (leave_task) instead; while another "
+                           "executor remains, it can invite you back (invite_back).", 422)
+        self._check_subscriptions(c, task, a["worker_id"], predicate.subscriptions)
+        self._check_questions(c, a["worker_id"], predicate.answers)
+        return self._record_wait(c, a, task, checkpoint.model_dump(), predicate.model_dump())
+
+    def _record_wait(self, c, a, task, checkpoint: dict, predicate: dict) -> dict:
+        """Record attempt `a`'s wait on `predicate`, already checked (stored waits recorded before
+        2026-11-07 may name requirements, or nothing)."""
         cid = uid()
-        state = "eligible" if self._satisfied(c, predicate.model_dump(), waiter=a["worker_id"]) else "waiting"
+        state = "eligible" if self._satisfied(c, predicate, waiter=a["worker_id"]) else "waiting"
         # The new wait states the whole wake condition: it replaces the worker's earlier ones here.
         c.execute("UPDATE continuations SET state='superseded_by_worker' WHERE preferred_worker=? AND task_id=? "
                   "AND state IN ('waiting','eligible')", (a["worker_id"], a["task_id"]))
         c.execute(
             "INSERT INTO continuations(id,task_id,task_revision,preferred_worker,predicate_json,checkpoint_json,state,origin_attempt,created_at)"
             " VALUES(?,?,?,?,?,?,?,?,?)",
-            (cid, a["task_id"], a["task_revision"], a["worker_id"], canonical(predicate.model_dump()), canonical(checkpoint.model_dump()), state, a["id"], self.clock()),
+            (cid, a["task_id"], a["task_revision"], a["worker_id"], canonical(predicate), canonical(checkpoint), state, a["id"], self.clock()),
         )
-        c.execute("UPDATE attempts SET state='draining',checkpoint_json=?,continuation_id=? WHERE id=?", (canonical(checkpoint.model_dump()), cid, a["id"]))
+        c.execute("UPDATE attempts SET state='draining',checkpoint_json=?,continuation_id=? WHERE id=?", (canonical(checkpoint), cid, a["id"]))
         c.execute("UPDATE workers SET state='draining' WHERE id=?", (a["worker_id"],))
+        deadline = self._answer_deadline(c)["minutes"]
+        if deadline is not None and (predicate.get("answers") or predicate.get("external_response_id")):
+            c.execute("INSERT INTO wait_deadlines VALUES(?,?)", (cid, self.clock() + deadline * 60_000))
         self._event(c, "continuation.created", cid, {"state": state}, task["id"], a["worker_id"])
         return {"runtime_directive": "drain_for_wait", "continuation_id": cid, "attempt_id": a["id"]}
+
+    @staticmethod
+    def _check_questions(c, worker_id, question_ids):
+        """Each awaited answer is to a question this worker asked."""
+        for question_id in question_ids:
+            if c.execute("SELECT 1 FROM peer_messages m JOIN peer_message_kinds k ON k.message_id=m.id "
+                         "AND k.kind='question' WHERE m.id=? AND m.sender_id=?", (question_id, worker_id)).fetchone() is None:
+                raise HubError("QUESTION_NOT_FOUND", f"{question_id} is not a question you asked. Ask it with "
+                               "talk_send (kind question), then wait on the id its receipt returns.", 422)
+
+    @staticmethod
+    def _answered(c, question_id) -> bool:
+        return c.execute("SELECT 1 FROM peer_message_kinds WHERE answers=? LIMIT 1", (question_id,)).fetchone() is not None
+
+    def _wake_answered(self, c, question_id):
+        """The question `question_id` has an answer: the waits on it that now hold end, as _wake ends
+        them, without reading every other wait."""
+        for row in c.execute("SELECT DISTINCT k.* FROM continuations k, json_each(k.predicate_json,'$.answers') a "
+                             "WHERE k.state='waiting' AND a.value=?", (question_id,)).fetchall():
+            if self._satisfied(c, json.loads(row["predicate_json"]), waiter=row["preferred_worker"]):
+                c.execute("UPDATE continuations SET state='eligible',wake_reason='requirements_satisfied' WHERE id=?", (row["id"],))
+                self._event(c, "continuation.eligible", row["id"], task_id=row["task_id"], worker_id=row["preferred_worker"])
+
+    async def end_overdue_waits(self) -> int:
+        """Waits for an answer still unanswered at their deadline end, and their workers reconsider.
+        The driver asks on every pass; this reads the database at most once a minute."""
+        if time.monotonic() < self._overdue_check_at:
+            return 0
+        self._overdue_check_at = time.monotonic() + 60
+
+        def end(c):
+            rows = c.execute("SELECT k.id,k.task_id FROM wait_deadlines d JOIN continuations k ON k.id=d.continuation_id "
+                             "WHERE d.due_at<=? AND k.state='waiting'", (self.clock(),)).fetchall()
+            for row in rows:
+                c.execute("UPDATE continuations SET state='reconsider',wake_reason='answer_deadline' WHERE id=?", (row["id"],))
+                self._notify(c, row["task_id"], row["id"], "answer_deadline")
+            return len(rows)
+        return await self.db.call(end, write=True)
+
+    def _check_subscriptions(self, c, task, worker_id, subscriptions):
+        """Each subscribed task exists and can still publish, and no subscription closes a cycle of
+        tasks waiting on each other (wait_graph)."""
+        if not subscriptions:
+            return
+        titles = {}
+
+        def title(task_id):
+            if task_id not in titles:
+                row = c.execute("SELECT json_extract(v.contract_json,'$.title') FROM tasks t JOIN task_revisions v "
+                                "ON v.task_id=t.id AND v.revision=t.current_revision WHERE t.id=?", (task_id,)).fetchone()
+                titles[task_id] = row[0] if row else "?"
+            return f"{task_id} ({titles[task_id]})"
+        edges = None
+        for subscription in subscriptions:
+            target = self._task(c, subscription.task_id)
+            if target["id"] == task["id"]:
+                raise HubError("SUBSCRIPTION_CYCLE", "A task cannot wait on itself: for your own submission's result "
+                               "wait on its validations or completion declaration, and ask a collaborator a question "
+                               "for anything else.", 422)
+            if target["state"] in {"done", "retired"}:
+                raise HubError("SUBSCRIPTION_CLOSED", f"Task {title(target['id'])} is {target['state']} and publishes "
+                               "nothing more: its results are in the Library or nowhere.", 422)
+            if edges is None:
+                edges = wait_edges(c, replacing=(worker_id, task["id"]))
+            back = path_between(edges, target["id"], task["id"])
+            if back is not None:
+                cycle = " -> ".join(title(node) for node in [task["id"], *back])
+                raise HubError("SUBSCRIPTION_CYCLE", "This subscription would close a cycle of tasks waiting on each "
+                               f"other, so none of them could go on: {cycle}. Ask the workers involved instead, or "
+                               "work on another part.", 422)
+            edges.setdefault(task["id"], set()).add(target["id"])
 
     @CORE.handles("artifact.submit")
     def _on_artifact_submit(self, c, name, p, actor):
@@ -2176,6 +2335,28 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
                   (uid(), task_id, object_id, reason, self.clock()))
         self._event(c, "attention.required", object_id, {"reason": reason}, task_id)
 
+    def _end_subscription_wait(self, c, continuation_id, task_id) -> bool:
+        """The waker found that what `task_id` published meets a subscription of this wait: the
+        wait ends, and its worker reconsiders, told only that its subscribed task changed. False
+        when the wait has ended or does not subscribe to `task_id`."""
+        row = c.execute("SELECT * FROM continuations WHERE id=? AND state='waiting'", (continuation_id,)).fetchone()
+        if row is None or task_id not in {item["task_id"] for item in
+                                          json.loads(row["predicate_json"]).get("subscriptions", [])}:
+            return False
+        c.execute("UPDATE continuations SET state='reconsider',wake_reason='subscribed_task_changed' WHERE id=?",
+                  (continuation_id,))
+        self._notify(c, row["task_id"], task_id, "subscribed_task_changed")
+        return True
+
+    def _end_closed_subscriptions(self, c, task_id, reason):
+        """`task_id` is done or retired and publishes nothing more: the waits subscribed to it end,
+        and their workers reconsider."""
+        for row in c.execute("SELECT DISTINCT k.id,k.task_id FROM continuations k, json_each(k.predicate_json,"
+                             "'$.subscriptions') s WHERE k.state IN ('waiting','eligible') "
+                             "AND json_extract(s.value,'$.task_id')=?", (task_id,)).fetchall():
+            c.execute("UPDATE continuations SET state='reconsider',wake_reason=? WHERE id=?", (reason, row["id"]))
+            self._notify(c, row["task_id"], task_id, reason)
+
     def _reconsider_artifact_waits(self, c, artifact_id, reason):
         """Whoever waits on a candidate that can no longer be accepted reconsiders its wait (one
         naming an earlier version it corrects as well), and a validation of it that waits for
@@ -2402,16 +2583,21 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
                 "claude_profiles": self._claude_profiles_view(c),
                 "codex_profiles": self._codex_profiles_view(c),
                 "decision_model": self._decision_preferences(c),
+                "waker_model": self._waker_preferences(c),
+                "answer_deadline": self._answer_deadline(c),
+                "missing_choices": self._missing_choices(c),
                 "rotation": self._rotation_settings(c),
                 "integrator_batch": self._batch_rule(c)}
 
     def _decision_preferences(self, c) -> dict:
-        """The model and effort for assignment and recruitment decisions: the operator's
-        recorded choice, else the project configuration."""
+        """The Dispatcher's model and effort for assignment and recruitment decisions: the
+        operator's recorded choice, else the project configuration; None while neither chose."""
         row = c.execute("SELECT model,effort FROM decision_preferences WHERE id=1").fetchone()
         if row is not None:
             return {"model": row["model"], "effort": row["effort"], "source": "operator"}
-        return {"model": self.config.decisions.model, "effort": self.config.decisions.effort, "source": "config"}
+        decisions = self.config.decisions
+        return {"model": decisions.model, "effort": decisions.effort,
+                "source": "config" if decisions.model or decisions.effort else None}
 
     async def decision_preferences(self) -> dict:
         return await self.db.read(self._decision_preferences)
@@ -2559,9 +2745,10 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         return await self.db.call(lambda c: [
             self._task(c, row["id"]) for row in c.execute("SELECT id FROM tasks ORDER BY created_at,id")])
 
-    async def task_page(self, *, view="all", query="", offset=0, limit=25):
+    async def task_page(self, *, view="all", query="", offset=0, limit=25, kind="both", sort="newest", until=None):
         from .task_browser import task_page
-        return await task_page(self, view=view, query=query, offset=offset, limit=limit)
+        return await task_page(self, view=view, query=query, offset=offset, limit=limit,
+                               kind=kind, sort=sort, until=until)
 
     async def task_revision_page(self, task_id, *, offset=0, limit=20):
         from .task_browser import task_revision_page
@@ -2572,8 +2759,16 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         return await task_overview(self)
 
     async def task_outline(self):
-        from .task_browser import task_outline
+        from .task_graph import task_outline
         return await task_outline(self)
+
+    async def task_graph(self, *, include_met=False):
+        from .task_graph import task_graph
+        return await task_graph(self, include_met=include_met)
+
+    async def task_relations(self, task_id):
+        from .task_graph import task_relations
+        return await task_relations(self, task_id)
 
     async def list_workers(self, *, retired: bool = True) -> list[dict]:
         """Every worker with its controls; without `retired`, only those not retired (the
@@ -2717,7 +2912,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
                 predicate = json.loads(continuation["predicate_json"])
                 resume_requirements = [
                     {**req, "satisfied": self._requirement(c, req), "artifact_ids": self._requirement_artifacts(c, [req])}
-                    for req in predicate["requirements"]]
+                    for req in predicate.get("requirements", [])]
             else:
                 resume_requirements = []
             packet = {

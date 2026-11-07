@@ -19,6 +19,8 @@ from formal_geyser.coordination.models import (
 )
 from tests.coordination.lifecycle_helpers import resolve_recruitment, select_review
 
+from .wait_helpers import legacy_wait
+
 OPERATOR, RUNNER, VALIDATOR = Actor(role=Role.OPERATOR), Actor(role=Role.RUNNER), Actor(role=Role.VALIDATOR)
 POLICY = "general.peer@1"
 
@@ -86,7 +88,7 @@ async def waiting_consumer(case):
             case.assigned.append(consumer)
     else:
         raise AssertionError("The consumer task was not assigned")
-    await command(case.hub, "task.wait", {
+    await legacy_wait(case.hub, {
         "checkpoint": {"summary": "Waiting for the provider.", "next_action": "Use its document."},
         "predicate": {"requirements": [{"key": "provider", "artifact_id": case.candidate["artifact_id"],
                                         "policy": POLICY}]}}, worker(consumer))

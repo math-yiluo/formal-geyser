@@ -6,12 +6,16 @@ inside a job to measure it, and one uses the real Codex sandbox when it is insta
 from __future__ import annotations
 
 import asyncio
+import collections
 import errno
+import functools
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,7 +27,7 @@ from formal_geyser.coordination.models import LeanServiceConfig
 from formal_geyser.coordination.runtime.executable import native_candidates
 from formal_geyser.lean_service import client, executor
 from formal_geyser.lean_service import service as service_module
-from formal_geyser.lean_service.osjobs import Usage
+from formal_geyser.lean_service.osjobs import JobGroup, Usage
 from formal_geyser.lean_service.sandbox import CodexSandbox, Unsandboxed
 from formal_geyser.lean_service.scheduler import GIB
 from formal_geyser.lean_service.service import LeanService
@@ -73,8 +77,8 @@ def spec(hub, *, lane="official", owner="w1", snapshot=None, directory=None, mod
                         "inspections": list(inspections)}}
 
 
-async def started(hub, runner=None, **kwargs):
-    service = LeanService(hub.root, LeanServiceConfig(), runner=runner or FakeRunner(),
+async def started(hub, runner=None, config=None, **kwargs):
+    service = LeanService(hub.root, config or LeanServiceConfig(), runner=runner or FakeRunner(),
                           measure=lambda: (64 * GIB, 128 * GIB), threads=8, **kwargs)
     await service.start()
     return service
@@ -292,6 +296,111 @@ async def test_an_integrator_job_takes_at_most_a_few_threads(proof_case, tmp_pat
         await service.close()
 
 
+async def test_a_validation_takes_at_most_a_few_threads(proof_case):
+    # Lake restores nearly all of a validation's modules from its cache: its build gets
+    # validation_threads, not a thread for each module, and may start with one.
+    hub, _, artifact = proof_case
+    service = await started(hub)
+    try:
+        official = executor.JobSpec.model_validate(spec(hub, snapshot=artifact["snapshot"],
+                                                        modules=[f"M{n}" for n in range(8)]))
+        sized = service._sched("validation", official, None, 0.0)
+        assert (sized.threads, sized.min_threads) == (4, 1)
+        estimated = service._sched("validation", official, {"processes": 8, "memory": GIB, "committed": GIB,
+                                                            "seconds": 60.0}, 0.0)
+        assert estimated.threads == 4
+    finally:
+        await service.close()
+    narrow = await started(hub, config=LeanServiceConfig(validation_threads=2))
+    try:
+        official = executor.JobSpec.model_validate(spec(hub, snapshot=artifact["snapshot"],
+                                                        modules=[f"M{n}" for n in range(8)]))
+        assert narrow._sched("validation", official, None, 0.0).threads == 2
+    finally:
+        await narrow.close()
+
+
+async def test_builds_past_the_build_slot_limit_wait_for_a_slot(proof_case):
+    hub, _, artifact = proof_case
+    assert LeanServiceConfig().build_slots == 8
+    runner, started_builds = Gated(), []
+    # Every build of Candidate is counted when it reaches Lake; the first is held there.
+    entered, release = runner.hold(lambda argv: builds("Candidate")(argv) and not started_builds.append(argv))
+    service = await started(hub, runner, config=LeanServiceConfig(build_slots=1))
+    try:
+        first = await service.submit(spec(hub, snapshot=artifact["snapshot"]))
+        await asyncio.wait_for(entered.wait(), 30)
+        second = await service.submit(spec(hub, snapshot=artifact["snapshot"], owner="w2", inspections=[
+            {"module": "Candidate", "declaration": "Candidate.target", "statement": "Baseline.target"}]))
+        assert second["id"] != first["id"]
+        await asyncio.sleep(0.5)
+        assert service.jobs[second["id"]].sched.state == "running"  # Started, and waiting for the slot.
+        assert len(started_builds) == 1
+        release.set()
+        results = [(await service.wait(job["id"], 30))["result"] for job in (first, second)]
+        assert all(result["compilation"]["ok"] for result in results)
+        assert [Path(result["compilation"]["workspace"]).name for result in results] == ["0", "0"]
+        assert results[1]["compilation"]["timings"]["slot"] >= 0.4
+    finally:
+        await service.close()
+
+
+def test_a_build_needs_the_cores_it_used_over_the_window_plus_one():
+    window = service_module.RELEASE_WINDOW_SECONDS
+    assert service_module.threads_in_use([(0.0, 0.0)], 4) is None
+    assert service_module.threads_in_use([(0.0, 0.0), (window - 1, 50.0)], 4) is None  # Not a window yet.
+    assert service_module.threads_in_use([(0.0, 0.0), (window, 1.2 * window)], 31) == 3
+    assert service_module.threads_in_use([(0.0, 0.0), (window, 0.0)], 31) == 1
+    assert service_module.threads_in_use([(0.0, 0.0), (window, 8.0 * window)], 4) == 4  # Never more than it holds.
+
+
+async def test_a_validation_build_gives_back_the_threads_it_does_not_use(proof_case, monkeypatch):
+    hub, _, artifact = proof_case
+    service = await started(hub)
+    try:
+        official = executor.JobSpec.model_validate(spec(hub, snapshot=artifact["snapshot"]))
+        clock, woken = [1000.0], []
+        monkeypatch.setattr(service_module.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(service, "wake", lambda: woken.append(True))
+
+        class Group:
+            peak_private_memory = 0
+            cpu = 0.0
+
+            def usage(self):
+                return Usage(self.cpu, 0, 0, 0, 1)
+
+        def running(lane="official"):
+            sched = service._sched("job", official, None, 0.0)
+            sched.lane, sched.state, sched.shape, sched.assigned = lane, "running", "build", 4
+            job = service_module.ServiceJob({"id": "job-" + lane}, official, sched)
+            job.group = Group()
+            return job
+
+        job, check = running(), running("interactive")
+        for _ in range(130):  # One core for 130 seconds, sampled every second.
+            for each in (job, check):
+                each.group.cpu += 1.0
+                await LeanService._sample_job(each)
+                service._release_idle_threads(each)
+            clock[0] += 1.0
+            if clock[0] < 1000.0 + service_module.RELEASE_WINDOW_SECONDS:
+                assert job.sched.assigned == 4  # Not before a whole window.
+        assert job.sched.assigned == 2 and woken
+        assert check.sched.assigned == 4  # A development check keeps its own.
+        assert len(job.cpu_samples) <= service_module.RELEASE_WINDOW_SECONDS + 2
+        # A new run counts from zero; a frozen job's samples say nothing of what it uses.
+        job.group.cpu = 0.0
+        await LeanService._sample_job(job)
+        assert len(job.cpu_samples) == 1
+        job.sched.state = "suspended"
+        job.group.suspend = lambda: None
+        await LeanService._sample_job(job)
+        assert not job.cpu_samples
+    finally:
+        await service.close()
+
+
 async def test_an_integrator_job_runs_while_the_checks_already_running_go_on(proof_case, tmp_path):
     hub, _, artifact = proof_case
     runner = Gated()
@@ -415,7 +524,7 @@ async def test_a_job_that_ends_while_it_is_measured_is_left_to_its_release():
 
     def running(group_of):
         job = SimpleNamespace(sched=SimpleNamespace(state="running", observed_memory=0, observed_commit=0),
-                              borrowed=[], peak_committed=0, row={})
+                              borrowed=[], peak_committed=0, row={}, cpu_samples=collections.deque())
         job.group = group_of(job)
         return job
 
@@ -449,8 +558,11 @@ async def test_a_job_that_ends_before_or_while_the_plan_freezes_or_thaws_it_stay
             self.signal("resume")
 
     updates = []
-    service = SimpleNamespace(_signal=LeanService._signal, clock=lambda: 100.0,
-                              store=SimpleNamespace(update=lambda job_id, **fields: updates.append(fields)))
+
+    async def write(job, *names):
+        updates.append({name: job.row[name] for name in names})
+
+    service = SimpleNamespace(_signal=LeanService._signal, clock=lambda: 100.0, _write=write)
 
     def job(state, group_of=lambda job: None):
         job = SimpleNamespace(id="job", sched=SimpleNamespace(state=state, suspended_at=None, suspended_for=None),
@@ -471,6 +583,64 @@ async def test_a_job_that_ends_before_or_while_the_plan_freezes_or_thaws_it_stay
     await LeanService._resume(service, frozen)
     assert frozen.group.calls == ["suspend", "resume"] and frozen.sched.state == "running" and frozen.runnable.is_set()
     assert updates == [{"state": "suspended", "suspensions": 1}, {"state": "running", "suspended_seconds": 5.0}]
+
+
+async def test_a_freeze_that_fails_is_undone_and_the_job_runs_on():
+    # A freeze that raised used to leave the job running with `runnable` cleared: its next process
+    # waited for a resume that the plan, seeing it running, never gave.
+    class Group:
+        def __init__(self, fail=()):
+            self.fail, self.calls, self.frozen = set(fail), [], False
+
+        def suspend(self):
+            self.calls.append("suspend")
+            if "suspend" in self.fail:
+                raise OSError(28, "No space left on device")
+            self.frozen = True
+
+        def resume(self):
+            self.calls.append("resume")
+            if "resume" in self.fail:
+                raise OSError(28, "No space left on device")
+            self.frozen = False
+
+    updates, requeued = [], []
+
+    async def write(job, *names):
+        updates.append({name: job.row[name] for name in names})
+
+    async def requeue(job, reason):
+        requeued.append(job.id)
+
+    service = SimpleNamespace(_signal=LeanService._signal, clock=lambda: 100.0, _write=write, _requeue=requeue)
+    service._undo_freeze = functools.partial(LeanService._undo_freeze, service)
+
+    def job(group, borrowed=()):
+        return SimpleNamespace(id="job", group=group, borrowed=list(borrowed), runnable=asyncio.Event(),
+                               sched=SimpleNamespace(state="running", suspended_at=None, suspended_for=None),
+                               row={"state": "running", "suspensions": 0}, suspended_since=None)
+
+    # The job's own cgroup cannot be frozen.
+    failed = job(Group(fail={"suspend"}))
+    with pytest.raises(OSError):
+        await LeanService._suspend(service, failed, "memory")
+    assert failed.group.calls == ["suspend", "resume"]
+    # Part of the job froze: its cgroup did, a session it borrows did not. Both are thawed.
+    session = Group(fail={"suspend"})
+    partly = job(Group(), [session])
+    with pytest.raises(OSError):
+        await LeanService._suspend(service, partly, "memory")
+    assert partly.group.calls == ["suspend", "resume"] and not partly.group.frozen
+    assert session.calls == ["suspend", "resume"]
+    for each in (failed, partly):
+        assert each.sched.state == each.row["state"] == "running" and each.runnable.is_set()
+        await asyncio.wait_for(each.runnable.wait(), 1)  # Its next process starts.
+    assert updates == [] and requeued == []
+    # What cannot be thawed either may stay frozen: the run is stopped and the job queued again.
+    stuck = job(Group(fail={"suspend", "resume"}))
+    with pytest.raises(OSError):
+        await LeanService._suspend(service, stuck, "memory")
+    assert stuck.runnable.is_set() and requeued == ["job"] and updates == []
 
 
 async def test_a_job_without_its_cgroup_ends_unavailable_instead_of_waiting(proof_case, monkeypatch):
@@ -571,6 +741,249 @@ async def test_a_finished_job_whose_cgroup_cannot_be_removed_keeps_its_result_an
         assert not service.lingering and not item.scratch.exists() and service._machine().threads == 8
     finally:
         await service.close()
+
+
+# On 2026-11-05 the Linux pilot's disk was full for some minutes. Starts failed at the job's scratch
+# directory, runs failed, and the service's records could not always be written; seven jobs stayed
+# running with no run, holding their threads, and once space returned no job started until the
+# service was restarted. The next tests fill the disk at each of those places and empty it again.
+
+
+def no_space(path="") -> OSError:
+    return OSError(errno.ENOSPC, "No space left on device", str(path))
+
+
+def counted_groups():
+    """Real job cgroups, and the paths of those that exist."""
+    live: set[Path] = set()
+
+    class Group(JobGroup):
+        def __init__(self):
+            super().__init__()
+            live.add(self.path)
+
+        def close(self):
+            super().close()
+            live.discard(self.path)
+
+    return live, Group
+
+
+class FullDisk:
+    """A store connection whose writes, but for new jobs, fail while `full` holds, as SQLite's do
+    when the disk is full."""
+
+    def __init__(self, db):
+        self.db, self.full = db, False
+
+    def execute(self, sql, *args):
+        if self.full and not sql.startswith(("SELECT", "INSERT INTO jobs")):
+            raise sqlite3.OperationalError("database or disk is full")
+        return self.db.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+
+class Spaceless(FakeRunner):
+    """Its processes fail for want of disk space while `full` holds."""
+
+    full = False
+
+    async def run(self, argv, **kwargs):
+        if self.full:
+            raise no_space(kwargs.get("cwd", ""))
+        return await super().run(argv, **kwargs)
+
+
+class GatedSpaceless(Gated, Spaceless):
+    """Held as Gated, then failing as Spaceless."""
+
+
+async def until(condition, seconds=10.0):
+    for _ in range(int(seconds / 0.05)):
+        if condition():
+            return
+        await asyncio.sleep(0.05)
+    assert condition()
+
+
+async def test_a_job_whose_scratch_directory_cannot_be_made_stays_queued_holding_nothing(proof_case, monkeypatch):
+    # It holds no threads and no cgroup, is tried again later while other jobs start, and starts
+    # once its directory can be made.
+    hub, _, artifact = proof_case
+    live, group = counted_groups()
+    monkeypatch.setattr(service_module, "JobGroup", group)
+    monkeypatch.setattr(service_module, "START_RETRY_SECONDS", 0.05)
+    monkeypatch.setattr(service_module, "START_RETRY_MAX_SECONDS", 0.2)
+    failing = {"all"}
+    mkdir = Path.mkdir
+
+    def full(path, *args, **kwargs):
+        if (path.parent.name, path.parent.parent.name) == ("scratch", "lean-service") and (
+                "all" in failing or path.name in failing):
+            raise no_space(path)
+        return mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", full)
+    service = await started(hub)
+    try:
+        first = service.jobs[(await service.submit(spec(hub, snapshot=artifact["snapshot"])))["id"]]
+        await until(lambda: first.start_failures >= 2)
+        assert (first.sched.state, first.sched.assigned, first.task, first.group) == ("queued", 0, None, None)
+        assert not live and service.status()["threads_in_use"] == 0
+        assert service.store.get(first.id)["state"] == "queued"
+        failing.clear()
+        failing.add(first.id)  # Only its own directory now: other jobs start meanwhile.
+        other = await service.submit(spec(hub, snapshot=artifact["snapshot"], inspections=[
+            {"module": "Candidate", "declaration": "Candidate.target", "statement": "Baseline.target"}]))
+        assert (await service.wait(other["id"], 30))["result"]["inspections"][0]["ok"]
+        failures = first.start_failures
+        await until(lambda: first.start_failures > failures)  # Still tried again.
+        assert first.sched.state == "queued" and not live
+        failing.clear()
+        done = await service.wait(first.id, 30)
+        assert done["state"] == "done" and done["result"]["compilation"]["ok"] and done["requeues"] == 0
+        assert not live and service.store.get(first.id)["state"] == "done"
+    finally:
+        await service.close()
+
+
+async def test_a_job_whose_records_cannot_be_written_runs_and_its_records_follow(proof_case):
+    # Neither its start nor its end can be written: it runs and ends all the same, holds nothing
+    # once it has ended, other jobs start, and its records are written once they can be.
+    hub, _, artifact = proof_case
+    service = await started(hub)
+    disk = service.store._db = FullDisk(service.store._db)
+    try:
+        disk.full = True
+        first = await service.submit(spec(hub, snapshot=artifact["snapshot"]))
+        done = await service.wait(first["id"], 30)
+        assert done["state"] == "done" and done["result"]["compilation"]["ok"] and done["result"]["definitive"]
+        assert service.store.get(first["id"])["state"] == "queued"  # As submitted: nothing since was written.
+        assert service.status()["unwritten"] == 1 and service.status()["threads_in_use"] == 0
+        second = await service.submit(spec(hub, snapshot=artifact["snapshot"], inspections=[
+            {"module": "Candidate", "declaration": "Candidate.target", "statement": "Baseline.target"}]))
+        assert (await service.wait(second["id"], 30))["result"]["inspections"][0]["ok"]
+        assert service.status()["unwritten"] == 2
+        disk.full = False
+        await until(lambda: not service._unwritten)
+        rows = [service.store.get(item["id"]) for item in (first, second)]
+        assert [(row["state"], row["outcome"], row["definitive"]) for row in rows] == [("done", "completed", 1)] * 2
+        assert all(row["started_at"] is not None and row["queue_seconds"] is not None for row in rows)
+        again = await service.submit(spec(hub, snapshot=artifact["snapshot"], owner="w2"))
+        assert again["id"] == first["id"] and again["deduplicated"]  # Its definitive result, as stored.
+    finally:
+        await service.close()
+
+
+async def test_a_run_that_fails_for_want_of_disk_space_ends_holding_nothing_and_its_end_is_written_later(
+        proof_case, monkeypatch):
+    # As in the pilot: a running check's processes fail when the disk fills, and its end cannot be
+    # written either.
+    hub, _, artifact = proof_case
+    live, group = counted_groups()
+    monkeypatch.setattr(service_module, "JobGroup", group)
+    runner = GatedSpaceless()
+    entered, release = runner.hold(builds("Candidate"))
+    service = await started(hub, runner)
+    disk = service.store._db = FullDisk(service.store._db)
+    try:
+        submitted = await service.submit(spec(hub, snapshot=artifact["snapshot"]))
+        await asyncio.wait_for(entered.wait(), 30)
+        assert service.store.get(submitted["id"])["state"] == "running"
+        runner.full = disk.full = True
+        release.set()
+        done = await service.wait(submitted["id"], 30)
+        assert done["state"] == "done" and not done["result"]["definitive"]
+        assert "No space left on device" in json.dumps(done["result"])
+        assert service.store.get(submitted["id"])["state"] == "running"  # Its end is not written yet.
+        assert not service.jobs and not live and service.status()["threads_in_use"] == 0
+        assert not (service.state_dir / "scratch" / submitted["id"]).exists()
+        runner.full = disk.full = False
+        await until(lambda: service.store.get(submitted["id"])["state"] == "done")
+        again = await service.submit(spec(hub, snapshot=artifact["snapshot"]))  # Not reused: unavailable.
+        assert again["id"] != submitted["id"]
+        result = await service.wait(again["id"], 30)
+        assert result["result"]["compilation"]["ok"] and result["result"]["definitive"]
+    finally:
+        release.set()
+        await service.close()
+
+
+@pytest.mark.parametrize("ending", [RuntimeError("lost"), asyncio.CancelledError()])
+async def test_a_job_whose_run_ends_without_ending_it_is_queued_again_not_left_running(proof_case, ending):
+    # A safeguard for whatever else ends a run without ending its job: a task cancelled before it
+    # began, say, never runs the run's own handling.
+    hub, _, artifact = proof_case
+    service = await started(hub)
+    run, lost = service._run, []
+
+    async def losing(job, threads):
+        if not lost:
+            lost.append(job.id)
+            raise ending
+        await run(job, threads)
+
+    service._run = losing
+    try:
+        submitted = await service.submit(spec(hub, snapshot=artifact["snapshot"]))
+        done = await service.wait(submitted["id"], 30)
+        assert done["state"] == "done" and done["result"]["compilation"]["ok"] and done["requeues"] == 1
+        assert lost == [submitted["id"]] and service.status()["threads_in_use"] == 0
+    finally:
+        await service.close()
+
+
+async def test_a_job_whose_run_was_cancelled_twice_while_stopping_ends_cancelled(proof_case):
+    # A client's cancel, and its retry, while the run is being stopped: the stop is carried out,
+    # and the job ends instead of staying running with no run.
+    hub, _, artifact = proof_case
+    runner = Gated()
+    entered, _ = runner.hold(builds("Candidate"))
+    service = await started(hub, runner)
+    try:
+        submitted = await service.submit(spec(hub, snapshot=artifact["snapshot"]))
+        await asyncio.wait_for(entered.wait(), 30)
+        job = service.jobs[submitted["id"]]
+        release = job.group.close
+
+        def slow_close():
+            time.sleep(0.3)  # The release takes a while: the second cancel arrives meanwhile.
+            release()
+
+        job.group.close = slow_close
+        first = asyncio.create_task(service.cancel(job.id))
+        await asyncio.sleep(0.1)
+        second = asyncio.create_task(service.cancel(job.id))
+        views = await asyncio.wait_for(asyncio.gather(first, second), 30)
+        assert [view["outcome"] for view in views] == ["cancelled", "cancelled"]
+        assert not service.jobs and service.store.get(job.id)["state"] == "done"
+        assert service.status()["threads_in_use"] == 0
+    finally:
+        await service.close()
+
+
+async def test_ending_a_job_is_carried_out_even_when_its_caller_is_cancelled_meanwhile():
+    steps = []
+
+    async def ending():
+        steps.append("began")
+        await asyncio.sleep(0.2)
+        steps.append("ended")
+
+    async def caller():
+        await service_module.carried_out(ending())
+        steps.append("after")
+
+    task = asyncio.create_task(caller())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert steps == ["began", "ended"]
 
 
 async def test_free_memory_that_cannot_be_measured_is_not_unlimited(proof_case):

@@ -1,7 +1,7 @@
 import asyncio
 import json
 import time
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
 import pytest
@@ -12,6 +12,7 @@ from formal_geyser.coordination.config import initialize
 from formal_geyser.coordination.errors import HubError
 from formal_geyser.coordination.hub import Hub
 from formal_geyser.coordination.models import ProjectConfig
+from formal_geyser.coordination.storage import digest
 from formal_geyser.coordination.transcripts import TranscriptStore
 
 
@@ -277,7 +278,7 @@ async def test_operator_receipt_wakes_previously_driven_continuation(project, du
         WorkerRunner,
     )
 
-    source_id = None
+    request_id = None
     activations = []
     passes = []
     finishing = asyncio.Event()
@@ -285,24 +286,26 @@ async def test_operator_receipt_wakes_previously_driven_continuation(project, du
 
     def harness_factory():
         if not activations:
-            action = ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {
-                "reason": "Wait for the reviewed source.",
-                "predicate": {"requirements": [{
-                    "key": "review", "artifact_id": source_id, "policy": "general.manual@1",
-                }]},
+            actions = [ScriptedAction("taskhub_call", {"operation": "request", "arguments": {
+                "kind": "question", "request_key": "approved-source", "title": "Approve the source",
+                "text": "Is the software source approved?",
+            }}), ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {
+                "reason": "Wait for the operator's approval.",
+                "predicate": {"external_response_id": request_id},
                 "checkpoint": {
                     "summary": "Prepared the software record",
                     "next_action": "Read the operator-approved source and finish",
                 },
-            }})
+            }})]
         else:
-            action = ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {
+            actions = [ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {
+                "predicate": {"external_response_id": "unanswered-request"},
                 "reason": "The operator receipt resumed the original conversation.",
                 "checkpoint": {"summary": "Read the operator-approved source.",
                                "next_action": "Await another explicit request."},
-            }})
+            }})]
         harness = ScriptedHarness([
-            ScriptedTurn([action], usage={"totalTokens": 10 * (len(activations) + 1)})
+            ScriptedTurn(actions, usage={"totalTokens": 10 * (len(activations) + 1)})
         ])
         activations.append(harness)
         return harness
@@ -327,10 +330,6 @@ async def test_operator_receipt_wakes_previously_driven_continuation(project, du
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver",
         ) as client:
-            source = await api_command(client, "artifact.register", {
-                "kind": "software.source", "data": {"reviewed": True},
-            })
-            source_id = source["id"]
             task = await api_command(client, "task.publish", {"contract": {
                 "title": "Finish approved record", "objective": "Use an approved software source",
                 "acceptance_policy": "general.json@1",
@@ -339,6 +338,9 @@ async def test_operator_receipt_wakes_previously_driven_continuation(project, du
                     "required": ["ready"], "additionalProperties": False,
                 }},
             }})
+            # The id the worker's question receives (communications._on_request).
+            request_id = uuid5(NAMESPACE_URL, "external-request:" + digest({
+                "kind": "question", "key": "approved-source", "task_id": task["id"], "task_revision": 1})).hex
             run = await api_command(client, "run.start", {
                 "limits": {},
             })
@@ -349,8 +351,8 @@ async def test_operator_receipt_wakes_previously_driven_continuation(project, du
                 await finish_driver(app, run_id)
             assert (await app.state.hub.task(task["id"]))["state"] == "waiting"
             original_worker = (await app.state.hub.list_workers())[0]["id"]
-            await api_command(client, "artifact.accept", {
-                "artifact_id": source_id, "policy": "general.manual@1", "verdict": "accepted",
+            await api_command(client, "request.resolve", {
+                "request_id": request_id, "text": "The source is approved.", "message_id": "approval",
             })
             if during_finish:
                 assert app.state.driver.pending_wakes == {run_id}

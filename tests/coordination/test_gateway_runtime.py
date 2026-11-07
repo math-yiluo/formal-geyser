@@ -144,14 +144,12 @@ async def test_a_missing_id_error_names_the_id_meant(project, monkeypatch):
                                      f"several tasks have IDs starting with {task['id'][:8]}: copy the full ID")
 
 
-@pytest.mark.parametrize("with_predicate", [False, True])
-async def test_pause_preserves_exact_wait_and_duplicate_receipt_after_drain(project, with_predicate):
+@pytest.mark.parametrize("predicate", [{"external_response_id": "unanswered-request"},
+                                       {"mode": "any", "validations": ["candidate-under-validation"]}])
+async def test_pause_preserves_exact_wait_and_duplicate_receipt_after_drain(project, predicate):
     hub, task, attempt, runner = project
     checkpoint = {"summary": "Saved the inspected metadata.", "next_action": "Wait for actionable input."}
-    arguments = {"reason": "A prerequisite is unavailable.", "checkpoint": checkpoint}
-    if with_predicate:
-        arguments["predicate"] = {"requirements": [{"key": "dependency", "task_id": task["id"],
-            "task_revision": 1, "policy": "general.manual@1"}]}
+    arguments = {"reason": "A prerequisite is unavailable.", "checkpoint": checkpoint, "predicate": predicate}
     result = await call(runner, attempt, "pause", arguments, "pause-once")
     assert result["runtime_directive"] == "drain_for_wait"
     assert await call(runner, attempt, "pause", arguments, "pause-once") == result

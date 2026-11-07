@@ -57,7 +57,7 @@ async def test_runtime_initial_continuation_and_helper_sessions_keep_exact_visib
     initial = ScriptedHarness([ScriptedTurn([ScriptedAction("taskhub_call", {
         "operation": "sync", "arguments": {}})], visible_output="First visible reply\n∀ x.")])
     choice = ScriptedHarness([ScriptedTurn([], visible_output='{"decision":false}')])
-    continuation = ScriptedHarness([ScriptedTurn([ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {
+    continuation = ScriptedHarness([ScriptedTurn([ScriptedAction("taskhub_call", {"operation": "pause", "arguments": {"predicate": {"external_response_id": "unanswered-request"}, 
         "reason": "Keep the finished inspection available.",
         "checkpoint": {"summary": "Read the complete context.", "next_action": "Wait for a concrete request."}}})],
         visible_output="Saved; waiting.")])

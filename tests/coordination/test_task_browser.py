@@ -16,6 +16,8 @@ from tests.coordination.lifecycle_helpers import (
 )
 from tests.coordination.publication_helpers import file_payload, new_hub
 
+from .wait_helpers import legacy_wait
+
 OPERATOR = Actor(role=Role.OPERATOR)
 RUNNER = Actor(role=Role.RUNNER)
 
@@ -50,7 +52,7 @@ async def quiet(hub, attempt):
 
 
 async def pause(hub, attempt):
-    await command(hub, "task.pause", {
+    await legacy_wait(hub, {
         "reason": "Keep this original execution available for later work.",
         "checkpoint": {"summary": "Retained work.", "next_action": "Reconsider the saved task."},
     }, worker(attempt))
@@ -143,7 +145,7 @@ async def test_task_browser_running_and_pool_use_actual_execution_and_admission(
 
     finishing = await publish(hub, "Finishing a work turn")
     draining = await claim(hub, finishing, run)
-    await command(hub, "task.pause", {"reason": "Preserve this task."}, worker(draining))
+    await legacy_wait(hub, {"reason": "Preserve this task."}, worker(draining))
 
     waiting = await publish(hub, "Waiting for a new approach")
     sleeping = await claim(hub, waiting, run)
@@ -200,7 +202,7 @@ async def test_task_browser_running_and_pool_use_actual_execution_and_admission(
 
 
 @pytest.mark.asyncio
-async def test_task_outline_lists_task_zero_first_and_reviews_under_their_task(browser):
+async def test_task_outline_lists_work_tasks_once_and_counts_reviews_on_their_task(browser):
     hub = browser.hub
     root = await publish(hub, "Task 0 of the project")
     other = await publish(hub, "A later task")
@@ -211,10 +213,13 @@ async def test_task_outline_lists_task_zero_first_and_reviews_under_their_task(b
     outline = await read(browser, "/v1/task-outline")
     by_id = {item["id"]: item for item in outline["items"]}
     assert outline["root_task_id"] == root["id"]
-    assert set(by_id) == {root["id"], other["id"], candidate["review_task_id"]}
-    assert by_id[candidate["review_task_id"]]["host_task_id"] == other["id"]
-    assert by_id[other["id"]]["reviews_pending"] == 1
-    assert by_id[root["id"]]["host_task_id"] is None and by_id[root["id"]]["reviews_pending"] == 0
+    assert set(by_id) == {root["id"], other["id"]}  # The review is counted, not listed.
+    assert candidate["review_task_id"] not in by_id and outline["review_count"] == 1
+    assert by_id[other["id"]]["reviews"] == {"total": 1, "open": 1, "accepted": 0, "changes": 0, "ended": 0}
+    assert by_id[root["id"]]["reviews"]["total"] == 0
+    assert by_id[root["id"]]["parent"] is None and by_id[other["id"]]["parent"] is None
+    assert [item["worker_id"] for item in by_id[other["id"]]["executors"]] == [author["worker_id"]]
+    assert by_id[root["id"]]["executors"] == []
 
 
 @pytest.mark.asyncio

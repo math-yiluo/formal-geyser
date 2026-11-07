@@ -27,7 +27,8 @@ dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "hypothesis>=6,<7", "ruff>=0.11,
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-markers = ["real_operator: checks operator requests without the in-process bypass"]
+markers = ["real_operator: checks operator requests without the in-process bypass",
+           "choices_required: requires every role's model and the answer deadline before a run"]
 [tool.ruff]
 target-version = "py313"
 line-length = 100
