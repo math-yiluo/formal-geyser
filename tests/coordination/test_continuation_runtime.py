@@ -163,7 +163,7 @@ async def test_a_sync_keeps_the_baseline_and_a_later_change_still_arrives(projec
             value = "B"
             refreshed = await on_tool("taskhub_call", {"operation": "sync", "arguments": {}}, "explicit-full-sync")
             # A sync returns only what is new: this conversation already has its task and resources.
-            assert set(refreshed["task"]) == {"id", "revision", "title", "state"}
+            assert set(refreshed["task"]) == {"id", "name", "revision", "title", "state"}
             assert "read_only_resources" not in refreshed and "paths" not in refreshed
             assert "wiki" not in refreshed
             assert "native" not in refreshed and "packet_id" not in refreshed

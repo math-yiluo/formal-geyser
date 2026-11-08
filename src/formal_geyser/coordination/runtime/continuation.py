@@ -19,6 +19,7 @@ from uuid import uuid4
 import portalocker
 
 from ..storage import atomic_json, canonical
+from ..task_names import present_task_references
 from .instructions import continuation_guidance
 from .model_view import project_packet, reading_view, render_prompt
 
@@ -106,7 +107,8 @@ class ContinuationPromptStore:
         return record
 
     def prepare(self, packet: dict, *, worker_id: str, thread_id: str,
-                allow_delta: bool = True, snapshot_packet: dict | None = None) -> PreparedPrompt:
+                allow_delta: bool = True, snapshot_packet: dict | None = None,
+                task_names: dict[str, str] | None = None) -> PreparedPrompt:
         task = packet.get("task", {})
         epoch = packet.get("context_epoch")
         if (not isinstance(task, dict) or not isinstance(task.get("id"), str)
@@ -156,7 +158,8 @@ class ContinuationPromptStore:
                     "instruction": (
                         "Continue the review from its recorded phase."
                         if task.get("kind") in {"review"} else "Continue your current task."),
-                    "task": {key: deepcopy(task[key]) for key in ("id", "revision", "title", "kind") if key in task},
+                    "task": {key: deepcopy(task[key]) for key in ("id", "name", "revision", "title", "kind")
+                             if key in task},
                 }
                 if isinstance(guidance, dict):
                     changed = continuation_guidance(guidance, previous["snapshot"].get("instruction_guidance"))
@@ -185,7 +188,8 @@ class ContinuationPromptStore:
                 reason = ("explicit_full" if not allow_delta else "missing_baseline" if previous is None
                           else "unconfirmed_baseline" if previous.get("status") != "confirmed"
                           else "context_binding_changed")
-            text = render_prompt(rendered)
+            # Only the rendered text names tasks (Task N): the baseline and the binding keep ids.
+            text = render_prompt(present_task_references(rendered, task_names) if task_names else rendered)
             # This write must succeed before any transport. A crash/uncertain
             # send cannot leave an older confirmed state eligible for omission.
             atomic_json(path, {"format": _FORMAT, "status": "pending", "token": token,

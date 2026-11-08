@@ -80,7 +80,8 @@ async def test_runtime_initial_continuation_and_helper_sessions_keep_exact_visib
     assert first_packet["paths"]["workspace"] == str(hub.workspace(worker_id))
     # A sync adds only what is new: the Worker N name and the task came with the first input.
     assert initial.results[0] == {
-        "task": {"id": task["id"], "revision": 1, "title": task["contract"]["title"], "state": "claimed"},
+        "task": {"id": task["id"], "name": "Task 0", "revision": 1, "title": task["contract"]["title"],
+                 "state": "claimed"},
         "instruction": NOTHING_NEW}
     # The recruitment decision runs in its own new conversation; its prompt names no worker.
     decision_prompt = json.loads(choice.prompts[0])

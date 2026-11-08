@@ -32,6 +32,17 @@ RECIPE_VERSION = 2  # Bump only when build semantics or cache compatibility chan
 REPLAY_VERSION = 1  # Bump only when what a recorded kernel replay establishes changes.
 OLEAN_PARTS = (".olean", ".olean.server", ".olean.private")
 SLOT_POLL_SECONDS = 0.5  # While another process holds a slot under the limit.
+# Lake prints a line for each module it builds and every message Lean reports, so a fresh build of
+# a large Library prints far past the environment's output bound, which stops the process: the
+# first build of the Linux pilot's 21,144-module Library on the Mac Studio was stopped at 1 MiB
+# after about 2,000 modules, with no error (2026-11-08; about 520 bytes a module). A build's bound
+# grows by this much for each Lean source it may compile, so only runaway output stops it.
+BUILD_OUTPUT_PER_SOURCE = 4096
+
+
+def build_output_limit(output_bytes: int, sources: dict[str, bytes]) -> int:
+    """The output a build of `sources` may print before it is stopped (BUILD_OUTPUT_PER_SOURCE)."""
+    return max(output_bytes, BUILD_OUTPUT_PER_SOURCE * sum(path.endswith(".lean") for path in sources))
 
 
 def _replay_keys(build_directory: Path, sources: dict[str, bytes], modules: Sequence[str],
@@ -431,7 +442,7 @@ async def compilation(tooling, source: Path | dict[str, bytes], modules: Sequenc
             with timed(timings, "build"):
                 result = await tooling.runner.run(argv, cwd=workspace, env=env,
                     timeout=tooling.process_timeout(),
-                    output_limit=tooling.environment.limits.output_bytes)
+                    output_limit=build_output_limit(tooling.environment.limits.output_bytes, sources))
             diagnostics = parse_diagnostics(result)
             has_sorry = uses_sorry(diagnostics)
             report = {"ok": result.ok and not diagnostics["errors"] and not has_sorry, "proof_accepted": False,

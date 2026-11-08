@@ -26,6 +26,7 @@ from ..models import Actor, Command, Role, ValidationReport, file_name_fields
 from ..plugins import load_plugin
 from ..shared_dags import prepare_dag_checker
 from ..storage import canonical, collected
+from ..task_names import present_task_references
 from ..transcript_digest import digest as transcript_digest
 from ..transcript_digest import search as search_history
 from ..transcripts import TranscriptStore
@@ -792,11 +793,19 @@ class WorkerRunner(DecisionHelpers):
             return ToolResult(projected, after_send=value.after_send)
         return projected
 
+    async def _task_names(self) -> dict[str, str]:
+        """Every numbered task's name (Task N), by id; none for a hub without numbers."""
+        names = getattr(self.hub, "task_display_names", None)
+        return await names() if callable(names) else {}
+
     async def _model_result(self, value, attempt):
         """Project only the response; callbacks retain their original backend envelopes."""
         named = await self._present(value)
         projected = await asyncio.to_thread(tool_view, named,
                                             workspace=self.hub.workspace(attempt["worker_id"]))
+        if names := await self._task_names():
+            # After the projection, which builds paths from exact task ids.
+            projected = await asyncio.to_thread(present_task_references, projected, names)
         if isinstance(value, ToolResult):
             return ToolResult(projected, after_send=value.after_send)
         return projected
@@ -850,6 +859,9 @@ class WorkerRunner(DecisionHelpers):
         native_call: dict | None = None,
     ) -> dict[str, Any]:
         actor = self._worker_actor(attempt)
+        resolve_tasks = getattr(self.hub, "resolve_task_refs", None)
+        if callable(resolve_tasks):
+            args = await resolve_tasks(args)  # Task N names a task wherever its id is taken.
         if name in {"taskhub_withdraw", "taskhub_leave_task"}:
             args = await self._ordinary_task_authority(attempt, name, args)
         key = ("native-tool:" + hashlib.sha256(canonical({
@@ -2120,10 +2132,11 @@ class Activation:
                 presented.pop("continuation_instruction", None)  # This turn only repairs the file.
         resumable_work = (worker.get("kind", "ordinary") in {"ordinary", "review", "integrator"}
                           and attempt.get("execution_mode", "work") == "work")
+        task_names = await preflight(runner._task_names())
         if resumable_work:
             built_prompt = await preflight(asyncio.to_thread(
                 runner.continuation_prompts.prepare, presented, worker_id=worker_id,
-                thread_id=session.thread_id,
+                thread_id=session.thread_id, task_names=task_names,
                 snapshot_packet=scenario_entry(presented) if worker.get("kind") == "review" else None,
                 allow_delta=bool(worker.get("thread_id") and not packet.get("runtime_recovery"))),
                 cancellable=False)
@@ -2135,7 +2148,7 @@ class Activation:
             if presented.get("instruction_guidance", {}).get("reason") == "context_compacted":
                 await preflight(asyncio.to_thread(runner.continuation_prompts.invalidate, worker_id,
                                                   reason="context_compacted"), cancellable=False)
-            prompt = render_prompt(project_packet(presented))
+            prompt = render_prompt(present_task_references(project_packet(presented), task_names))
         prepared_prompt = self.prepared_prompt
         self.input_id = runner.transcripts.prepare_input(worker_id, session.thread_id, "taskhub", prompt,
             attempt_id=attempt["id"], kind="message" if attempt.get("execution_mode") in {"message", "message_only"}

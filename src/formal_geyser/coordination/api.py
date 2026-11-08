@@ -590,18 +590,20 @@ def create_app(
 
     @app.get("/v1/tasks/{task_id}/relations", dependencies=[Depends(operator)])
     async def task_relations(task_id: str):
-        return await app.state.hub.task_relations(task_id)
+        return await app.state.hub.task_relations(await app.state.hub.resolve_task_ref(task_id))
 
     @app.get("/v1/tasks/{task_id}/revisions", dependencies=[Depends(operator)])
     async def task_revisions(
         task_id: str, offset: int = Query(default=0, ge=0), limit: int = Query(default=20, ge=1, le=100),
     ):
-        return await app.state.hub.task_revision_page(task_id, offset=offset, limit=limit)
+        return await app.state.hub.task_revision_page(await app.state.hub.resolve_task_ref(task_id),
+                                                      offset=offset, limit=limit)
 
     @app.get("/v1/tasks/{task_id}", dependencies=[Depends(operator)])
     async def task(task_id: str, revision: int | None = Query(default=None, ge=1)):
         from .task_browser import task_detail
-        return await task_detail(app.state.hub, task_id, revision=revision)
+        # Task N (or N) names a work task here as well as its id.
+        return await task_detail(app.state.hub, await app.state.hub.resolve_task_ref(task_id), revision=revision)
 
     @app.get("/v1/workers", dependencies=[Depends(operator)])
     async def workers():

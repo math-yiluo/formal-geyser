@@ -162,7 +162,7 @@ async def test_message_entry_keeps_exact_saved_wait_and_explicit_resume_changes(
             sync = await on_tool("taskhub_call", {"operation": "sync", "arguments": {}}, "full-sync")
             # A sync adds only what is new. This turn's input already holds the task, the message
             # state, the message and the notifications, and the resume reported its own effect.
-            assert sync["task"] == {key: packet["task"][key] for key in ("id", "revision", "title", "state")}
+            assert sync["task"] == {key: packet["task"][key] for key in ("id", "name", "revision", "title", "state")}
             assert sync["task"]["id"] == project.task["id"]
             assert sync["instruction"] == NOTHING_NEW
             assert not {"message_state", "messages", "notifications", "checkpoint", "paths", "reading"} & sync.keys()

@@ -10,6 +10,7 @@ import json
 from typing import Any
 
 from .errors import HubError
+from .task_names import TASK_ALIAS, task_name
 from .worker_names import worker_identity
 
 VIEWS = frozenset({"all", "running", "pool", "history"})
@@ -18,7 +19,7 @@ SORTS = frozenset({"newest", "oldest", "title"})
 NO_REVIEWS = {"total": 0, "open": 0, "accepted": 0, "changes": 0, "ended": 0}
 TERMINAL = frozenset({"done", "retired"})
 _TASK_ROWS = """
-SELECT t.id,t.current_revision,t.state,t.state_version,t.created_at,
+SELECT t.id,t.current_revision,t.state,t.state_version,t.created_at,t.task_number,
        r.task_id,r.revision,r.contract_hash,r.contract_json
 FROM tasks t JOIN task_revisions r ON r.task_id=t.id AND r.revision=t.current_revision
 """
@@ -161,7 +162,9 @@ def _summaries(c, rows, *, running: set[str], opportunities: dict | None = None)
             value["acceptance"] = review["state"] == "integrating"
             collaboration["review"] = value
         opportunity = (opportunities or {}).get(task_id)
-        result = {key: row[key] for key in ("id", "state", "revision", "current_revision", "created_at", "state_version")}
+        result = {key: row[key] for key in ("id", "task_number", "state", "revision", "current_revision", "created_at",
+                                            "state_version")}
+        result["name"] = task_name(row["task_number"])
         # The operator's place for it in admission, if any (task.set_priority, task.set_pinned).
         place, contract_priority = placed.get(task_id), contract.get("priority", 1)
         operator_priority = place["priority"] if place else None
@@ -216,7 +219,7 @@ async def task_page(hub, *, view: str = "all", query: str = "", offset: int = 0,
         counts = {"all": count(), "running": count(listed, (json.dumps(sorted(running)),)),
                   "pool": count(listed, (json.dumps(sorted(pool)),)), "history": count("t.state IN ('done','retired')")}
         conditions: list[str] = [kinds]
-        values: list[str | int] = []
+        values: list[str | int | None] = []
         if view in {"running", "pool"}:
             ids = running if view == "running" else set(pool)
             # JSON avoids SQLite's placeholder limit for large project pools.
@@ -224,11 +227,16 @@ async def task_page(hub, *, view: str = "all", query: str = "", offset: int = 0,
             values.append(json.dumps(sorted(ids)))
         elif view == "history":
             conditions.append("t.state IN ('done','retired')")
-        if query:
-            conditions.append("instr(lower(t.id || ' ' || t.state || ' ' || "
+        alias = TASK_ALIAS.fullmatch(query)
+        if alias and not query[0].isdigit():
+            conditions.append("t.task_number=?")  # "Task 12" is that task.
+            values.append(int(alias[1]))
+        elif query:
+            # Text, and "12" finds Task 12 as well.
+            conditions.append("(instr(lower(t.id || ' ' || t.state || ' ' || "
                               "json_extract(r.contract_json,'$.title') || ' ' || "
-                              "json_extract(r.contract_json,'$.kind')),lower(?))>0")
-            values.append(query)
+                              "json_extract(r.contract_json,'$.kind')),lower(?))>0 OR t.task_number=?)")
+            values.extend([query, int(alias[1]) if alias else None])
         where, newer = " WHERE " + " AND ".join(conditions), 0
         if until is not None:
             newer = c.execute("SELECT COUNT(*) FROM (" + _TASK_ROWS + where + " AND t.created_at>?)",

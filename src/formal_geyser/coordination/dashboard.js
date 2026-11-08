@@ -230,12 +230,14 @@ class TaskBrowserStore {
     this.selectedTask = null;
     this.details = new Map();
     this.titles = new Map();
+    this.numbers = new Map();  // A work task's number: it is shown as Task N.
   }
 
   rememberTasks(items) {
     for (const item of items || []) {
       const title = item.contract?.title || item.title;
       if (title) this.titles.set(item.id, title);
+      if (Number.isInteger(item.task_number)) this.numbers.set(item.id, item.task_number);
     }
   }
 
@@ -342,7 +344,7 @@ class TaskBrowserStore {
         if (!this.open || id !== this.selectedTask || detail.relationsLoad !== operation) return;
         detail.relations = result; detail.relationsError = ''; detail.relationsAt = now;
         const tasks = Object.values(result.tasks || {}).concat(result.children?.items || []);
-        this.rememberTasks(tasks.map(task => ({id: task.id, title: task.title})));
+        this.rememberTasks(tasks.map(task => ({id: task.id, title: task.title, task_number: task.task_number})));
       } catch (error) {
         if (this.open && id === this.selectedTask && detail.relationsLoad === operation) detail.relationsError = error.message;
         throw error;
@@ -2220,6 +2222,11 @@ if (typeof document !== 'undefined') {
   const OUTLINE_CHILDREN = 150;
   function plural(count, word, many = word + 's') { return count.toLocaleString() + ' ' + (count === 1 ? word : many); }
   function shortId(id) { return String(id).slice(0, 8); }
+  // A work task by its name, Task N; a review, or a task not yet seen, by its short id.
+  function taskName(id) {
+    const number = taskStore.numbers.get(id);
+    return Number.isInteger(number) ? 'Task ' + number : shortId(id);
+  }
   function chip(text, tone = '') { return node('span', text, 'chip' + (tone ? ' ' + tone : '')); }
   function stateChip(task) {
     if (task.contract?.kind === 'review') {
@@ -2312,7 +2319,7 @@ if (typeof document !== 'undefined') {
     marks.append(stateChip(task));
     if (task.id === outline.root_task_id) marks.prepend(chip('Task 0', 'active'));
     if (task.relation === 'repair') marks.append(chip('Repair', 'bad'));
-    const meta = [];
+    const meta = task.id === outline.root_task_id ? [] : [taskName(task.id)];  // Task 0 has its chip.
     const executors = taskExecutors(task);
     if (executors.length) meta.push(executorText(executors));
     if (children.length) meta.push(below.done + '/' + below.total + ' below done');
@@ -2393,7 +2400,8 @@ if (typeof document !== 'undefined') {
       try {
         graphView.data = await api('/v1/task-graph?include_met=' + graphView.includeMet);
         graphView.error = ''; graphView.loadedAt = Date.now();
-        taskStore.rememberTasks(graphView.data.tasks.map(task => ({id: task.id, title: task.title})));
+        taskStore.rememberTasks(graphView.data.tasks.map(task => ({id: task.id, title: task.title,
+                                                                    task_number: task.task_number})));
       } catch (error) { graphView.error = error.message; }
       finally { graphView.load = null; renderGraph(); }
     })();
@@ -2503,7 +2511,7 @@ if (typeof document !== 'undefined') {
           const task = graphTask(id) || {id, title: taskTitle(id), state: 'ready', executors: []};
           const state = taskOutlineState(task);
           const first = node('span', undefined, 'line');
-          first.append(state.text + ' · ' + shortId(id) + (onYou.has(id) ? ' · waits on you' : ''));
+          first.append(state.text + ' · ' + taskName(id) + (onYou.has(id) ? ' · waits on you' : ''));
           const waiting = (value.notes || []).filter(note => note.task === id && !note.met).map(note => noteSentence(note, agents));
           const third = waiting.length ? waiting.join('; ') : task.executors.length ? executorText(task.executors) : 'No executors';
           button.append(first, node('span', task.title || 'Untitled task', 'line title'), node('span', third, 'line muted'));
@@ -2608,7 +2616,7 @@ if (typeof document !== 'undefined') {
       const title = node('td'), state = node('td'), members = node('td'), reviews = node('td'), published = node('td');
       const open = taskButton(task.id, contract.title || 'Untitled task');
       open.setAttribute('aria-current', String(task.id === taskStore.selectedTask));
-      const meta = [shortId(task.id)];
+      const meta = [taskName(task.id)];
       if (review) meta.push('review');
       if (task.revision > 1) meta.push('revision ' + task.revision);
       const place = admissionLabel(task);
@@ -2847,7 +2855,7 @@ if (typeof document !== 'undefined') {
       detail.dataset.task = id;
       detail.replaceChildren();
       const contract = record?.contract, review = (contract || task?.contract)?.kind === 'review';
-      detail.append(node('div', (review ? 'Review' : 'Work task') + ' · ' + shortId(id)
+      detail.append(node('div', (review ? 'Review' : 'Work task') + ' · ' + taskName(id)
         + (pinned ? ' · contract frozen at revision ' + view.selectedRevision : ''), 'eyebrow'));
       detail.append(node('h3', contract?.title || taskTitle(id)));
       if (task) {

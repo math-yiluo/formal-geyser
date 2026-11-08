@@ -21,7 +21,7 @@ from formal_geyser.coordination.models import (
     RepositoryConfig,
     Role,
 )
-from formal_geyser.coordination.storage import BlobStore, atomic_json
+from formal_geyser.coordination.storage import BlobStore, atomic_json, digest
 from formal_geyser.registry import (
     EnvironmentUnavailable,
     ObjectRegistry,
@@ -229,7 +229,12 @@ async def test_registration_asks_the_compiler_and_the_seed_check_runs_in_the_lea
             assert json.loads((hub.state_dir / "initialization-check.json").read_text(encoding="utf-8"))["ok"] is False
         else:
             checked = await bootstrap._check_seed(hub, snapshot, environment_id)
-            assert checked["ok"] and checked["checked_modules"] == ["Example.Base"]
+            # The receipt, which every admission reads, only counts the modules; the report beside it
+            # names them all, however large the Library.
+            assert checked["ok"] and "checked_modules" not in checked and checked["checked_module_count"] == 1
+            assert checked["checked_modules_sha256"] == digest(["Example.Base"])
+            report = json.loads((hub.state_dir / "initialization-check.json").read_text(encoding="utf-8"))
+            assert report["ok"] and [item["module"] for item in report["modules"]] == ["Example.Base"]
             assert lean_service.runner.replays == [["Example.Base"]]  # An official check: replayed.
         [spec] = lean_service.specs
         assert (spec.lane, spec.owner, spec.label) == ("official", "operator", "Initial Library")

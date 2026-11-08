@@ -87,7 +87,10 @@ replace it with edits made since capture. Use a new instance for a different
 initial baseline. Existing managed repositories are preserved.
 
 Only a complete `.task-based/initialization.json` and matching cache/environment
-receipts allow Lean run admission. The backend gates run start/resume, worker
+receipts allow Lean run admission. The receipt stays small, since every admission reads
+it: the seed check records how many modules it compiled and their digest, and writes its
+full report, every module named, to `.task-based/initialization-check.json`, whether the
+check passed or not. The backend gates run start/resume, worker
 claims, and native worker/helper launches. Removing the cache, changing its pins,
 or withdrawing its environment blocks new execution. Routine admission performs
 small identity/presence checks; compilation and publication retain the existing

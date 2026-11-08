@@ -196,16 +196,20 @@ async def _check_seed(hub, snapshot: str, environment_id: str) -> dict:
     entries = validate_snapshot_sources(hub.blobs, snapshot)
     modules = snapshot_module_order(hub.blobs, entries)
     if not modules:
-        return {"ok": True, "checked_modules": [], "proof_accepted": False}
+        return {"ok": True, "checked_module_count": 0, "proof_accepted": False}
     environment, _ = await ObjectRegistry(hub).get(environment_id, "environment", approved=True)
     checked = await lean_service.check(hub.root, environment, hub.blobs, snapshot=snapshot, modules=modules,
                                        lane="official", owner="operator", label="Initial Library")
     result = checked["compilation"] if checked["doctor"]["ok"] else {"ok": False, "doctor": checked["doctor"]}
+    # The full report, with every module, goes beside the receipt, which must stay small: each
+    # admission reads at most 1 MiB of it (require_ready), and the module names of a large Library
+    # pass that alone (21,144 modules, about 1.6 MB, on the Mac Studio, 2026-11-08).
+    atomic_json(hub.state_dir / "initialization-check.json", result)
     if not result["ok"]:
-        atomic_json(hub.state_dir / "initialization-check.json", result)
         raise ValueError("Initial Library does not compile with the pinned environment; "
                          "see .task-based/initialization-check.json")
-    return {"ok": True, "checked_modules": modules, "proof_accepted": False,
+    return {"ok": True, "checked_module_count": len(modules), "checked_modules_sha256": digest(modules),
+            "report": "initialization-check.json", "proof_accepted": False,
             "scope": "Compilation of operator-supplied baseline; no synthetic mathematical acceptance"}
 
 

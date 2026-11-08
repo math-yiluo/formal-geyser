@@ -979,6 +979,7 @@ async def test_oversized_tool_result_is_immutable_retrievable_and_keeps_routing(
     from formal_geyser.coordination.runtime import WorkerRunner
     from formal_geyser.coordination.runtime.model_view import tool_view
     from formal_geyser.coordination.storage import canonical
+    from formal_geyser.coordination.task_names import present_task_references
 
     packet_bytes = 512
     hub, command, run = await _runtime_project(tmp_path, packet_bytes=packet_bytes,
@@ -1001,7 +1002,9 @@ async def test_oversized_tool_result_is_immutable_retrievable_and_keeps_routing(
         report = ("Record detail: " + chr(0x1F680) + chr(0) + '"\\') * 400
         artifact = await runner._command("artifact.stage", file_payload(
             hub, attempt, kind="record", data={"text": report}), actor=runner._worker_actor(attempt))
-        expected = tool_view(await runner._present(await hub.artifact(artifact["id"])))
+        # What the model is shown: names for workers and tasks (Task N), as _model_result does.
+        expected = present_task_references(tool_view(await runner._present(await hub.artifact(artifact["id"]))),
+                                           await runner._task_names())
         assert expected["data"]["text"] == report
         response = await runner._tool(attempt, "thread", "taskhub_call", {"operation": 'fetch', "arguments": file_arguments(runner.hub.workspace(attempt["worker_id"]), 'fetch', {
             "artifact_id": artifact["id"],

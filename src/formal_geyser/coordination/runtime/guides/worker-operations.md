@@ -96,6 +96,10 @@ notes. Literature procedures and submission formats are read when needed.
 
 ## Task lifecycle
 
+A work task is named `Task N` (Task 0 is the project's root). Every `task_id` you give takes
+`Task N` or the id; a task object shows its exact `id` (for paths such as `drafts/<task-id>/`)
+beside its `name`.
+
 You may belong to several unfinished tasks but execute at most one. An ordinary
 task permits one initial executor and one recruited collaborator. After the
 first turn a separate decision opens the collaborator place or not; do not open it yourself.

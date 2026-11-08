@@ -60,6 +60,13 @@ from .session_settings import (
 from .shared_dags import SharedDags
 from .storage import BlobStore, Database, canonical, collected_thread_call, digest
 from .talk import PeerTalk
+from .task_names import (
+    INTERNAL_KINDS,
+    TaskNames,
+    allocate_task_number,
+    initialize_task_names,
+    task_name,
+)
 from .wait_graph import path_between, wait_edges
 from .waker import WAKER_PREFERENCES_SCHEMA, Waker
 from .worker_names import (
@@ -160,7 +167,7 @@ RUN_STOP_REASONS = {"run.pause": "operator_pause", "run.pause_after_turn": "oper
                     "run.stop": "operator_stop"}
 
 
-class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIntegration, FaultIsolation, WorkerNames, SharedDags, NativeWorkflow, Communications, PeerTalk, RepositoryCoordination, Rotation, ClaudeProfiles, CodexProfiles, SessionSettings, Waker, Lifecycle):
+class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIntegration, FaultIsolation, WorkerNames, TaskNames, SharedDags, NativeWorkflow, Communications, PeerTalk, RepositoryCoordination, Rotation, ClaudeProfiles, CodexProfiles, SessionSettings, Waker, Lifecycle):
     def __init__(
         self, root: Path, config: ProjectConfig | None = None,
         clock: Callable[[], int] | None = None,
@@ -204,6 +211,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIn
     def _recover_startup(self, c):
         """Quarantine unfinished local execution until its owned processes are confirmed quiet."""
         initialize_agent_names(c)  # Manages its own transaction.
+        initialize_task_names(c)  # So does this; it numbers work tasks that have no number.
         c.execute("BEGIN IMMEDIATE")
         try:
             self._restore_dispatch_hold(c)
@@ -323,7 +331,8 @@ class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIn
         ).fetchone()
         if row is None:
             raise HubError("NOT_FOUND", "Task revision does not exist", 404)
-        result.update(revision=revision, contract=self._task_contract(c, row), contract_hash=row["contract_hash"])
+        result.update(revision=revision, contract=self._task_contract(c, row), contract_hash=row["contract_hash"],
+                      name=task_name(result.get("task_number")))
         result["files"] = self._task_file_reference(c, key, revision)
         drafts = self._draft_reference(c, key)
         if drafts is not None:
@@ -1264,7 +1273,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIn
             raise HubError("CONFLICT", "A uniqueness or relationship constraint prevented this operation") from exc
 
     def _dispatch(self, c, name, p, actor):
-        p = dict(p)
+        p = self._resolve_task_refs(c, p)  # Task N names a task wherever its id is taken.
         self._require_current_mutation(c, name, p, actor)
         if actor.role == Role.WORKER and actor.attempt_id:
             attempt = self._get(c, "attempts", actor.attempt_id)
@@ -1685,7 +1694,12 @@ class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIn
             if c.execute("SELECT 1 FROM tasks WHERE id=?", (p["task_id"],)).fetchone():
                 raise HubError("TASK_EXISTS", "A task with this id already exists", 409)
             tid = p["task_id"]
-        c.execute("INSERT INTO tasks(id,current_revision,state,created_at) VALUES(?,1,'ready',?)", (tid, self.clock()))
+        if p.get("task_number") is not None and actor.role != Role.OPERATOR:
+            raise HubError("FORBIDDEN", "Only the operator chooses a new task's number", 403)
+        number = (None if contract.kind in INTERNAL_KINDS
+                  else allocate_task_number(c, p.get("task_number")))  # core_transfer keeps its own.
+        c.execute("INSERT INTO tasks(id,current_revision,state,created_at,task_number) VALUES(?,1,'ready',?,?)",
+                  (tid, self.clock(), number))
         c.execute("INSERT INTO task_revisions VALUES(?,1,?,?)", (tid, body, sha))
         origin = self._active(c, actor) if actor.role == Role.WORKER else None
         c.execute("INSERT INTO task_origins VALUES(?,?,?,?,?)", (
@@ -3017,7 +3031,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIn
                 "packet_id": uid(), "worker_id": worker_id, "context_epoch": worker["context_epoch"],
                 "worker_number": worker["worker_number"], "display_name": worker["display_name"],
                 "reviewer_number": worker["reviewer_number"], "worker_kind": worker["kind"],
-                "task": {"id": task["id"], "revision": task["revision"],
+                "task": {"id": task["id"], "revision": task["revision"], "name": task["name"],
                          "contract_hash": task["contract_hash"], "state": task["state"],
                          "title": contract["title"], "objective": contract["objective"],
                          "domain": contract["domain"], "kind": contract["kind"],

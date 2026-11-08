@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 
 from formal_geyser.coordination.storage import BlobStore
-from formal_geyser.lake_build import _output_times, _sources, _synchronize, _workspace
+from formal_geyser.lake_build import (
+    BUILD_OUTPUT_PER_SOURCE,
+    _output_times,
+    _sources,
+    _synchronize,
+    _workspace,
+    build_output_limit,
+)
 from formal_geyser.process import ProcessResult, ProcessRunner
 from formal_geyser.registry import EnvironmentUnavailable, file_sha256
 from formal_geyser.schemas import EnvironmentRecord
@@ -242,6 +249,29 @@ async def test_one_lake_process_inherits_explicit_limits_and_detects_source_edit
     assert len(runner.calls) == 1
     assert not result["ok"] and "frozen source" in result["reason"]
     assert not (Path(result["workspace"]) / "outputs.json").exists()
+
+
+async def test_a_build_may_print_more_the_more_sources_it_may_compile(proof_case, tmp_path):
+    hub, _, _ = proof_case
+    environment = EnvironmentRecord.model_validate(hub.artifacts["environment-1"]["data"])
+    environment.limits.output_bytes = 1024
+    root = tmp_path / "input"
+    for index in range(3):
+        source(root, f"M{index}.lean", f"def m{index} : Nat := {index}\n")
+        source(root, f"M{index}.md", "Prose is not compiled.\n")
+    bounds = []
+
+    class Counting(FakeRunner):
+        async def run(self, argv, **kwargs):
+            if "build" in argv:
+                bounds.append(kwargs["output_limit"])
+            return await super().run(argv, **kwargs)
+
+    assert (await LeanTooling(environment, hub.blobs, Counting()).compile(root, ["M0"]))["ok"]
+    # A fresh build prints a line and Lean's messages for each module: stopping it at the
+    # environment's bound would refuse a large Library that compiles.
+    assert bounds == [3 * BUILD_OUTPUT_PER_SOURCE]
+    assert build_output_limit(1048576, {"A.lean": b"", "A.md": b""}) == 1048576
 
 
 def test_source_walk_skips_hidden_and_linked_directories_and_refuses_linked_files(tmp_path):

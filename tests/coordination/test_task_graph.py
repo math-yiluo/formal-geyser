@@ -92,7 +92,8 @@ async def test_a_task_hangs_under_the_task_whose_attempt_published_it(browser):
     above = await read(browser, f"/v1/tasks/{root['id']}/relations")
     assert above["parent"] is None and above["publisher"] is None
     assert above["children"] == {"total": 1, "items": [
-        {"id": child["id"], "title": "Published from Task 0", "state": "ready", "relation": "published"}]}
+        {"id": child["id"], "task_number": 1, "title": "Published from Task 0", "state": "ready",
+         "relation": "published"}]}
     assert above["reviews"]["counts"]["open"] == 1
     assert [item["id"] for item in above["reviews"]["items"]] == [candidate["review_task_id"]]
     review = await read(browser, f"/v1/tasks/{candidate['review_task_id']}/relations")

@@ -113,7 +113,7 @@ async def test_sync_returns_only_what_is_new(project):
     _, harness = await activate(hub, run, ScriptedTurn([sync]))
     result = harness.results[0]
     assert set(result) <= {"task", "notifications", "messages", "next_action", "workspace_refresh", "instruction"}
-    assert set(result["task"]) == {"id", "revision", "title", "state"}
+    assert set(result["task"]) == {"id", "name", "revision", "title", "state"}
     assert "objective" not in json.dumps(result) and "paths" not in result and "reading" not in result
 
 

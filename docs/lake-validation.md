@@ -37,6 +37,12 @@ whose identity differs is hashed and must match the receipt; otherwise the slot'
 outputs are discarded and the build starts clean. Integration builds the complete
 final tree once.
 
+Diagnostics are read from Lake's output, so a build stopped at its output bound has not
+completed and leaves no receipt. The bound grows with the build: the environment's
+`output_bytes`, or 4 KiB for each Lean source the build may compile if that is more
+(`BUILD_OUTPUT_PER_SOURCE`). A fresh build of the Linux pilot's 21,144-module Library
+printed about 520 bytes a module and was stopped at 1 MiB before this.
+
 ## Retention
 
 Maintenance runs lazily at most once per minute, after acquiring the caller's

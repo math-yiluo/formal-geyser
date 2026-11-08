@@ -30,7 +30,7 @@ trees; use Git branches. Package and dependency versions stay as locked.
 
 | Term | Meaning |
 | --- | --- |
-| Task | A unit of work with objective, constraints, inputs, requirements, and acceptance conditions. Versioned by revisions. Separate from any conversation. |
+| Task | A unit of work with objective, constraints, inputs, requirements, and acceptance conditions. Versioned by revisions. Separate from any conversation. A work task is named `Task N` (Task 0, Task 1, …, in publication order); reviews and the Integrator's tasks are named by the task they serve. |
 | Task 0 | The root task that preserves the user's original request. Its completion stops autonomous work. |
 | Worker | A persistent execution identity (`Worker 0`, `Worker 1`, …) with one workspace, at most one current task, and one current native conversation (a new one for each new task and after each rotation). |
 | Reviewer | A disposable execution identity (`Reviewer 1`, …) that executes exactly one review task. Never reused. |
@@ -100,6 +100,19 @@ trees; use Git branches. Package and dependency versions stay as locked.
 
 - **Publishing.** Workers may publish tasks freely. The publisher identity is
   immutable provenance, not an office.
+- **Task numbers** (`task_names.py`). The transaction that publishes a work task gives it the
+  next number, never reused or changed: Task 0 is the root. The id stays every record's
+  identity (evidence, receipts, bindings, paths, the Library's history). Every command and read
+  that takes a task id also takes `Task N` or `N`: top-level task fields, a pause's
+  subscriptions, and a contract's requirements, resolved before the handler runs. A worker
+  reads `Task N` in each reference to a task (`task_id`, `source_task_id`, a notification's
+  `reference`, …); a task object keeps its exact `id`, from which a worker builds paths such
+  as `drafts/<task-id>/`, and says its `name` beside it. Names are applied to the final view
+  only: projections, continuation baselines, decisions' packets and paths keep ids. The task
+  list finds `Task N` exactly, and a bare number as text and as that task. The first start
+  after this change numbers every existing work task, the root first and then by publication;
+  core transfer keeps each carried task's number, and the new instance numbers on from the
+  old one's next.
 - **Maintenance rights.** Original publishing parties and current executor members
   may revise a task from the start, as equals. Every revision records author, reason,
   and prior/new version and requires the expected current version (no lost updates).
@@ -697,7 +710,14 @@ trees; use Git branches. Package and dependency versions stay as locked.
   `bootstrap_pins.py`), keeps dependency sources and compiled outputs in the
   instance's `.dependencies/` (shared by all its workers, never per worker), verifies
   a full Mathlib import, and compiles imported source before admitting any worker.
-  Imported seed source is a baseline, not synthetic acceptance.
+  Imported seed source is a baseline, not synthetic acceptance. The readiness receipt,
+  which every admission reads (at most 1 MiB), counts the checked modules and keeps their
+  digest; the full check report, every module named, is `initialization-check.json`.
+- **Build output.** Lake prints a line for each module it builds and every message Lean
+  reports, and diagnostics are read from that output, so a build stopped at its output
+  bound has not completed. The bound is the environment's `output_bytes` or 4 KiB for each
+  Lean source the build may compile, whichever is larger: a fresh build of a large Library
+  completes, and only runaway output stops a build.
 - **Inspection transport.** Large expression JSON uses a bounded private file;
   declaration and proposition fingerprints still hash the exact original UTF-8
   representations. Diagnostic pipe limits and exact target checks remain
@@ -1082,7 +1102,9 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
     reviews), its objective rendered from Markdown as text, its evidence, admission, and its
     revisions and records.
 - **Core transfer** (`taskctl export-core`, `taskctl import-core`).
-  An instance moves to a new machine as its core only: the current published Library,
+  An instance moves to a new machine as its core only: the Library at its last recorded
+  publication (read from the instance's Git repository, since the `library/` view on disk is
+  refreshed only when read and can lag),
   every unfinished work task with its shared draft, the shared DAGs, registered literature,
   and the operator's priorities and pins. No worker, conversation, workspace, candidate,
   review, evidence, build output or history comes along. Export reads one snapshot of the

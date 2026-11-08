@@ -1,4 +1,5 @@
 """Real Git archive transitions with synthetic storage-validation receipts only."""
+import json
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 from formal_geyser.coordination.config import initialize
+from formal_geyser.coordination.core_transfer import export_core
 from formal_geyser.coordination.hub import Hub
 from formal_geyser.coordination.models import (
     Actor,
@@ -124,3 +126,21 @@ async def remove_current_pair(case):
     candidate = await quiet(hub, author)
     await original_validation(SimpleNamespace(hub=hub, candidate=candidate))
     await approve(hub, await select_review(hub, candidate["review_task_id"], case.run["id"]))
+
+
+async def test_the_core_export_takes_the_last_publication_however_far_the_library_view_lags(
+        archive_case, tmp_path_factory):
+    case = archive_case
+    bundle = tmp_path_factory.mktemp("export") / "bundle"  # Outside the project, which is tmp_path.
+    initial = (await case.hub.public_content()).commit  # The view on disk names the initial commit.
+    await approve(case.hub, case.reviewer)  # A publication; nothing reads the view, so it stays behind.
+    published = await case.hub.db.read(lambda c: c.execute(
+        "SELECT commit_sha FROM repository_publications").fetchone()[0])
+    view = json.loads((case.root / "library" / "current.json").read_text(encoding="utf-8"))["commit"]
+    assert view == initial != published
+    summary = export_core(case.root, bundle)  # While the hub serves: one ledger snapshot.
+    assert (summary["library_commit"], summary["library_view_commit"]) == (published, initial)
+    library = json.loads((bundle / "library.json").read_text(encoding="utf-8"))
+    assert library["commit"] == published
+    assert {item["path"] for item in library["files"]} >= {"Fixture.lean", "Fixture.md"}
+    assert (bundle / "library" / "Fixture.lean").read_bytes() == case.submitted

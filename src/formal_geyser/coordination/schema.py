@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS helper_usage_holds(
 CREATE TABLE IF NOT EXISTS tasks(
  id TEXT PRIMARY KEY,current_revision INTEGER NOT NULL,state TEXT NOT NULL,
  state_version INTEGER NOT NULL DEFAULT 1,fencing_counter INTEGER NOT NULL DEFAULT 0,
- active_attempt TEXT,created_at INTEGER NOT NULL);
+ active_attempt TEXT,created_at INTEGER NOT NULL,
+ task_number INTEGER CHECK(task_number>=0));  -- task_names.py; a work task's Task N.
 CREATE TABLE IF NOT EXISTS task_revisions(
  task_id TEXT NOT NULL REFERENCES tasks(id),revision INTEGER NOT NULL,
  contract_json TEXT NOT NULL,contract_hash TEXT NOT NULL,

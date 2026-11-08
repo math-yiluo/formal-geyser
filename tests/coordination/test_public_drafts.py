@@ -24,6 +24,12 @@ from .test_gateway_runtime import call
 from .test_gateway_runtime import project as project
 
 
+def exact(result, task):
+    """A draft result as its records hold it: the worker reads its task as Task N (task_names)."""
+    assert result["task_id"] == "Task 0"
+    return {**result, "task_id": task["id"]}
+
+
 def draft_arguments(hub, task, attempt):
     source = hub.workspace(attempt["worker_id"]) / ".private/drafts/current"
     source.mkdir(parents=True, exist_ok=True)
@@ -44,11 +50,11 @@ async def test_unimplemented_public_pair_is_readable_without_artifact_or_task_re
     assert "MissingBase" in (root / "Higher.lean").read_text(encoding="utf-8")
     assert result["status"] == "unreviewed" and result["revision"] == 1
     current = json.loads(Path(result["current_path"]).read_text(encoding="utf-8"))
-    assert current == result
+    assert current == exact(result, task)
     manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
     assert manifest["author"] == "Worker 0" and manifest["task_revision"] == 1
     updated = await hub.task(task["id"])
-    assert updated["drafts"] == result
+    assert updated["drafts"] == exact(result, task)
     assert updated["revision"] == task["revision"] and updated["contract_hash"] == task["contract_hash"]
     assert updated["artifacts"] == [] and len(await hub.list_tasks()) == 1
     assert (await hub.worker(attempt["worker_id"]))["active_attempt"] == attempt["id"]
@@ -56,7 +62,7 @@ async def test_unimplemented_public_pair_is_readable_without_artifact_or_task_re
     assert not any("drafts" in item["path"] for item in hub.blobs.get_json(snapshot)["files"])
     native = await hub.prepare_native_context(attempt["worker_id"])
     assert native["directories"]["drafts"] == str(hub.root / "drafts")
-    assert native["task_drafts"] == result
+    assert native["task_drafts"] == exact(result, task)
     relative = (root / "Higher.lean").relative_to(hub.root / "drafts").as_posix()
     read = await call(runner, attempt, "resource_read", {"root": "drafts", "path": relative}, "read")
     assert "MissingBase" in read["text"]
@@ -72,7 +78,7 @@ async def test_unimplemented_public_pair_is_readable_without_artifact_or_task_re
     decided = await WorkerRunner(hub, lambda: decision).run_helper(intent)
     assert decided["directive"] == "recruitment_decided"
     assert len(decision.results) == 2 and all(set(item) == {"error"} for item in decision.results)
-    assert (await hub.task(task["id"]))["drafts"] == result
+    assert (await hub.task(task["id"]))["drafts"] == exact(result, task)
     for mode in ("message_only", "ordinary"):
         packet = {"execution_mode": mode, "task": {"id": task["id"]}, "native": native,
                   "review": {"candidate_id": "example"} if mode == "ordinary" else None}
@@ -89,7 +95,7 @@ async def test_exact_retry_survives_changed_source_and_does_not_rewind_latest_re
     second = await call(runner, attempt, "draft_update", {**arguments, "expected_revision": 1}, "second")
     (source / "Higher.lean").unlink()
     assert await call(runner, attempt, "draft_update", arguments, "first") == first
-    assert json.loads(Path(first["current_path"]).read_text(encoding="utf-8")) == second
+    assert json.loads(Path(first["current_path"]).read_text(encoding="utf-8")) == exact(second, task)
     assert "MissingBase" in (Path(first["root"]) / "Higher.lean").read_text(encoding="utf-8")
     with pytest.raises(HubError) as error:
         await call(runner, attempt, "draft_update", arguments, "stale-update")
@@ -123,8 +129,8 @@ async def test_receipt_recovers_navigation_failure_without_rereading_source(proj
     (hub.workspace(attempt["worker_id"]) / arguments["source_dir"] / "Higher.lean").unlink()
     monkeypatch.setattr(DraftFiles, "point", point)
     result = await call(runner, attempt, "draft_update", arguments)
-    assert result == reference
-    assert json.loads(Path(result["current_path"]).read_text(encoding="utf-8")) == result
+    assert exact(result, task) == reference
+    assert json.loads(Path(result["current_path"]).read_text(encoding="utf-8")) == reference
 
 
 async def test_rolled_back_update_does_not_publish_a_current_head(project, monkeypatch):
@@ -154,8 +160,8 @@ async def test_restart_rebuilds_navigation_and_preserves_shared_source(project):
     await hub.close()
     reopened = Hub(hub.root)
     try:
-        assert (await reopened.task(task["id"]))["drafts"] == result
-        assert json.loads(Path(result["current_path"]).read_text(encoding="utf-8")) == result
+        assert (await reopened.task(task["id"]))["drafts"] == exact(result, task)
+        assert json.loads(Path(result["current_path"]).read_text(encoding="utf-8")) == exact(result, task)
     finally:
         await reopened.close()
 

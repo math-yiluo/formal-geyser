@@ -2,9 +2,11 @@
 
 `export_core` reads an instance (it may be serving) and writes a bundle directory:
 
-- `library/` and `library.json`: the files of the current published Library, with their hashes;
-- `tasks.json`: every unfinished work task, its current contract, its operator priority and
-  pin, and the task it came from (reviews and the Integrator's task go with their candidates and
+- `library/` and `library.json`: the files of the Library's last recorded publication, read from the
+  instance's Git repository (the `library/` view on disk is refreshed only when read, so it can lag),
+  with their hashes;
+- `tasks.json`: every unfinished work task, its current contract, its number (Task N), its
+  operator priority and pin, and the task it came from (reviews and the Integrator's task go with their candidates and
   batches, which stay behind);
 - `drafts/<task>/`: each carried task's current shared draft;
 - `dags/`: the current shared planning DAGs;
@@ -31,14 +33,18 @@ import json
 import re
 import shutil
 import sqlite3
+import subprocess
+import threading
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import uuid4
 
 from ..registry import read_snapshot
+from .config import load_config
 from .errors import HubError
 from .models import Actor, Command, Role
+from .task_names import work_task_order
 from .wiki import _TEMPLATES as STARTER_PAGES
 
 FORMAT = 1
@@ -64,6 +70,69 @@ def _copy_tree(source: Path, target: Path) -> list[dict[str, str]]:
         body = path.read_bytes()
         destination.write_bytes(body)
         files.append({"path": relative, "sha256": _sha(body)})
+    return files
+
+
+def _git(repository: Path, *args: str) -> bytes:
+    return subprocess.run(["git", "--git-dir", str(repository), *args], check=True, capture_output=True).stdout
+
+
+def _published_commit(db: sqlite3.Connection) -> str | None:
+    """The Library's last recorded publication in the ledger snapshot, or its initial commit."""
+    row = db.execute("SELECT commit_sha FROM repository_publications ORDER BY created_at DESC,rowid DESC LIMIT 1"
+                     ).fetchone()
+    if row is None:
+        row = db.execute("SELECT object_id FROM events WHERE kind='repository.initialized' "
+                         "ORDER BY created_at DESC,rowid DESC LIMIT 1").fetchone()
+    return row[0] if row is not None else None
+
+
+def _export_commit(repository: Path, commit: str, target: Path) -> list[dict[str, str]]:
+    """Write the files of `commit` under `target`, read-only on the repository; their paths and hashes."""
+    entries = []
+    for item in _git(repository, "ls-tree", "-r", "-z", "--full-tree", commit).split(b"\0"):
+        if not item:
+            continue
+        meta, _, name = item.partition(b"\t")
+        mode, kind, obj = meta.split(b" ")
+        path = name.decode("utf-8")
+        if kind != b"blob" or mode not in (b"100644", b"100755") or ".." in PurePosixPath(path).parts:
+            raise ValueError(f"The Library commit {commit} holds an entry that is not a plain file: {path}")
+        entries.append((path, obj))
+    process = subprocess.Popen(["git", "--git-dir", str(repository), "cat-file", "--batch"],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    assert process.stdin is not None and process.stdout is not None
+    requests = process.stdin
+
+    def feed() -> None:  # Written apart from the reads, so neither pipe fills.
+        try:
+            with requests:
+                for _, obj in entries:
+                    requests.write(obj + b"\n")
+        except BrokenPipeError:
+            pass  # The reader stopped and ended git.
+    writer = threading.Thread(target=feed, daemon=True)
+    writer.start()
+    files = []
+    try:
+        for path, obj in entries:
+            header = process.stdout.readline().split()
+            if len(header) != 3 or header[0] != obj or header[1] != b"blob":
+                raise ValueError(f"Git did not return the blob {obj.decode()} of {path}")
+            body = process.stdout.read(int(header[2]))
+            process.stdout.read(1)  # The newline after each object.
+            destination = target / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(body)
+            files.append({"path": path, "sha256": _sha(body)})
+    except BaseException:
+        process.kill()
+        raise
+    finally:
+        writer.join()
+        status = process.wait()
+    if status != 0:
+        raise ValueError(f"git cat-file failed reading the Library commit {commit}")
     return files
 
 
@@ -94,12 +163,21 @@ def export_core(project: Path, destination: Path) -> dict:
     return summary
 
 
+def _task_numbers(db: sqlite3.Connection) -> dict[str, int]:
+    """Each work task's number (Task N). An instance from before numbering has none stored: it
+    gets the numbers its first start with numbering would give (task_names.work_task_order)."""
+    if "task_number" in {row[1] for row in db.execute("PRAGMA table_info(tasks)")}:
+        return {row[0]: row[1] for row in db.execute("SELECT id,task_number FROM tasks WHERE task_number IS NOT NULL")}
+    return {task_id: number for number, task_id in enumerate(work_task_order(db, unnumbered=False))}
+
+
 def _export(project: Path, state: Path, destination: Path, db: sqlite3.Connection) -> dict:
     current = {row["id"]: dict(row) for row in db.execute(
         "SELECT t.id,t.state,t.current_revision,t.created_at,r.contract_json FROM tasks t JOIN task_revisions r "
         "ON r.task_id=t.id AND r.revision=t.current_revision ORDER BY t.created_at,t.id")}
     origins = {row[0]: row[1] for row in db.execute("SELECT task_id,source_task_id FROM task_origins")}
     contracts = {tid: json.loads(row["contract_json"]) for tid, row in current.items()}
+    numbers = _task_numbers(db)
     carried = [tid for tid, row in current.items()
                if row["state"] not in ("done", "retired") and contracts[tid].get("kind", "work") == "work"]
     carried_set = set(carried)
@@ -147,7 +225,8 @@ def _export(project: Path, state: Path, destination: Path, db: sqlite3.Connectio
     for tid in carried:
         entry = {"id": tid, "state": current[tid]["state"], "revision": current[tid]["current_revision"],
                  "created_at": current[tid]["created_at"], "contract": contracts[tid],
-                 "origin_task_id": origins.get(tid), "priority": None, "pinned_at": None, "draft": None}
+                 "origin_task_id": origins.get(tid), "priority": None, "pinned_at": None, "draft": None,
+                 "number": numbers.get(tid)}
         if tid in admission:
             entry["priority"] = admission[tid]["priority"]
             entry["pinned_at"] = admission[tid]["pinned_at"]
@@ -196,13 +275,21 @@ def _export(project: Path, state: Path, destination: Path, db: sqlite3.Connectio
                            "source_path": record["source_path"], "bundled_path": local})
     _write_json(destination / "literature.json", literature)
 
-    # The current published Library, if any was published.
+    # The Library at its last recorded publication, from Git. The view under library/ is refreshed
+    # only when something reads it: the Linux pilot's still showed 7ccb886 an hour after 9bb3bef
+    # was published (2026-11-08), and a bundle taken from it lacked that publication.
     current_path = project / "library" / "current.json"
     pointer: dict[str, Any] = (json.loads(current_path.read_text(encoding="utf-8")) if current_path.is_file()
                                else {"commit": None})
-    library = _copy_tree(project / "library" / pointer["root"], destination / "library") if "root" in pointer else []
+    repository = state / "repository.git"
+    commit = _published_commit(db) if load_config(project).repository.enabled and repository.is_dir() else None
+    if commit is not None:
+        library = _export_commit(repository, commit, destination / "library")
+    else:  # No managed repository: the view is all there is.
+        commit = pointer["commit"]
+        library = _copy_tree(project / "library" / pointer["root"], destination / "library") if "root" in pointer else []
     (destination / "library").mkdir(exist_ok=True)
-    _write_json(destination / "library.json", {"commit": pointer["commit"], "files": library})
+    _write_json(destination / "library.json", {"commit": commit, "files": library})
 
     # Every task, read-only, for the operator; and the old settings.
     history = destination / "history" / "tasks.jsonl"
@@ -211,16 +298,18 @@ def _export(project: Path, state: Path, destination: Path, db: sqlite3.Connectio
         for tid, row in current.items():
             stream.write(json.dumps({"id": tid, "state": row["state"], "revision": row["current_revision"],
                                      "created_at": row["created_at"], "kind": contracts[tid].get("kind", "work"),
-                                     "title": contracts[tid].get("title"), "origin_task_id": origins.get(tid)},
+                                     "title": contracts[tid].get("title"), "origin_task_id": origins.get(tid),
+                                     "number": numbers.get(tid)},
                                     ensure_ascii=False) + "\n")
     if (project / "project.toml").is_file():
         shutil.copyfile(project / "project.toml", destination / "project.toml")
     return {"format": FORMAT, "bundle_id": uuid4().hex, "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "source": str(project), "library_commit": pointer["commit"], "library_files": len(library),
+            "source": str(project), "library_commit": commit, "library_view_commit": pointer["commit"],
+            "library_files": len(library),
             "tasks": len(records), "drafts": drafts, "dag_revision": dag_revision,
             "literature": len(literature), "literature_bundled": bundled,
             "root_task_id": root[0] if root is not None else None, "environments": environments,
-            "history_tasks": len(current)}
+            "history_tasks": len(current), "next_task_number": max(numbers.values(), default=-1) + 1}
 
 
 def _describe_artifact(artifact_id: str, references: dict) -> str:
@@ -385,8 +474,11 @@ async def import_core(hub, bundle: Path) -> dict:
     root = core.get("root_task_id") if core.get("root_task_id") in carried else None
     for entry in _order(entries, carried, root):
         contract = carried_contract(entry, carried, references, environments, moved_on)
+        # A task keeps its id and its number (Task N); a bundle from before numbering has none,
+        # and the task takes the next.
         await command("task.publish", "task:" + entry["id"],
-                      {"contract": contract, "task_id": entry["id"], "deduplicate": False})
+                      {"contract": contract, "task_id": entry["id"], "deduplicate": False,
+                       **({"task_number": entry["number"]} if entry.get("number") is not None else {})})
     # Where each task came from, when that task came along too (display only).
     origins = [(entry["origin_task_id"], entry["id"]) for entry in entries if entry.get("origin_task_id") in carried]
 
@@ -394,6 +486,12 @@ async def import_core(hub, bundle: Path) -> dict:
         c.executemany("UPDATE task_origins SET source_task_id=? WHERE task_id=?", origins)
     if origins:
         await hub.db.call(keep_origins, write=True)
+
+    def continue_numbers(c):
+        # A new task never takes a number the old instance gave (history-tasks.jsonl names them).
+        c.execute("UPDATE task_name_sequence SET next_number=max(next_number,?) WHERE id=1",
+                  (int(core.get("next_task_number") or 0),))
+    await hub.db.call(continue_numbers, write=True)
     for entry in entries:
         if entry.get("priority") is not None:
             await command("task.set_priority", "priority:" + entry["id"],

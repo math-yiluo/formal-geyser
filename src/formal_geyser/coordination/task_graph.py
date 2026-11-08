@@ -104,7 +104,7 @@ def backfill_task_origins(c, now: int) -> int:
 def _work_rows(c, where: str = "", args: Iterable[Any] = ()) -> list[dict]:
     """Work tasks (no reviews): id, title, state, creation, and the task they hang under."""
     return [dict(row) for row in c.execute(
-        "SELECT t.id,t.state,t.created_at,t.current_revision,json_extract(v.contract_json,'$.title') AS title,"
+        "SELECT t.id,t.task_number,t.state,t.created_at,t.current_revision,json_extract(v.contract_json,'$.title') AS title,"
         "o.source_task_id,i.task_id AS repair_of FROM tasks t "
         "JOIN task_revisions v ON v.task_id=t.id AND v.revision=t.current_revision "
         "LEFT JOIN task_origins o ON o.task_id=t.id "
@@ -150,7 +150,8 @@ async def task_outline(hub) -> dict:
         items = []
         for row in rows:
             parent, relation = _parent(row, hosts)
-            items.append({"id": row["id"], "state": row["state"], "revision": row["current_revision"],
+            items.append({"id": row["id"], "task_number": row["task_number"], "state": row["state"],
+                          "revision": row["current_revision"],
                           "created_at": row["created_at"], "contract": {"title": row["title"], "kind": "work"},
                           "parent": parent, "relation": relation, "running": row["id"] in running,
                           "executors": executors.get(row["id"], []),
@@ -316,12 +317,13 @@ def _nodes(c, task_ids: Iterable[str]) -> list[dict]:
         return []
     running = _running_ids(c)
     rows = {row["id"]: dict(row) for row in c.execute(
-        "SELECT t.id,t.state,json_extract(v.contract_json,'$.title') AS title,"
+        "SELECT t.id,t.task_number,t.state,json_extract(v.contract_json,'$.title') AS title,"
         "json_extract(v.contract_json,'$.kind') AS kind FROM tasks t "
         "JOIN task_revisions v ON v.task_id=t.id AND v.revision=t.current_revision "
         "WHERE t.id IN (SELECT value FROM json_each(?))", (json.dumps(ids),))}
     executors = _executors(c, [task_id for task_id in ids if rows.get(task_id, {}).get("state") not in TERMINAL])
-    return [{"id": task_id, "title": rows[task_id]["title"], "state": rows[task_id]["state"],
+    return [{"id": task_id, "task_number": rows[task_id]["task_number"], "title": rows[task_id]["title"],
+             "state": rows[task_id]["state"],
              "kind": rows[task_id]["kind"] or "work", "running": task_id in running,
              "executors": executors.get(task_id, [])} for task_id in ids if task_id in rows]
 
@@ -386,7 +388,7 @@ async def task_relations(hub, task_id: str) -> dict:
             if origin["worker_id"] else None,
             "host": nodes.get(host) if host else None,
             "children": {"total": len(children), "items": [
-                {"id": row["id"], "title": row["title"], "state": row["state"],
+                {"id": row["id"], "task_number": row["task_number"], "title": row["title"], "state": row["state"],
                  "relation": "repair" if row["repair_of"] == task_id and row["source_task_id"] != task_id else "published"}
                 for row in children[:CHILD_LIMIT]]},
             "reviews": {"counts": review_counts(c, [task_id]).get(task_id, dict(NO_REVIEWS)),

@@ -89,7 +89,7 @@ NOTHING_NEW = "Nothing new since your last input. To wait for something, pause r
 def sync_view(packet: dict) -> dict:
     """What a sync adds to a conversation that already has its task: only what is new."""
     view = project_packet(packet)
-    result: dict[str, Any] = {"task": {key: view["task"][key] for key in ("id", "revision", "title", "state")
+    result: dict[str, Any] = {"task": {key: view["task"][key] for key in ("id", "name", "revision", "title", "state")
                                        if key in view.get("task", {})}}
     for key in ("notifications", "messages", "next_action", "workspace_refresh"):
         if view.get(key):
@@ -231,7 +231,7 @@ def project_packet(packet: dict, *, workspace: Path | None = None) -> dict:
     task_path = task_file(packet)
     # The task's text lives in its file; inputs keep only an excerpt, so they stay small when
     # Codex keeps every input across compaction.
-    keys = ("id", "revision", "title", "kind", "state") + (() if task_path else ("objective", "context", "constraints"))
+    keys = ("id", "name", "revision", "title", "kind", "state") + (() if task_path else ("objective", "context", "constraints"))
     result["task"] = {key: deepcopy(task[key]) for key in keys if key in task and task[key] not in (None, "", [], {})}
     if task_path and isinstance(task.get("objective"), str) and task["objective"].strip():
         objective = task["objective"].strip()

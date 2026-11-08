@@ -100,4 +100,6 @@ async def test_old_verification_cannot_rewind_a_new_draft_head(project, monkeypa
     finally:
         release.set()
         await old
-    assert json.loads(Path(first["current_path"]).read_bytes()) == second
+    # The worker reads its task as Task 0; the file keeps the id.
+    assert second["task_id"] == "Task 0"
+    assert json.loads(Path(first["current_path"]).read_bytes()) == {**second, "task_id": task["id"]}

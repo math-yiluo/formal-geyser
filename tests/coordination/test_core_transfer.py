@@ -115,6 +115,8 @@ async def test_a_fresh_instance_takes_the_core_with_the_same_task_ids(exported, 
         assert summary["literature_skipped"] == []
         root, child, waiting = [await target.task(tasks[name]["id"]) for name in ("root", "child", "waiting")]
         assert {root["revision"], child["revision"], waiting["revision"]} == {1}
+        # Each keeps its number: Task 2 (finished) and Task 4 (the review) stayed behind.
+        assert [task["name"] for task in (root, child, waiting)] == ["Task 0", "Task 1", "Task 3"]
         # A carried requirement names the carried task at its new revision; its words still hold.
         assert child["contract"]["requirements"] == [{"key": "root-result", "task_id": root["id"], "task_revision": 1,
                                                       "artifact_id": None}]
@@ -148,6 +150,8 @@ async def test_a_fresh_instance_takes_the_core_with_the_same_task_ids(exported, 
         again = await import_core(target, bundle)
         assert again["tasks"] == 3 and again["drafts"] == 0
         assert await target.db.call(lambda c: c.execute("SELECT count(*) FROM tasks").fetchone()[0]) == 3
+        # A new task takes no number the old instance gave.
+        assert (await publish(target, "Published here"))["name"] == "Task 5"
     finally:
         await target.close()
 
