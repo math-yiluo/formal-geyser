@@ -284,5 +284,13 @@ def revalidate_candidate(ctx: typer.Context, artifact_id: str, record: bool = Fa
         raise typer.Exit(1)
 
 
+@app.command("restore-library-copies")
+def restore_library_copies(ctx: typer.Context):
+    """With the service stopped, write back every resting worker's Library copy: required before
+    running a version older than Library copies at rest."""
+    from .maintenance import restore_library_copies as restore
+    _emit(_run(restore(ctx.obj)))
+
+
 if __name__ == "__main__":
     app()

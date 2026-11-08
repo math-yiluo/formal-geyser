@@ -9,7 +9,8 @@ FormalGeyser is one Python 3.13 distribution: a coordination runtime
 (`formal_geyser.coordination`, "TaskHub") plus a general domain and a Lean
 domain. It contains no mathematical workload, proof corpus, or fixed reasoning phases.
 LLM workers are Codex or Claude Code conversations that work in ordinary files. Each
-worker keeps the backend it was created with; the operator chooses the backend for
+worker keeps the backend it was created with until the operator moves it, which takes effect
+at its next activation in a new conversation; the operator chooses the backend for
 workers created next, unless the project's assignment plan fixes it by role and worker
 number, and each account runs at most its configured number of sessions at once
 (`docs/claude-backend.md`). TaskHub coordinates
@@ -53,7 +54,9 @@ trees; use Git branches. Package and dependency versions stay as locked.
   idempotency receipts, delivery positions, review and publication state, and
   indexes. The native backend (Codex or Claude Code) owns conversation history; Git
   owns published source history (published Library and wiki content is authoritative
-  at its exact commit).
+  at its exact commit). A published Library view (`library/<commit>/`) is a cache of its
+  commit: after each publication, views superseded more than a day ago are removed, but the
+  current one and the three newest stay.
 - **Coordination storage.** Audited SQL-only status and message-signal reads use four
   read-only WAL connections; mutations, native-file reconciliation and delivery
   creation stay serialized on one writer with FULL durability. Command replies retain
@@ -150,7 +153,9 @@ trees; use Git branches. Package and dependency versions stay as locked.
   based on an older committed revision merges disjoint node and edge edits with the
   current pair; overlapping changes, cycles and dangling references fail explicitly.
   Installation runs outside the transaction, and the commit checks the exact current
-  revision the merge was prepared against. See [shared DAGs](docs/shared-dags.md).
+  revision the merge was prepared against. Each update removes revisions below the 200 newest
+  that are more than 7 days old (revision zero stays); an update read from a removed revision
+  is refused as a revision conflict. See [shared DAGs](docs/shared-dags.md).
 - **Task 0 completion** stops automatic assignment, claiming, recruitment, and worker
   creation, brings active work to a safe stop, and keeps unfinished tasks, candidates,
   and reviews for explicit future resumption. Messages and dependency changes do not
@@ -225,6 +230,26 @@ trees; use Git branches. Package and dependency versions stay as locked.
   last stored snapshot, read again in full; `.private` keeps its notes, records and
   material. In the Linux pilot ordinary workers were never retired: 723 of them held 44 GB
   after three days.
+- **Library copies at rest.** A workspace holds a full Library checkout only while its worker
+  has an attempt. The retention pass rests up to 30 workers
+  every ten minutes. A worker qualifies if it is ordinary or a reviewer, idle or suspended, has
+  no attempt for two hours, and has no turn, helper, message delivery or parked interruption.
+  Resting reads the workspace in full and records its base and exact manifest in
+  `workers/<id>/library-at-rest.json`, outside the writable workspace. It then removes each
+  file whose path and bytes are the base's, unless that file is executable, read-only, linked,
+  registered literature, or changed since it was read. Every reader restores those files from
+  the blob store first, under the workspace lock: admission's refresh, `ensure_library_copy`
+  and every snapshot preparation. So each turn, snapshot and three-way refresh sees exactly
+  the workspace it would have seen. Reclaiming a retired worker at rest compares its last
+  snapshot with the files present plus the restorable ones. On 11-07 in the Linux pilot, 945
+  copies held 263 of 912 GB, almost all of workers at rest. Rolling back to an older version
+  first needs `formalizectl --project <root> restore-library-copies` with the service stopped.
+- **Released conversations.** TaskHub opens a native conversation only while a worker, a turn
+  not yet ended, a parked interruption, a live rotation or a decision not yet completed is bound
+  to it; its own transcript keeps what it said. Every ten minutes the run driver compresses in
+  place (`.jsonl.gz`) the Codex and Claude Code files of conversations no one is bound to,
+  unchanged for an hour, at most 4 GB a pass, and trims Codex's debug log (`logs_2.sqlite`) to a
+  day (`conversation_archive.py`). On 11-07 the pilot's native conversation files held 96 GB.
 - **Rotation.** A conversation is replaced, at a safe point, by a new one that
   continues the same task. The prompt cache lasts about an hour: in Test 2, 501 turns
   resumed after more than an hour sent 74M uncached tokens in their first requests.
@@ -253,7 +278,12 @@ trees; use Git branches. Package and dependency versions stay as locked.
   conversation records the digest of its standing instructions, which are the same for
   every mode of one conversation (an ordinary worker's message turns use its work text;
   the input says what the turn is). One whose instructions changed continues in a new
-  conversation (reason `instructions`). A new conversation is not sent the updates its worker already
+  conversation (reason `instructions`). A worker the operator moves to the other backend
+  continues in a new conversation there at its next activation (reason `backend`), on a
+  session admission gave it on that account, not its old one. It takes no further session on
+  the old account, for its waiting work or a new task: records bound to the old conversation (a
+  parked interruption, an unresolved delivery, an open validation) make it wait until they
+  settle. A new conversation is not sent the updates its worker already
   had: its delivery cursor carries over, and the current state comes from its first
   input and the task's state file.
 
@@ -350,7 +380,18 @@ trees; use Git branches. Package and dependency versions stay as locked.
     again later. A subscribed task that becomes done or retired ends the wait too
     (`subscribed_task_done`, `subscribed_task_retired`). The Waker's model and effort
     are chosen like every role's (see Choices before a run).
-  - *Its own submission's result:* `validations`, `completion_declaration_id`.
+  - *Its own submission's result:* `validations`, `publications`, `completion_declaration_id`.
+    `publications` names candidates of the waiter's own task (its author's or a
+    co-executor's) that are still staged, under review or awaiting integration; any other
+    is refused (`PUBLICATION_NOT_OWN`, `PUBLICATION_SETTLED`). Each holds once the
+    candidate has an outcome: published by the Integrator (the normal end, after which the
+    worker can declare completion), rejected in review or by its machine validation,
+    deferred by the Integrator, withdrawn, superseded, or its review ended without
+    acceptance. The check is mechanical: no Waker and no answer deadline. The wait ends
+    as `reconsider` with `candidate_<outcome>` (`candidates_settled` when several differ),
+    and the task is told each outcome. A review verdict, which otherwise wakes the
+    author's waits, leaves a wait on that candidate's outcome alone while the candidate
+    is still on its way.
   - *A person's answer:* `answers`, ids of questions the worker asked in peer talk, or
     `external_response_id`, the operator's answer to its request. Each such wait gets a
     deadline from the answer deadline (`waits.answer_deadline_minutes`, or the operator's
@@ -490,13 +531,18 @@ trees; use Git branches. Package and dependency versions stay as locked.
   ends without new work. The Integrator never pauses: it waits for an answer by
   deferring the item and retries it once the answer resolves it, so a batch never
   stalls on a reply.
-- **Integration workspace retention.** Keep current-batch workspaces and the most
-  recently finished batch. At the next preparation, reclaim older finalized
-  checkouts only when their bytes still match the retained immutable snapshot.
-  Keep Git commits, snapshot objects and session receipts. Modified, unfrozen,
-  linked, or extra private files are retained; this is conservative reclamation,
-  not a hard disk quota. Maintenance runs off the coordination thread and records
-  reclaimed bytes and paths. It never makes a failed deletion block integration.
+- **Integration workspace retention.** An integration checkout lives as long as its batch
+  uses it. Once a batch lets it go, whether published, empty, deferred, recovered or
+  cancelled, it is reclaimed: found on disk, not through recorded rounds, so a checkout let
+  go before its round was recorded goes too (40 such checkouts, about 10 GB, were never
+  removed in the Linux pilot by 2026-11-07). A frozen checkout still equal to its frozen
+  snapshot is removed as it is; any other one is first read in full into an exact snapshot
+  that its session receipt records. Git commits, snapshot objects and session receipts
+  stay. A checkout holding what a snapshot leaves out (private files, drafts, graphs, build
+  directories) or a linked one is kept and looked at again an hour later. The driver
+  reclaims in the background as soon as a batch lets a checkout go, at start and every ten
+  minutes, a few at a time; each preparation also reclaims one. It never makes a failed
+  deletion block integration.
 - **Waiting and completion.** Independent review acceptance and successful batch
   validation do not satisfy a wait for a usable artifact. Actual accepted Library
   publication does. A requirement on a task also requires its evidence-backed
@@ -560,7 +606,12 @@ trees; use Git branches. Package and dependency versions stay as locked.
   project module they import, since replay trusts imports as compiled; a closure whose
   exact compiled bytes already passed, under the same environment and helper, is not
   replayed again (`.task-based/objects/lake/replays/`). On 10-19 the published Test 2
-  Library (269 modules, 6025 declarations) replayed cleanly in 259 seconds.
+  Library (269 modules, 6025 declarations) replayed cleanly in 259 seconds. Each module is
+  checked once whichever process checks it, so a replay of more than 100 modules runs in up to
+  the check's threads processes at once, at least 100 modules each; a group that passes records
+  its markers as it passes, and the first failing group's report is the replay's. On 11-07 one
+  edit to a widely imported module left about 5,200 modules to replay, about 4 s each, in one
+  process.
 - **Snapshot size.** A candidate snapshot holds its author's whole Library checkout, and the
   integration workspace holds the Library and its batch, so both grow with the Library. Each
   is bounded by the platform maximum of 100,000 files and 1 GiB and by the pinned
@@ -604,6 +655,12 @@ trees; use Git branches. Package and dependency versions stay as locked.
   using, the only one with a single pinned environment, it keeps the two most recently
   used idle slots warm and clears every other idle slot after 24 hours unused, one slot
   lock at a time; it never clears a slot a build holds or that namespace's artifact cache.
+  Where the filesystem shares extents (XFS with reflink, btrfs), the Lean service's hourly pass
+  makes the idle slots' identical `.olean` files share their blocks (FIDEDUPERANGE,
+  `[lean_service] share_outputs_gib` compared a pass): each keeps its inode and timestamps, so the
+  slot receipts still match, and Lean replaces an `.olean` by renaming a new one. Hard links
+  would change the shared inode's change time, which every slot's receipt records. On ext4 the
+  first attempt says it cannot, and nothing more is tried; on 11-07 the 8 slots held 86 GB.
 - **Failure verdicts.** Reported source/type/target findings reject. Environment
   loading failures, process crashes, memory exhaustion, interrupted checks and
   incomplete reports are unavailable. An inconclusive recheck never permanently
@@ -678,7 +735,10 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
   starts it on demand, in a systemd user scope of its own; a supervisor restarts it when it
   exits. TaskHub restarts and deployments leave it, its jobs and its warm pages in
   place; `formalizectl lean-service start|stop|restart|status|telemetry` manage it. Its jobs,
-  results, estimates and machine samples are in `.task-based/lean-service/service.sqlite3`.
+  results, estimates and machine samples are in `.task-based/lean-service/service.sqlite3`. A
+  finished job keeps its result and specification, compressed, `[lean_service] result_days` (2),
+  then only its telemetry; the database gives freed pages back as it goes, and `compact`
+  rewrites an older one with the service stopped (`docs/lean-service.md`).
   Each check's reading, syncing and hashing of the Library's sources and build outputs runs in
   a pool of bookkeeping processes (`bookkeeping_processes`), not in the server's own
   interpreter, which that work alone otherwise saturates.
@@ -1021,6 +1081,21 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
     from, what it needs and what needs it, waits within it, the tasks published from it, its
     reviews), its objective rendered from Markdown as text, its evidence, admission, and its
     revisions and records.
+- **Core transfer** (`taskctl export-core`, `taskctl import-core`).
+  An instance moves to a new machine as its core only: the current published Library,
+  every unfinished work task with its shared draft, the shared DAGs, registered literature,
+  and the operator's priorities and pins. No worker, conversation, workspace, candidate,
+  review, evidence, build output or history comes along. Export reads one snapshot of the
+  ledger and may run while the service serves; it writes a bundle outside the project. The
+  new instance is initialized from the bundle's Library, which import checks file by file,
+  and then seeded with the service stopped. A carried task keeps its id, so what its words,
+  the DAGs and its draft say of other carried tasks still holds; it starts again at
+  revision 1 under the new environment. A requirement, input, parent or subject that
+  names something left behind (an artifact, a finished task, a task not carried) is
+  removed, and the task's context says what it was and where its result now is. Reviews
+  and the Integrator's task stay with their candidates and batches. Import starts no run,
+  records what it did under `.task-based/core-transfer/<bundle>/`, and repeats nothing when
+  run again after a failure.
 - **CLI:** `taskctl` (coordination) and `formalizectl` (Lean domain).
 - **Git sharing** (optional): reviewed source, public wiki, and generated state under
   `taskhub/` on one branch. Private notes, messages, transcripts, credentials, and live

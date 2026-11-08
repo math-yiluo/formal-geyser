@@ -79,6 +79,48 @@ def _record_replays(store: Path, keys: Sequence[str]) -> None:
         (store / key).touch()
 
 
+# A replay process loads the environment its modules import, then sends each module's own
+# declarations to the kernel, trusting its compiled imports, the replayed ones included: each
+# module is checked once whichever process checks it. So a long replay is split among up to
+# `threads` processes, each with at least this many modules, since each loads its environment
+# again. In the Linux pilot one edit to a widely imported module left about 5,200 modules to
+# replay, about 4 s each, in one process.
+REPLAY_GROUP_MODULES = 100
+
+
+async def _replay_groups(tooling, build_directory: Path, pending: list[str], libraries, threads: int,
+                         record) -> dict:
+    """Replay `pending` in up to `threads` processes at once. `record(modules)` keeps the markers
+    of each group that passes as it passes, so a replay stopped or failed later keeps that work.
+    The report is the first failing group's, or the first group's, for all of `pending`."""
+    groups = max(1, min(max(1, threads), len(pending) // REPLAY_GROUP_MODULES))
+    parts = [pending[index::groups] for index in range(groups)]
+
+    async def one(part: list[str]) -> dict:
+        report = await tooling.kernel_replay(build_directory, part, libraries)
+        if report["ok"]:
+            await record(part)
+        return report
+    if groups == 1:
+        return await one(parts[0])
+    running = [asyncio.ensure_future(one(part)) for part in parts]
+    try:
+        reports = await asyncio.gather(*running)
+    except BaseException:
+        # The first error, or a cancellation, stops the other groups too; it is raised as it was.
+        for task in running:
+            task.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
+        raise
+    failed = next((report for report in reports if not report["ok"]), None)
+    merged = {**(failed or reports[0]), "replayed_modules": list(pending),
+              "groups": [{"modules": len(part), "ok": report["ok"]} for part, report in zip(parts, reports)]}
+    if failed is None:
+        constants = [report.get("constants") for report in reports]
+        merged["constants"] = sum(constants) if all(isinstance(item, int) for item in constants) else None
+    return merged
+
+
 @contextmanager
 def timed(timings: dict[str, float], step: str) -> Iterator[None]:
     """Add the seconds the block took to `timings[step]`. A check's result keeps its timings: in
@@ -438,14 +480,16 @@ async def compilation(tooling, source: Path | dict[str, bytes], modules: Sequenc
                                        digest({"environment": key, "replay_helper": helper}))
                     store = cache_root / "replays" / namespace
                     pending = await _disk(_pending_replays, store, keys)
-                    replay = (await tooling.kernel_replay(build_directory, pending, libraries) if pending else
+
+                    async def record(passed: list[str]) -> None:
+                        await _disk(_record_replays, store, [keys[module] for module in passed])
+                    replay = (await _replay_groups(tooling, build_directory, pending, libraries, threads, record)
+                              if pending else
                               {"ok": True, "replayed_modules": [], "validation_method": "kernel-replay",
                                "helper_sha256": helper})
                     replay["previously_replayed_modules"] = sorted(set(keys) - set(pending))
                     report["kernel_replay"] = replay
-                    if replay["ok"]:
-                        await _disk(_record_replays, store, [keys[module] for module in pending])
-                    else:
+                    if not replay["ok"]:
                         report.update(ok=False, reason=replay["reason"])
             # Inspect uses this directory in place while the slot remains locked.
             yield report

@@ -116,8 +116,11 @@ predicate waits for one of three things:
   subscription that would close a cycle of tasks waiting on each other is refused.
   The wait also ends when that task is done or retired.
 - Your own submission's result: `{"validations": ["<candidate id>"]}` for a staged
-  candidate's machine validation, `{"completion_declaration_id": "<id>"}` for its
-  feedback if you declared it, else its decision.
+  candidate's machine validation; `{"publications": ["<candidate id>"]}` for the
+  outcome of a candidate of your task (yours or a co-executor's) still under review
+  or awaiting integration: published by the Integrator, or rejected, deferred,
+  withdrawn or superseded, and you are told which; `{"completion_declaration_id":
+  "<id>"}` for its feedback if you declared it, else its decision.
 - An answer: `{"answers": ["<question id>"]}` for a question you asked with
   `talk_send`, `{"external_response_id": "<request id>"}` for the operator's answer
   to your `request`. Such a wait also ends at the project's answer deadline.

@@ -18,6 +18,10 @@ everything else in `.private` stay, as does any file registered literature point
 Registering a worker creates its workspace before the transaction commits, so a registration
 rolled back leaves an empty `workers/<id>/work` with no worker. Each pass also removes those,
 once an hour old: any still empty, for a worker that does not exist.
+
+Last, each pass rests the Library copies of up to REST_BATCH workers that have had no attempt
+for REST_AFTER_MS (library_rest): their workspaces keep only what differs from their Library
+base until something reads them again.
 """
 from __future__ import annotations
 
@@ -29,6 +33,9 @@ import shutil
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from .library_rest import at_rest, read_record, record_path, rest_workspace, rested_snapshot
+from .storage import collected_thread_call
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +51,12 @@ KEPT_ENTRIES = frozenset({".private", ".git", ".taskhub-integration"})
 PYTHON_MARKERS = ("pyvenv.cfg", "CACHEDIR.TAG")
 # Scratch in `.private`: the shells' temporary directory and rendered PDF pages.
 SCRATCH = frozenset({"tmp"})
+# A worker without an attempt for this long has its Library copy rested (library_rest). Each
+# worker resumed after a rest has it written back (about 42k files in the Linux pilot), so a
+# worker between turns of ordinary work keeps it.
+REST_AFTER_MS = 2 * 3_600_000
+# Workspaces rested in one pass: each is read in full first (about 270 MB in the Linux pilot).
+REST_BATCH = 30
 
 WORKSPACE_RETENTION_SCHEMA = """
 CREATE TABLE IF NOT EXISTS workspace_reclamations(
@@ -78,6 +91,18 @@ RECLAIMABLE = (
     "AND NOT EXISTS(SELECT 1 FROM continuations k WHERE k.preferred_worker=w.id "
     "AND k.state IN ('waiting','eligible','reconsider')) "
     "AND snapshot IS NOT NULL ORDER BY w.created_at LIMIT ?")
+# A worker whose Library copy may rest: one with a checkout and no attempt, turn, helper, message
+# delivery or parked interruption (whose ticket names the workspace's exact snapshot), and no
+# attempt since the cutoff that follows. The Integrator keeps its copy.
+RESTABLE = (
+    "w.kind IN ('ordinary','review') AND w.state IN ('idle','suspended') AND w.active_attempt IS NULL "
+    "AND EXISTS(SELECT 1 FROM repository_bases b WHERE b.worker_id=w.id) AND " + LAST_ACTIVE + "<? "
+    "AND NOT EXISTS(SELECT 1 FROM interruption_checkpoints i WHERE i.worker_id=w.id AND i.state='parked') "
+    "AND NOT EXISTS(SELECT 1 FROM message_delivery_holds h WHERE h.worker_id=w.id AND h.state IN ('sending','uncertain')) "
+    "AND NOT EXISTS(SELECT 1 FROM turn_intents t WHERE t.worker_id=w.id "
+    "AND t.state IN ('prepared','sending','bound','uncertain')) "
+    "AND NOT EXISTS(SELECT 1 FROM helper_intents h WHERE h.source_worker_id=w.id "
+    "AND h.state IN ('prepared','running','uncertain'))")
 
 
 def python_install(path: Path) -> bool:
@@ -139,9 +164,13 @@ class WorkspaceRetention:
     if TYPE_CHECKING:
         db: Any
         blobs: Any
+        config: Any
         state_dir: Path
         clock: Any
         _event: Any
+        _repository: Any
+        _workspace_lock: Any
+        workspace: Any
 
     async def retire_idle_workers(self, limit: int = RETIREMENT_BATCH) -> list[str]:
         """Retire up to `limit` ordinary workers with nothing of their own left and no attempt for
@@ -190,16 +219,20 @@ class WorkspaceRetention:
                 continue
             work = (self.state_dir / "workers" / worker_id / "work").resolve()
             if work.is_dir():
-                # Read in full: every file stored again, and nothing changed or added since.
+                # Read in full: every file stored again, and nothing changed or added since. A
+                # workspace at rest counts the Library files a restore would write back.
                 try:
-                    current = self.blobs.snapshot(work, exact=True)
-                except (OSError, ValueError) as error:
+                    record = read_record(work)
+                    current = (self.blobs.snapshot(work, exact=True) if record is None
+                               else rested_snapshot(self.blobs, work, record))
+                except (OSError, ValueError, KeyError, TypeError) as error:
                     logger.warning("Retired worker %s keeps its workspace: it cannot be read: %s", worker_id, error)
                     continue
                 if current != snapshot:
                     logger.warning("Retired worker %s keeps its workspace: it differs from its last snapshot", worker_id)
                     continue
             done.append((worker_id, reclaim_workspace(work, kept)))
+            record_path(work).unlink(missing_ok=True)  # Never run again: nothing is restored.
         return done
 
     def _remove_unregistered(self, registered: set[str]) -> int:
@@ -237,12 +270,62 @@ class WorkspaceRetention:
         if removed := await asyncio.to_thread(self._remove_unregistered, registered):
             logger.info("Removed %d empty workspaces left by rolled-back worker registrations", removed)
         rows = await self.db.read(lambda c: [(row[0], row[1]) for row in c.execute(RECLAIMABLE, (limit,))])
-        if not rows:
-            return []
-        done = await asyncio.to_thread(self._reclaim, rows)
+        done = await asyncio.to_thread(self._reclaim, rows) if rows else []
         if done:
             now = self.clock()
             await self.db.call(lambda c: c.executemany(
                 "INSERT OR IGNORE INTO workspace_reclamations(worker_id,reclaimed_at,bytes) VALUES(?,?,?)",
                 [(worker_id, now, freed) for worker_id, freed in done]), write=True)
+        if rested := await self.rest_library_copies():
+            logger.info("Rested %d workers' Library copies: %d files, %.0f MiB", len(rested),
+                        sum(files for _, files, _ in rested), sum(freed for _, _, freed in rested) / 2**20)
         return done
+
+    async def rest_library_copies(self, limit: int = REST_BATCH) -> list[tuple[str, int, int]]:
+        """Rest the Library copies of up to `limit` workers without an attempt for REST_AFTER_MS,
+        longest at rest first (library_rest); each one's worker ID, files removed and bytes freed.
+        An error leaves that worker's copy, and the others are rested. A workspace that could not
+        be rested, or had nothing to remove, is not read again until its worker has run again."""
+        if not self.config.repository.enabled:
+            return []
+        cutoff = self.clock() - REST_AFTER_MS
+        found = await self.db.read(lambda c: [(row[0], row[1]) for row in c.execute(
+            "SELECT w.id," + LAST_ACTIVE + " FROM workers w WHERE " + RESTABLE + " ORDER BY " + LAST_ACTIVE, (cutoff,))])
+        workers = self.state_dir / "workers"
+        # Per worker, its last activity when its workspace was last read without being rested.
+        unrested: dict[str, int] = self.__dict__.setdefault("_unrested_workspaces", {})
+        found = await asyncio.to_thread(lambda: [
+            (worker_id, active) for worker_id, active in found
+            if unrested.get(worker_id) != active and not at_rest(workers / worker_id / "work")][:limit])
+        if not found:
+            return []
+        kept = await asyncio.to_thread(self._literature_in_workspaces)
+        done = []
+        for worker_id, active in found:
+            try:
+                files, freed = await self._rest_library_copy(worker_id, cutoff, kept)
+            except Exception as error:
+                logger.warning("Worker %s keeps its Library copy: %s: %s", worker_id, type(error).__name__, error)
+                unrested[worker_id] = active
+                continue
+            if files:
+                unrested.pop(worker_id, None)
+                done.append((worker_id, files, freed))
+            else:
+                unrested[worker_id] = active
+        return done
+
+    async def _rest_library_copy(self, worker_id: str, cutoff: int, kept: list[Path]) -> tuple[int, int]:
+        # Under the workspace lock, which every reader of the workspace takes and which restores
+        # it first: a claim made meanwhile has its checkout prepared only after this.
+        async with self._workspace_lock(worker_id):
+            row = await self.db.read(lambda c: c.execute(
+                "SELECT b.base_commit FROM workers w JOIN repository_bases b ON b.worker_id=w.id "
+                "WHERE w.id=? AND " + RESTABLE, (worker_id, cutoff)).fetchone())
+            if row is None:
+                return 0, 0
+            base_commit = row[0]
+            base_snapshot = await collected_thread_call(self._repository().snapshot, base_commit, self.blobs)
+            work = self.workspace(worker_id).resolve()
+            return await collected_thread_call(rest_workspace, self.blobs, work, base_commit, base_snapshot,
+                                               kept, self.clock())

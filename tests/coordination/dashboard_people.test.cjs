@@ -235,7 +235,7 @@ test('the sidebar applies its order and filters to every refresh', async () => {
   assert.deepEqual(app.commands, []);
 });
 
-test('a worker switches backend from its next new conversation', async () => {
+test('a worker switches backend at its next turn', async () => {
   const app = harness([person(1, {thread_id: 't', session_settings: {model: 'gpt-6-astra', effort: 'xhigh'}}),
     {...person(0), id: 'r1', kind: 'review', reviewer_number: 1, display_name: 'Reviewer 1'}]);
   await app.load();
@@ -247,7 +247,7 @@ test('a worker switches backend from its next new conversation', async () => {
   app.state.overview = {...app.state.overview, workers: [{...app.state.overview.workers[0], requested_backend: 'claude'},
     app.state.overview.workers[1]]};
   await app.refresh(); await settle();
-  assert.match(app.el('worker-backend-text').textContent, /moves to Claude at its next new conversation$/);
+  assert.match(app.el('worker-backend-text').textContent, /moves to Claude at its next turn$/);
   assert.equal(app.el('worker-backend-button').textContent, 'Stay on Codex');
   // Reviewers stay on Codex: no switch is offered.
   app.el('reviewer-list').children[0].onclick(); await settle();

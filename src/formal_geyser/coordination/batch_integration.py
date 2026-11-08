@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -28,6 +29,14 @@ BATCH_THRESHOLD = 5
 BATCH_DELAY_MAX_MINUTES = 7 * 24 * 60
 BATCH_THRESHOLD_MAX = 1000
 BATCH_STATES = ("collecting", "preparing", "prepared", "frozen", "validated", "validation_failed", "publishing", "published", "empty")
+# Integration checkouts no open batch uses, reclaimed in one pass: each is read in full first
+# (about 0.36 GB of Library in the Linux pilot on 2026-11-07). A preparation, which waits for
+# its pass, reclaims fewer; the driver's background passes take the rest.
+RECLAIM_PER_PASS = 4
+RECLAIM_PER_PREPARATION = 1
+# A checkout a pass kept (private files in it, say) is looked at again after this long, so it
+# neither fills every pass nor keeps passes due.
+KEPT_RETRY_SECONDS = 3600.0
 ROUND_STATES = ("frozen", "validated", "validation_failed", "published", "invalidated")
 ITEM_STATES = ("included", "deferred", "published")
 BATCH_SCHEMA = """
@@ -114,6 +123,7 @@ class BatchIntegration:
         _integration: Any
         _archive_publication: Any
         _promote_candidate: Any
+        _wake_publication_waits: Any
         _set_member_work: Any
         _recompute_task: Any
         _notify: Any
@@ -664,12 +674,15 @@ class BatchIntegration:
             "UPDATE integration_batches SET state='collecting',workspace_id=NULL,target_head=NULL,prepared_json=NULL,round_id=NULL WHERE id=?",
             (batch["id"],),
         )
+        if batch["workspace_id"]:
+            self._integration_workspace_released()  # The next preparation starts a fresh checkout.
         self._notify(
             c,
             self._candidate_binding(c, p["candidate_id"])["task_id"],
             p["candidate_id"],
             reason,
         )
+        self._wake_publication_waits(c, p["candidate_id"])
         self._event(
             c,
             "integration.deferred",
@@ -838,30 +851,91 @@ class BatchIntegration:
             # The coordination call repeats every check and reports any real failure.
             logger.warning("Batch file checks before the coordination call did not complete: %s", error)
 
-    async def prune_integration_workspaces(self, actor):
-        def plan(c):
-            self._active_batch(c, actor)
-            latest = c.execute("SELECT id FROM integration_batches WHERE ended_at IS NOT NULL "
-                               "ORDER BY ended_at DESC,created_at DESC,id DESC LIMIT 1").fetchone()
-            if latest is None:
-                return []
-            return [dict(row) for row in c.execute(
-                "SELECT DISTINCT r.workspace_id,b.worker_id,b.id AS batch_id FROM integration_batch_rounds r "
-                "JOIN integration_batches b ON b.id=r.batch_id WHERE b.ended_at IS NOT NULL AND b.id<>?",
-                (latest[0],))]
-        candidates = await self.db.call(plan)
+    def integration_workspaces_due(self) -> bool:
+        """Whether a batch has let go of an integration checkout since the last reclaim pass (or
+        TaskHub started, and checkouts let go before may wait)."""
+        return self.__dict__.get("_integration_reclaim_due", True)
+
+    def _integration_workspace_released(self) -> None:
+        # Set inside the transaction that ends or detaches a batch's checkout: if it rolls
+        # back, the next pass finds nothing more to reclaim.
+        self.__dict__["_integration_reclaim_due"] = True
+
+    async def reclaim_integration_workspaces(self, actor=None, *, limit: int = RECLAIM_PER_PASS):
+        """Remove the integration checkouts no open batch uses (prune_integration_workspace),
+        whatever let them go: a published or empty batch, a deferral or a recovery that prepares
+        anew, a cancelled attempt. They are found on disk, not through recorded rounds: in the
+        Linux pilot a checkout let go before its round was recorded was never removed, and 40
+        of them held about 10 GB on 2026-11-07. The checkouts are listed before the open
+        batches are read, so one prepared meanwhile belongs to a reservation that read sees,
+        and a checkout no batch uses is never used again (a batch reserves a fresh one).
+        `actor`, given by an Integrator's preparation, must own the open batch. One pass runs
+        at a time; a preparation that finds one running reclaims nothing rather than wait."""
+        passes = self.__dict__.setdefault("_integration_reclaim_lock", asyncio.Lock())
+        if actor is not None and passes.locked():
+            return {"checked": 0, "remaining": 0, "reclaimed_bytes": 0, "workspaces": [], "state": "pass_running"}
+        async with passes:
+            return await self._reclaim_integration_pass(actor, limit)
+
+    async def _reclaim_integration_pass(self, actor, limit):
+        self.__dict__["_integration_reclaim_due"] = False
+
+        def integrators(c):
+            if actor is not None:
+                self._active_batch(c, actor)
+            return [row[0] for row in c.execute("SELECT id FROM workers WHERE kind='integrator' ORDER BY id")]
+
+        def listed(workers):
+            found = []
+            for worker_id in workers:
+                root = self.workspace(worker_id) / ".taskhub-integration"
+                try:
+                    names = sorted(entry.name for entry in root.iterdir()
+                                   if entry.is_dir(follow_symlinks=False))
+                except FileNotFoundError:
+                    continue
+                found += [(worker_id, name) for name in names]
+            return found
+
+        def in_use(c, names):
+            open_ones = {row[0] for row in c.execute(
+                "SELECT workspace_id FROM integration_batches WHERE ended_at IS NULL AND workspace_id IS NOT NULL")}
+            batches = {}
+            for name in names:
+                row = c.execute("SELECT batch_id FROM integration_batch_rounds WHERE workspace_id=? "
+                                "UNION SELECT id FROM integration_batches WHERE workspace_id=? LIMIT 1",
+                                (name, name)).fetchone()
+                if row is not None:
+                    batches[name] = row[0]
+            return open_ones, batches
+
+        workers = await self.db.call(integrators)
+        on_disk = await asyncio.to_thread(listed, workers)
+        open_ones, batches = await self.db.call(lambda c: in_use(c, [name for _, name in on_disk]))
+        kept = self.__dict__.setdefault("_integration_kept", {})
+        now = time.monotonic()
+        unused = [(worker_id, name) for worker_id, name in on_disk
+                  if name not in open_ones and now - kept.get(name, -KEPT_RETRY_SECONDS) >= KEPT_RETRY_SECONDS]
         results = []
-        for item in candidates:
-            workspace = self.workspace(item["worker_id"]) / ".taskhub-integration" / item["workspace_id"]
+        for worker_id, name in unused[:limit]:
+            workspace = self.workspace(worker_id) / ".taskhub-integration" / name
             try:
                 result = await asyncio.to_thread(self._repository().prune_integration_workspace, workspace, self.blobs)
             except (OSError, ValueError) as error:
                 result = {"workspace": str(workspace), "state": "retained_error", "reason": str(error), "bytes": 0}
+            if result["state"].startswith("retained"):
+                kept[name] = time.monotonic()
             if result["state"] != "already_absent":
-                results.append({**result, "batch_id": item["batch_id"]})
-        report = {"checked": len(candidates), "reclaimed_bytes": sum(r["bytes"] for r in results), "workspaces": results}
+                results.append({**result, "batch_id": batches.get(name)})
+        remaining = max(0, len(unused) - limit)
+        if remaining:
+            self._integration_workspace_released()  # The next pass takes the rest.
+        report = {"checked": min(len(unused), limit), "remaining": remaining,
+                  "reclaimed_bytes": sum(r["bytes"] for r in results if r["state"].startswith("reclaimed")),
+                  "workspaces": results}
         if results:
-            await self.db.call(lambda c: self._event(c, "integration.workspace_retention", actor.worker_id, report), write=True)
+            owner = actor.worker_id if actor is not None else (workers[0] if workers else None)
+            await self.db.call(lambda c: self._event(c, "integration.workspace_retention", owner, report), write=True)
         return report
 
     async def prepare_batch_publication(self, command):
@@ -894,7 +968,7 @@ class BatchIntegration:
 
     async def prepare_integration_batch(self, actor, command):
         plan = await command("integrator.prepare.reserve", {}, actor=actor, suffix=":reserve")
-        retention = await self.prune_integration_workspaces(actor)
+        retention = await self.reclaim_integration_workspaces(actor, limit=RECLAIM_PER_PREPARATION)
         snapshot, target, paths, conflicts = await asyncio.to_thread(self._batch_source_tree, plan)
         prepared = await asyncio.to_thread(
             self._repository().prepare, self.blobs, snapshot, target, Path(plan["workspace"]), paths
@@ -942,6 +1016,8 @@ class BatchIntegration:
                 "target_head=NULL,prepared_json=NULL,round_id=NULL,error=? WHERE id=?",
                 (error.code + ": " + error.message, batch_id),
             )
+            if batch["workspace_id"]:
+                self._integration_workspace_released()
             if batch["round_id"]:
                 c.execute(
                     "UPDATE integration_batch_rounds SET state='invalidated' WHERE id=?",
@@ -1140,6 +1216,7 @@ class BatchIntegration:
             "UPDATE integration_batches SET state=?,ended_at=? WHERE id=?",
             (state, self.clock(), batch["id"]),
         )
+        self._integration_workspace_released()  # Published or empty, its checkout is let go.
         kinds = {row[0] for row in c.execute("SELECT a.kind FROM integration_batch_items i JOIN artifacts a "
                                              "ON a.id=i.candidate_id WHERE i.batch_id=?", (batch["id"],))}
         if kinds != {"note.wiki"}:

@@ -276,6 +276,34 @@ def init(
     _emit(_perform(create))
 
 
+@app.command("export-core")
+def export_core_command(
+    ctx: typer.Context,
+    destination: Annotated[Path, typer.Argument(help="A new directory outside the project.")],
+):
+    """Write this instance's core (open tasks, the current Library, drafts, DAGs, literature) for
+    import-core; reads only, and may run while the service serves."""
+    from .core_transfer import export_core
+
+    _emit(_perform(lambda: export_core(ctx.obj.root, destination)))
+
+
+@app.command("import-core")
+def import_core_command(
+    ctx: typer.Context,
+    bundle: Annotated[Path, typer.Argument(help="A directory export-core wrote.")],
+):
+    """Seed this fresh instance with another's core, with the service stopped. Initialize it first
+    from the bundle's library/ (init --domain lean --from-library BUNDLE/library); no run starts."""
+    def run():
+        if ctx.obj.url:
+            raise ValueError("Import locally while the service is stopped; --url is not supported")
+        from .core_transfer import import_core
+
+        return asyncio.run(_local(ctx.obj, lambda hub: import_core(hub, bundle)))
+    _emit(_perform(run))
+
+
 @app.command("prepare")
 def prepare_instance(
     ctx: typer.Context,

@@ -59,8 +59,8 @@ class Note:
     task: str
     agent: str | None
     kind: str
-    """``validation``, ``declaration``, ``answer`` (a peer's answer to a question), or ``requirement``
-    for one that names no task."""
+    """``validation``, ``publication`` (a candidate's outcome), ``declaration``, ``answer`` (a peer's
+    answer to a question), or ``requirement`` for one that names no task."""
     met: bool
     detail: str = ""
 
@@ -246,6 +246,10 @@ class _Collector:
         for artifact_id in predicate.get("validations", []):
             self.notes.append(Note(task_id, agent, "validation", bool(self.hub._validation_finished(self.c, artifact_id)),
                                    f"the validation of {artifact_id}"))
+        for candidate_id in predicate.get("publications", []):
+            self.notes.append(Note(task_id, agent, "publication",
+                                   self.hub._publication_outcome(self.c, candidate_id) is not None,
+                                   f"the publication of {candidate_id}"))
         if predicate.get("completion_declaration_id"):
             self.notes.append(Note(task_id, agent, "declaration", False,
                                    f"the decision on {predicate['completion_declaration_id']}"))

@@ -93,6 +93,7 @@ class Rotation:
         _role: Any
         _normalize_worker_fields: Any
         _release_conversation: Any
+        _switch_possible: Any
         _task: Any
 
     # -- settings -------------------------------------------------------------------
@@ -228,7 +229,13 @@ class Rotation:
                 self._end_rotation(c, live["id"], "superseded")
                 live = None
             if live is not None:
-                return self._rotation_row(live) if live["state"] == "ready" and not self._rotation_blocked(c, worker) else None
+                blocked = self._rotation_blocked(c, worker)
+                if blocked and live["reason"] == "backend" and live["state"] == "ready":
+                    # Records bound to the old conversation keep the worker there for this turn;
+                    # admission prepares the move again once they settle.
+                    self._end_rotation(c, live["id"], "backend_" + blocked)
+                    return None
+                return self._rotation_row(live) if live["state"] == "ready" and not blocked else None
             if self._rotation_blocked(c, worker):
                 return None
             # Codex keeps a conversation's instructions as they were when it began (or was last
@@ -311,12 +318,21 @@ class Rotation:
         return await self.db.call(decide, write=True)
 
     async def begin_rotation(self, rotation_id: str, *, handoff: dict, state_path: str) -> dict | None:
-        """Release the old conversation; the activation opens a new one."""
+        """Release the old conversation; the activation opens a new one. A move to another
+        backend whose account can no longer start a session (held since admission) keeps the old
+        conversation for this activation instead of opening a new one where it was."""
         def begin(c):
             row = self._rotation(c, rotation_id)
             worker = self._get(c, "workers", row["worker_id"])
             if row["state"] != "ready" or worker["thread_id"] != row["thread_id"]:
                 return None
+            if row["reason"] == "backend":
+                request = c.execute("SELECT backend FROM worker_backend_requests WHERE worker_id=?",
+                                    (worker["id"],)).fetchone()
+                if (request is None or request["backend"] == worker["backend"]
+                        or not self._switch_possible(c, worker["id"], request["backend"], worker["kind"])):
+                    self._end_rotation(c, rotation_id, "backend_unavailable")
+                    return None
             automatic = bool(row["automatic"]) or not handoff.get("valid")
             c.execute("UPDATE rotations SET state='started',handoff_json=?,state_path=?,automatic=?,started_at=? WHERE id=?",
                       (canonical(handoff), state_path, int(automatic), self.clock(), rotation_id))

@@ -28,6 +28,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
+from ..lean_service.store import unpack
 from .transcript_digest import events
 
 WINDOW = 25  # Actions compared on each side of a switch, as in Test 2's analysis.
@@ -152,7 +153,8 @@ def checks(store: Path | None, owner: str, start: float, end: float) -> dict[str
     finally:
         connection.close()
     for outcome, body in rows:
-        result = json.loads(body) if body else {}
+        text = unpack(body)
+        result = json.loads(text) if text else {}
         found["count"] += 1
         found["failed"] += (outcome != "completed" or "error" in result
                             or _mapping(result.get("compilation")).get("ok") is not True)

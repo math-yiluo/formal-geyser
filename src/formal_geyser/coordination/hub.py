@@ -29,6 +29,7 @@ from .communications import (
 )
 from .config import codex_profiles_equal, load_config, resolve_config
 from .context_events import WORKER_UPDATE_LIMIT, routine_for_recipient, worker_collaboration
+from .conversation_archive import ConversationArchive
 from .errors import HubError, WorkerWorkspaceError
 from .faults import FaultIsolation
 from .integration import RepositoryCoordination
@@ -50,7 +51,12 @@ from .models import (
 from .native import MATHEMATICAL_KINDS, NativeWorkflow
 from .rotation import ROTATION_SCHEMA, Rotation
 from .schema import LATEST_VERSION_SQL, NEXT_VERSION_SQL, SCHEMA
-from .session_settings import SESSION_SETTINGS_SCHEMA, SessionSettings, bound_settings
+from .session_settings import (
+    SESSION_BACKEND,
+    SESSION_SETTINGS_SCHEMA,
+    SessionSettings,
+    bound_settings,
+)
 from .shared_dags import SharedDags
 from .storage import BlobStore, Database, canonical, collected_thread_call, digest
 from .talk import PeerTalk
@@ -75,6 +81,7 @@ logger = logging.getLogger(__name__)
 UNRETAINED_RUNTIME_COMMANDS = frozenset({"usage.record"})
 # The first 8 characters of a task or artifact ID (a UUID).
 HEX_PREFIX = re.compile(r"[0-9a-f]{8}")
+TASK_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 # The core commands' handlers; the lifecycle's own table goes first (Hub._dispatch).
@@ -153,7 +160,7 @@ RUN_STOP_REASONS = {"run.pause": "operator_pause", "run.pause_after_turn": "oper
                     "run.stop": "operator_stop"}
 
 
-class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsolation, WorkerNames, SharedDags, NativeWorkflow, Communications, PeerTalk, RepositoryCoordination, Rotation, ClaudeProfiles, CodexProfiles, SessionSettings, Waker, Lifecycle):
+class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIntegration, FaultIsolation, WorkerNames, SharedDags, NativeWorkflow, Communications, PeerTalk, RepositoryCoordination, Rotation, ClaudeProfiles, CodexProfiles, SessionSettings, Waker, Lifecycle):
     def __init__(
         self, root: Path, config: ProjectConfig | None = None,
         clock: Callable[[], int] | None = None,
@@ -506,6 +513,8 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
                 yield self._external_wait_satisfied(c, predicate)
             for artifact_id in predicate.get("validations", []):
                 yield self._validation_finished(c, artifact_id)
+            for candidate_id in predicate.get("publications", []):
+                yield self._publication_outcome(c, candidate_id) is not None
             if predicate.get("completion_declaration_id"):
                 declaration = c.execute("SELECT state,feedback_state,declarer_id FROM task_completion_declarations WHERE id=?",
                                         (predicate["completion_declaration_id"],)).fetchone()
@@ -514,7 +523,8 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
                 yield bool(declaration and (declaration["state"] != "pending" or (
                     declaration["feedback_state"] != "pending" and declaration["declarer_id"] == waiter)))
         if not (predicate.get("requirements", []) or predicate.get("answers") or predicate.get("external_response_id")
-                or predicate.get("validations") or predicate.get("completion_declaration_id")):
+                or predicate.get("validations") or predicate.get("publications")
+                or predicate.get("completion_declaration_id")):
             return False
         return all(results()) if predicate["mode"] == "all" else any(results())
 
@@ -565,6 +575,69 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
                          "WHERE e.artifact_id=? AND e.policy=b.policy AND e.sequence>? LIMIT 1",
                          (artifact_id, phase["validation_after_sequence"] if phase else 0)).fetchone() is not None
 
+    def _publication_outcome(self, c, candidate_id) -> tuple[str, str] | None:
+        """How candidate `candidate_id` ended, as (outcome, what a worker waiting on it is told),
+        or None while it is on its way to the Library: staged, under review, or accepted and
+        waiting for the Integrator. A deferral ends it too, though a retry (integrator_retry)
+        queues it again."""
+        row = c.execute(
+            "SELECT a.status,r.state AS review,d.reason AS deferral,(SELECT verdict FROM peer_review_receipts "
+            "WHERE candidate_id=a.id ORDER BY created_at DESC,id DESC LIMIT 1) AS verdict FROM artifacts a "
+            "LEFT JOIN review_requests r ON r.candidate_id=a.id LEFT JOIN integration_deferred d "
+            "ON d.candidate_id=a.id WHERE a.id=?", (candidate_id,)).fetchone()
+        if row is None:
+            return None
+        rejected_in_review = row["verdict"] == "request_changes"
+        if row["status"] == "accepted":
+            return "published", f"Candidate {candidate_id} was published to the Library by the Integrator."
+        if row["status"] == "rejected" or (rejected_in_review and row["review"] not in {"pending", "integrating"}):
+            return "rejected", (f"Candidate {candidate_id} was rejected in review; the review report gives the "
+                                "suggestions." if rejected_in_review else
+                                f"Candidate {candidate_id} was rejected by its machine validation.")
+        if row["status"] == "withdrawn":
+            return "withdrawn", f"Candidate {candidate_id} was withdrawn."
+        if row["status"] == "superseded":
+            return "superseded", (f"Candidate {candidate_id} was superseded: its review basis changed, and it "
+                                  "will not be published. Submit a corrected candidate.")
+        if row["review"] == "integrating" and row["deferral"] is not None:
+            return "deferred", f"The Integrator deferred candidate {candidate_id}: {row['deferral']}"
+        # An approved candidate whose machine validation is still running is promoted when it
+        # finishes (_on_artifact_validate).
+        if row["review"] in {"pending", "integrating"} or (row["review"] == "resolved" and row["verdict"] == "approve"):
+            return None
+        return "review_ended", (f"The review of candidate {candidate_id} ended without accepting it; it will not "
+                                "be published.")
+
+    def _end_wait(self, c, row, predicate, told: set[tuple[str, str]] | None = None):
+        """End the wait `row`, whose predicate holds. One ended by its candidates' outcomes is
+        reconsidered, and its task is told each outcome (once per task and candidate in `told`);
+        any other becomes eligible."""
+        outcomes = {candidate_id: outcome for candidate_id in predicate.get("publications", [])
+                    if (outcome := self._publication_outcome(c, candidate_id)) is not None}
+        if not outcomes:
+            c.execute("UPDATE continuations SET state='eligible',wake_reason='requirements_satisfied' WHERE id=?",
+                      (row["id"],))
+            self._event(c, "continuation.eligible", row["id"], task_id=row["task_id"], worker_id=row["preferred_worker"])
+            return
+        kinds = {outcome for outcome, _ in outcomes.values()}
+        reason = "candidate_" + kinds.pop() if len(kinds) == 1 else "candidates_settled"
+        c.execute("UPDATE continuations SET state='reconsider',wake_reason=? WHERE id=?", (reason, row["id"]))
+        told = set() if told is None else told
+        for candidate_id, (_, text) in outcomes.items():
+            if (row["task_id"], candidate_id) not in told:
+                told.add((row["task_id"], candidate_id))
+                self._notify(c, row["task_id"], candidate_id, text)
+
+    def _wake_publication_waits(self, c, candidate_id):
+        """Candidate `candidate_id` may have reached an outcome: the waits naming it that now hold
+        end, as _wake ends them, without reading every other wait."""
+        told: set[tuple[str, str]] = set()
+        for row in c.execute("SELECT DISTINCT k.* FROM continuations k, json_each(k.predicate_json,'$.publications') p "
+                             "WHERE k.state='waiting' AND p.value=?", (candidate_id,)).fetchall():
+            predicate = json.loads(row["predicate_json"])
+            if self._satisfied(c, predicate, waiter=row["preferred_worker"]):
+                self._end_wait(c, row, predicate, told)
+
     def _reconsidering_continuation(self, c, continuation_id):
         if not continuation_id:
             return False
@@ -582,10 +655,10 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         rows = c.execute("SELECT * FROM continuations WHERE state='waiting'").fetchall()
         predicates = [json.loads(row["predicate_json"]) for row in rows]
         possible = self._possible_requirements(c, [r for predicate in predicates for r in predicate.get("requirements", [])])
+        told: set[tuple[str, str]] = set()
         for row, predicate in zip(rows, predicates):
             if self._satisfied(c, predicate, waiter=row["preferred_worker"], possible=possible):
-                c.execute("UPDATE continuations SET state='eligible',wake_reason='requirements_satisfied' WHERE id=?", (row["id"],))
-                self._event(c, "continuation.eligible", row["id"], task_id=row["task_id"], worker_id=row["preferred_worker"])
+                self._end_wait(c, row, predicate, told)
         self._return_set_aside_tasks(c)
 
     def _return_set_aside_tasks(self, c):
@@ -1602,6 +1675,16 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
             if row:
                 return self._task(c, row["id"])
         tid = uid()
+        if p.get("task_id") is not None:
+            # The operator keeps a task's identity when carrying it from another instance
+            # (core_transfer): its references there, in words and in graphs, name it still.
+            if actor.role != Role.OPERATOR:
+                raise HubError("FORBIDDEN", "Only the operator chooses a new task's id", 403)
+            if not isinstance(p["task_id"], str) or not TASK_ID.fullmatch(p["task_id"]):
+                raise HubError("INVALID_INPUT", "A task id is a lowercase UUID", 422)
+            if c.execute("SELECT 1 FROM tasks WHERE id=?", (p["task_id"],)).fetchone():
+                raise HubError("TASK_EXISTS", "A task with this id already exists", 409)
+            tid = p["task_id"]
         c.execute("INSERT INTO tasks(id,current_revision,state,created_at) VALUES(?,1,'ready',?)", (tid, self.clock()))
         c.execute("INSERT INTO task_revisions VALUES(?,1,?,?)", (tid, body, sha))
         origin = self._active(c, actor) if actor.role == Role.WORKER else None
@@ -1641,12 +1724,14 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         checkpoint, predicate = Checkpoint.model_validate(p["checkpoint"]), Predicate.model_validate(raw or {})
         if not predicate.has_condition():
             raise HubError("WAIT_CONDITION_REQUIRED", "A pause needs what ends it: a subscription to another task "
-                           "(subscriptions), your own submission's result (validations, completion_declaration_id), or "
+                           "(subscriptions), your own submission's result (validations, publications, "
+                           "completion_declaration_id), or "
                            "an answer to your question (answers: a worker's; external_response_id: the operator's). If "
                            "nothing is left for you to do in this task, leave it (leave_task) instead; while another "
                            "executor remains, it can invite you back (invite_back).", 422)
         self._check_subscriptions(c, task, a["worker_id"], predicate.subscriptions)
         self._check_questions(c, a["worker_id"], predicate.answers)
+        self._check_publications(c, task, predicate.publications)
         return self._record_wait(c, a, task, checkpoint.model_dump(), predicate.model_dump())
 
     def _record_wait(self, c, a, task, checkpoint: dict, predicate: dict) -> dict:
@@ -1679,6 +1764,18 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
                 raise HubError("QUESTION_NOT_FOUND", f"{question_id} is not a question you asked. Ask it with "
                                "talk_send (kind question), then wait on the id its receipt returns.", 422)
 
+    def _check_publications(self, c, task, candidate_ids):
+        """Each awaited candidate belongs to the waiter's own task, whose author or co-executor it
+        is, and is still on its way to the Library."""
+        for candidate_id in candidate_ids:
+            binding = c.execute("SELECT task_id FROM candidate_bindings WHERE artifact_id=?", (candidate_id,)).fetchone()
+            if binding is None or binding["task_id"] != task["id"]:
+                raise HubError("PUBLICATION_NOT_OWN", f"{candidate_id} is not a candidate of this task. Wait only on "
+                               "a candidate staged in your own task; for another task's results, subscribe to it.", 422)
+            outcome = self._publication_outcome(c, candidate_id)
+            if outcome is not None:
+                raise HubError("PUBLICATION_SETTLED", outcome[1] + " Its wait would end at once.", 409)
+
     @staticmethod
     def _answered(c, question_id) -> bool:
         return c.execute("SELECT 1 FROM peer_message_kinds WHERE answers=? LIMIT 1", (question_id,)).fetchone() is not None
@@ -1688,9 +1785,9 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         them, without reading every other wait."""
         for row in c.execute("SELECT DISTINCT k.* FROM continuations k, json_each(k.predicate_json,'$.answers') a "
                              "WHERE k.state='waiting' AND a.value=?", (question_id,)).fetchall():
-            if self._satisfied(c, json.loads(row["predicate_json"]), waiter=row["preferred_worker"]):
-                c.execute("UPDATE continuations SET state='eligible',wake_reason='requirements_satisfied' WHERE id=?", (row["id"],))
-                self._event(c, "continuation.eligible", row["id"], task_id=row["task_id"], worker_id=row["preferred_worker"])
+            predicate = json.loads(row["predicate_json"])
+            if self._satisfied(c, predicate, waiter=row["preferred_worker"]):
+                self._end_wait(c, row, predicate)
 
     async def end_overdue_waits(self) -> int:
         """Waits for an answer still unanswered at their deadline end, and their workers reconsider.
@@ -2362,6 +2459,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         naming an earlier version it corrects as well), and a validation of it that waits for
         an operator ends."""
         self._end_held_validation(c, artifact_id, reason)
+        self._wake_publication_waits(c, artifact_id)  # Told the candidate's outcome, not only `reason`.
         versions = self._versions_named_by(c, artifact_id)
         for row in c.execute("SELECT * FROM continuations WHERE state IN ('waiting','eligible')").fetchall():
             predicate = json.loads(row["predicate_json"])
@@ -2562,8 +2660,8 @@ class Hub(WorkspacePreparation, WorkspaceRetention, BatchIntegration, FaultIsola
         usage = c.execute("SELECT COALESCE(SUM(codex_tokens_used),0) AS codex,"
                           "COALESCE(SUM(claude_tokens_used),0) AS claude FROM runs").fetchone()
         live = dict.fromkeys(BACKENDS, 0)
-        for row in c.execute("SELECT w.backend,COUNT(*) AS count FROM attempts a JOIN workers w "
-                             "ON w.id=a.worker_id WHERE a.ended_at IS NULL GROUP BY w.backend"):
+        for row in c.execute("SELECT " + SESSION_BACKEND + " AS backend,COUNT(*) AS count FROM attempts a "
+                             "JOIN workers w ON w.id=a.worker_id WHERE a.ended_at IS NULL GROUP BY 1"):
             live[row["backend"]] = row["count"]
         limits = self._session_limits_view(c)
         return {"new_worker_backend": self._new_worker_backend(c), "workers": workers,

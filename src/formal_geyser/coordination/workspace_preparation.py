@@ -45,6 +45,7 @@ class WorkspacePreparation:
         content: Any
         config: Any
         _repository: Any
+        _restore_library_copy: Any
 
     def _workspace_lock(self, worker_id):
         locks = self.__dict__.setdefault("_workspace_io_locks", {})
@@ -56,6 +57,7 @@ class WorkspacePreparation:
             if worker_id not in prepared:
                 raise SnapshotRequired(worker_id)
             return prepared[worker_id]["snapshot"]
+        self._restore_library_copy(worker_id)
         return self.blobs.snapshot(self.workspace(worker_id))
 
     def _prepared_candidate(self, worker_id):
@@ -127,6 +129,7 @@ class WorkspacePreparation:
             async with self._workspace_lock(worker_id):
                 binding = await self.db.read(lambda c: self._snapshot_binding(c, worker_id))
                 def capture():
+                    self._restore_library_copy(worker_id)
                     if candidate:
                         return self._candidate_snapshot(worker_id)
                     first = self.blobs.snapshot(self.workspace(worker_id))

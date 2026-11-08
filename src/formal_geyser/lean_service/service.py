@@ -25,6 +25,7 @@ from uuid import uuid4
 from .. import offload
 from ..coordination.models import LeanServiceConfig
 from ..coordination.storage import collected_thread_call, digest
+from ..lake_dedupe import SlotDeduper
 from ..process import ProcessRunner, process_environment
 from . import machine as machine_module
 from .executor import JobSpec, content_key, memory_limited, run_check, stopped_reason
@@ -32,7 +33,7 @@ from .osjobs import JobGroup
 from .sandbox import Unsandboxed
 from .scheduler import CLASSES, GIB, Job, Machine, Policy, plan, rank
 from .sessions import SessionPool
-from .store import RESULT_DAYS, Store
+from .store import Store
 from .warm import WarmSet
 
 logger = logging.getLogger(__name__)
@@ -237,7 +238,8 @@ class LeanService:
         self.config = config or LeanServiceConfig()
         self.state_dir = self.root / ".task-based" / "lean-service"
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.store = Store(self.state_dir / "service.sqlite3")
+        self.store = Store(self.state_dir / "service.sqlite3", result_days=self.config.result_days)
+        self.deduper = SlotDeduper(self.root / ".task-based" / "objects" / "lake")
         self.sandbox = sandbox or Unsandboxed()
         self.process_runner = runner or ProcessRunner()
         self.measure = measure or machine_module.memory
@@ -334,7 +336,7 @@ class LeanService:
                 if job.row["content_key"] == key:
                     await self._upgrade(job, spec)
                     return {**self.view(job), "deduplicated": True}
-            stored = await asyncio.to_thread(self.store.reusable, key, now - RESULT_DAYS * 86400)
+            stored = await asyncio.to_thread(self.store.reusable, key)
             if stored is not None:
                 return {**self._row_view(stored), "deduplicated": True}
         job_id = uuid4().hex
@@ -983,5 +985,10 @@ class LeanService:
                 if now - last_prune >= 3600:
                     last_prune = now
                     await asyncio.to_thread(self.store.prune, now)
+                    if self.config.share_outputs_gib:
+                        shared = await asyncio.to_thread(
+                            self.deduper.run, int(self.config.share_outputs_gib * 1024**3))
+                        if shared["shared"]:
+                            logger.info("Shared %.1f GB of identical build outputs on disk", int(shared["shared"]) / 1e9)
             except Exception:
                 logger.exception("Lean service measurement failed; it is retried")

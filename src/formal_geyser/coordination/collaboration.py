@@ -61,6 +61,7 @@ def contract_substance(contract: dict) -> dict:
 class Collaboration:
     if TYPE_CHECKING:
         _prepared_candidate: Any
+        _restore_library_copy: Any
         db: Any
         blobs: Any
         clock: Any
@@ -70,6 +71,7 @@ class Collaboration:
         _artifact: Any
         _reconsider_artifact_waits: Any
         _role: Any
+        _wake_publication_waits: Any
         _active: Any
         _event: Any
         _notify: Any
@@ -267,6 +269,7 @@ class Collaboration:
         prepared = self._prepared_candidate(worker_id)
         if prepared is not None:
             return prepared
+        self._restore_library_copy(worker_id)
         workspace = self.workspace(worker_id)
         io_workspace = workspace.resolve()
         # Measure what the snapshot will hold before it stores anything.
@@ -494,11 +497,15 @@ class Collaboration:
                      "report_material_sha256": self.blobs.put_json({"receipt_id": receipt_id, **report})},
                     binding["task_id"], attempt["worker_id"])
         self._set_member_work(c, binding["task_id"], binding["author_id"], True, "peer_review_received")
+        # A wait on this candidate's outcome ends with that outcome (_wake_publication_waits), which
+        # an approval that still awaits validation or integration is not.
         c.execute("UPDATE continuations SET state='reconsider',wake_reason='peer_review_received' "
-                  "WHERE task_id=? AND preferred_worker=? AND state='waiting'",
-                  (binding["task_id"], binding["author_id"]))
+                  "WHERE task_id=? AND preferred_worker=? AND state='waiting' AND NOT EXISTS("
+                  "SELECT 1 FROM json_each(predicate_json,'$.publications') WHERE value=?)",
+                  (binding["task_id"], binding["author_id"], binding["artifact_id"]))
         if valid:
             self._promote_candidate(c, binding["artifact_id"])
+        self._wake_publication_waits(c, binding["artifact_id"])
         self._recompute_collaborative(c, binding["task_id"])
         return {"directive": "reviewed", "review_receipt_id": receipt_id,
                 "candidate_id": binding["artifact_id"], "basis_valid": valid,
@@ -635,6 +642,7 @@ class Collaboration:
             self._recompute_collaborative(c, request["task_id"])
         binding = self._candidate_binding(c, artifact_id)
         self._set_member_work(c, binding["task_id"], binding["author_id"], True, "validation_rejected")
+        self._wake_publication_waits(c, artifact_id)  # Told the outcome first.
         c.execute("UPDATE continuations SET state='reconsider',wake_reason='validation_rejected' "
                   "WHERE task_id=? AND preferred_worker=? AND state='waiting'", (binding["task_id"], binding["author_id"]))
         self._reconsider_artifact_waits(c, artifact_id, "validation_rejected")

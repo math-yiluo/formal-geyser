@@ -4,24 +4,38 @@ Open the initialized project's local service in your browser.
 Choose **Project setup** in the page header:
 
 1. Enter the Task 0 goal, including what would count as completion.
-2. Select **Model**, then one of its supported **Effort** values.
+2. Under **Agents and sessions**, choose the models and sessions: the same panel the
+   dialog shows once the project runs (backend of the next new worker, the model and
+   effort of workers on Codex and on Claude, of reviewers, of the Integrator, of the
+   Dispatcher and of the Waker, the answer deadline, session limits, idle rotation and the
+   Integrator's batch rule). None of the models, efforts or the deadline has a default:
+   the panel lists what is still to choose, and Start starts nothing until every one is
+   chosen (Workers on Claude only where Claude workers can start).
 3. Click **Start**.
 
-The service preserves the exact goal in Task 0's native contract and prepares the
-local managed Git repository used for independent review and publication. It
-saves the model and effort in this project's `project.toml`, creates the first
-run, and explicitly activates it. Other configuration, the selected Codex profile,
-and dependency/application versions are preserved. No GitHub remote is added.
+Before the first run the **Worker · Codex** row is the project's own model and effort:
+select its model, then one of its supported efforts. Start saves them in this project's
+`project.toml` (`[codex]` `model` and `effort`), so the project, not a separate operator
+choice, holds them. No other role takes them: reviewers and the Integrator have rows of their
+own, which project.toml may also fill (`[reviewers]`, `[integrator]`). Start first saves every
+other choice that changed in the panel, exactly as its **Save** button does, and starts
+nothing if that save fails; a choice saved there stays saved if a later step of Start
+fails.
+
+The service then preserves the exact goal in Task 0's native contract and prepares the
+local managed Git repository used for independent review and publication. It creates
+the first run and explicitly activates it. Other configuration, the selected Codex
+profile, and dependency/application versions are preserved. No GitHub remote is added.
 The normal worker list, task browser, sessions, messages, and Pause/Resume controls
-then show the run. These settings apply to the project's ordinary workers and
-reviewers. Assignment and recruitment decisions use the separate decision model
-(`taskctl backend decision-model`).
+then show the run. After the first run the panel's rows are ordinary choices for
+conversations that begin later; what project.toml chooses stays there for every role the
+operator has not chosen for. A run resumes, like it starts, only while every choice is made.
 
 ## Existing projects
 
 An existing Task 0 with no execution history can be started from this form. Its
 goal is displayed read-only; its exact contract and revision remain unchanged.
-The initial model and effort can still be selected before the first run.
+The agents' models and sessions can still be chosen before the first run.
 
 Once a project has any run, worker, attempt, or helper history, setup settings are
 locked. Use the existing run controls to resume a paused project. Project setup
@@ -35,7 +49,7 @@ no Codex thread or model turn. Sign in to that profile before starting execution
 
 ## Models and effort
 
-The picker uses the account/client's actual `model/list` response, including
+The Worker · Codex picker uses the account/client's actual `model/list` response, including
 supported and default reasoning efforts. It does not contain a fixed list of
 model names or effort levels. A previously configured model that is unavailable
 is shown as a mismatch requiring a deliberate selection. An unavailable catalog

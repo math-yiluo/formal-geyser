@@ -1,6 +1,7 @@
 """Stopped-service maintenance that preserves conversations and historical evidence."""
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
@@ -9,6 +10,7 @@ from uuid import uuid4
 from .coordination.api import ProjectOwner
 from .coordination.config import load_config
 from .coordination.hub import Hub
+from .coordination.library_rest import RECORD, restore_workspace
 from .coordination.models import Actor, Command, Role
 from .coordination.runtime.ownership import tree_quiet
 from .lean_service import client as lean_service
@@ -68,3 +70,19 @@ async def project(root: Path, function):
 
 async def run(root: Path, artifact_id: str, *, record: bool) -> dict:
     return await project(root, lambda hub: revalidate(hub, artifact_id, record=record))
+
+
+async def restore_all_library_copies(hub) -> dict:
+    """Write back every resting worker's Library copy (library_rest), as its next reader would."""
+    restored: dict[str, int] = {}
+    for record in sorted((hub.state_dir / "workers").glob("*/" + RECORD)):
+        written = await asyncio.to_thread(restore_workspace, hub.blobs, (record.parent / "work").resolve())
+        if written is not None:
+            restored[record.parent.name] = written
+    return {"workers": len(restored), "files": sum(restored.values()), "restored": restored}
+
+
+async def restore_library_copies(root: Path) -> dict:
+    """With the service stopped: before running a version that does not know rested workspaces,
+    which would read one as its worker having deleted those Library files."""
+    return await project(root, restore_all_library_copies)

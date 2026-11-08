@@ -15,6 +15,10 @@ files; follow both paths from that one response to avoid mixing versions. The
 pointer is a recoverable navigation convenience and can lag after an I/O failure.
 These are the same two global DAGs across revisions, not per-task graphs.
 The immutable versions retain authorship, source task, summary, and file hashes.
+Each update removes the revisions below the 200 newest that are more than 7 days old; revision
+zero stays. They are kept only as merge bases: an update read from a removed revision is refused
+with `DAG_REVISION_CONFLICT`, to be read again and merged. The Linux pilot kept every one of 2,630
+revisions, each a full copy of the pair, 8.7 GB.
 The existing SQLite coordinator retains only one head identity and normal command
 receipts; graph bodies are ordinary JSON files. Graphs remain outside Library and
 formal source snapshots. Existing public drafts retain their separate workflow.

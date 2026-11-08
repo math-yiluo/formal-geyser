@@ -475,7 +475,7 @@ async def test_standing_cheat_sheet_lists_each_available_operation_once_and_stay
             if capability == "worker":
                 # A small object argument shows its fields, and an operation that ends the turn says so.
                 assert "checkpoint: {summary, next_action, [input_refs]}" in line_of["pause"]
-                assert "predicate: {[mode], [subscriptions], [validations], [answers]" in line_of["pause"]
+                assert "predicate: {[mode], [subscriptions], [validations], [publications], [answers]" in line_of["pause"]
                 assert all(line_of[name].endswith("(ends the turn)") for name in ("pause", "contribute", "leave_task"))
                 assert not line_of["stage"].endswith("(ends the turn)")
                 # Bounds are shown, so a worker does not ask search for 30 results; usual minimums are not.

@@ -908,6 +908,12 @@ class NativeWorkflow:
             # The view check and file replacement run off the coordination thread; the
             # replacement requires the pointer still to name the commit read above.
             await collected_thread_call(lambda: self.content.publish_current_view(view, expected_commit=old_commit))
+            try:
+                removed = await collected_thread_call(self.content.prune_public_views)
+                if removed:
+                    logger.info("Removed %d superseded Library views", len(removed))
+            except (OSError, ValueError) as error:  # ContentError is a ValueError; the next publication retries.
+                logger.warning("Superseded Library views were not removed: %s", error)
         return view
 
     async def library_status(self):

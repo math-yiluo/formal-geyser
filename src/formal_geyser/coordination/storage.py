@@ -310,11 +310,22 @@ class BlobStore:
     def get_json(self, sha: str):
         return json.loads(self.get(sha))
 
+    def read(self, sha: str) -> bytes:
+        """A blob's bytes, verified, without the store's lock or cache: for copying many blobs
+        out (library_rest), which would otherwise hold the lock and evict the cache."""
+        if not self.has(sha):
+            raise ValueError("Missing or invalid content hash")
+        body = (self.root / sha[:2] / sha).read_bytes()
+        if hashlib.sha256(body).hexdigest() != sha:
+            raise ValueError("Blob integrity failure")
+        return body
+
     def snapshot(self, directory: Path, *, max_files: int | None = None,
-                 max_bytes: int | None = None, exact: bool = False) -> str:
+                 max_bytes: int | None = None, exact: bool = False,
+                 record: dict[str, tuple[tuple[int, ...], str]] | None = None) -> str:
         """The directory's files by content. An exact snapshot reads every file: content evidence,
         such as a candidate. Otherwise a settled file unchanged since the last snapshot keeps its
-        hash."""
+        hash. `record`, when given, receives each file's identity and hash."""
         max_files, max_bytes = snapshot_bounds(
             self.max_files if max_files is None else max_files,
             self.max_bytes if max_bytes is None else max_bytes,
@@ -359,6 +370,8 @@ class BlobStore:
                 sha = self.put(body)
             if time.time_ns() - max(info.st_mtime_ns, info.st_ctime_ns) >= SNAPSHOT_SETTLED_NANOSECONDS:
                 current[relative] = (identity, sha)
+            if record is not None:
+                record[relative] = (identity, sha)
             total += size
             files.append({"path": relative, "sha256": sha})
         with self._lock:

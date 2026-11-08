@@ -40,7 +40,7 @@ final tree once.
 ## Retention
 
 Maintenance runs lazily at most once per minute, after acquiring the caller's
-shared namespace lock. Sizing runs in a joined thread alongside the build; no
+shared namespace lock. Sizing runs in a joined bookkeeping process or thread alongside the build; no
 separate service is started and cleanup cannot outlive the namespace lock. It retains at most two
 idle slots per namespace, expires idle data after 24 hours, and targets 4 GiB for
 disposable cache/workspace data across the instance. Oldest idle namespaces are
@@ -48,14 +48,44 @@ evicted first. These are retention limits, not execution limits: active namespac
 are never evicted and may exceed the target. The most recently used namespace
 also survives size pressure alone: 4 GiB is a soft target, not a maximum Library
 size. Its idle slot-count and age policies still apply on idle maintenance passes.
-Stable lock files are retained. Size walks skip both active workspace trees and
-their artifact caches, including older builds holding only slot locks. Missing
-files during enumeration are ignored. The collector rechecks locks before eviction.
-Builds waiting for maintenance's namespace lock yield asynchronously and can be
-cancelled; a cache size walk cannot block the coordinator's event loop.
-`retention.json` and build reports record observed idle size (`size_scope`),
-reclaimed bytes, skipped active namespaces and cleanup errors. This is a partial
-sample, not the total size of all live caches. Source Library, artifact archives, receipts
+
+A namespace that builds are using, which with one pinned environment is every
+pass's own, keeps its artifact cache and is not sized, but its idle slots still
+expire: its two most recently used idle slots stay warm, and every other idle slot
+is cleared once unused for 24 hours. Maintenance never takes that namespace's lock.
+It locks one slot at a time, exclusively and without blocking, only while it looks
+at or clears that slot. It skips a slot a build holds, and a starting build that
+finds a slot held takes the next free one rather than wait. A cleared slot keeps
+its lock file; the next build there starts clean and restores or rebuilds its modules.
+
+At most `[lean_service] build_slots` builds (default 8) hold a slot at once, and they take
+only slots 0 to `build_slots` - 1: each slot holds a full copy of the Library's build, about
+9.6 GB in the Linux pilot, where 13 builds at once filled the disk on 2026-11-06. A build past
+the limit waits, first come first served, for a slot to free; a slot under the limit that
+another process holds is passed over, and the build waits for the next free one. Maintenance
+clears an idle slot numbered `build_slots` or above as soon as it is idle, since no build takes
+it again; 0 lifts the limit.
+
+The slots' outputs are mostly the same bytes, since Lake restores a slot from its artifact cache
+by copying. Where the filesystem shares extents (XFS with reflink, btrfs), the Lean service's
+hourly maintenance makes identical `.olean` files of idle slots share their blocks with the
+kernel's FIDEDUPERANGE, at most `[lean_service] share_outputs_gib` compared a pass
+(`lake_dedupe.py`). The kernel compares the bytes itself; each file keeps its inode, size and
+timestamps, so a slot's receipt still matches, and a write to either copies first. Lean writes an
+`.olean` to a temporary file and renames it, so a rebuild replaces a shared file. Hard links are
+not used: a link changes the shared inode's change time, which every other slot's receipt
+records. On ext4 or tmpfs the first attempt reports that extents cannot be shared, and the pass
+does nothing more. A new machine's build volume should be XFS with reflink or btrfs to benefit.
+
+Stable lock files are retained. Size walks skip active workspace trees, except an
+idle slot being cleared under its lock, and their artifact caches, including older
+builds holding only slot locks. Missing files during enumeration are ignored. The
+collector rechecks locks before eviction. Builds waiting for maintenance's namespace
+lock yield asynchronously and can be cancelled; a cache size walk cannot block the
+coordinator's event loop. `retention.json` and build reports record observed idle
+size (`size_scope`), reclaimed bytes, skipped active namespaces, the slots cleared
+in them (`active_slots_cleared`) and cleanup errors. The size is a partial sample,
+not the total size of all live caches. Source Library, artifact archives, receipts
 and `.dependencies` are outside this collector. Maintenance errors do not stop work.
 
 ## Targets and outcomes

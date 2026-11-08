@@ -199,6 +199,15 @@ class LeanServiceConfig(StrictModel):
     # How long a submission waits for its validation before the validation continues in the
     # background and its result arrives as a notification.
     validation_wait_seconds: float = Field(default=90, ge=0, allow_inf_nan=False)
+    # Days a finished check keeps its result (for its caller and for reuse by content) and its
+    # specification; after them only its telemetry stays. In the Linux pilot every check that ran
+    # again with the same content did so within a day of the first, and seven days of results
+    # held 64 GB (lean_service/store.py).
+    result_days: float = Field(default=2, gt=0, le=90, allow_inf_nan=False)
+    # Each hour, at most this much of the idle build slots' identical outputs is compared and
+    # shared on disk where the filesystem shares extents (XFS with reflink, btrfs; not ext4):
+    # each slot holds a full copy of the Library's build (lake_dedupe.py). 0 turns it off.
+    share_outputs_gib: float = Field(default=32, ge=0, allow_inf_nan=False)
 
 
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
@@ -400,22 +409,25 @@ class Subscription(StrictModel):
 
 class Predicate(StrictModel):
     """What ends a pause. A task subscription (W1) is judged by the waker and ends the wait whatever
-    `mode` says; the own-submission results (W2: validations, completion_declaration_id) and a
-    person's answer (W3: answers from workers, external_response_id from the operator) combine by
-    `mode`. A wait for an answer also ends at the project's answer deadline. Since 2026-11-07 a
-    pause takes no `requirements`: stored waits keep theirs."""
+    `mode` says; the own-submission results (W2: validations, publications,
+    completion_declaration_id) and a person's answer (W3: answers from workers, external_response_id
+    from the operator) combine by `mode`. A wait for an answer also ends at the project's answer
+    deadline. Since 2026-11-07 a pause takes no `requirements`: stored waits keep theirs."""
     mode: Literal["all", "any"] = "all"
     subscriptions: list[Subscription] = Field(default_factory=list, max_length=20)
     # Staged candidates whose machine validation result, whatever its verdict, is awaited.
     validations: list[str] = Field(default_factory=list, max_length=20)
+    # Candidates of the waiter's own task whose outcome is awaited: published by the Integrator,
+    # or rejected (in review or machine validation), deferred, withdrawn or superseded.
+    publications: list[str] = Field(default_factory=list, max_length=20)
     # Questions this worker sent with talk_send (their message ids), each awaiting its answer.
     answers: list[str] = Field(default_factory=list, max_length=20)
     external_response_id: str | None = Field(default=None, min_length=1)
     completion_declaration_id: str | None = Field(default=None, min_length=1)
 
     def has_condition(self) -> bool:
-        return bool(self.subscriptions or self.validations or self.answers or self.external_response_id
-                    or self.completion_declaration_id)
+        return bool(self.subscriptions or self.validations or self.publications or self.answers
+                    or self.external_response_id or self.completion_declaration_id)
 
     def awaits_answer(self) -> bool:
         return bool(self.answers or self.external_response_id)

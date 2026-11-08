@@ -20,7 +20,9 @@ STARTUP_RETRY_MAX_SECONDS = 300.0
 STARTUP_FAULTS = (HubError, OSError, sqlite3.Error)
 # Visible-history records that could not be updated are retried this often.
 HISTORY_RETRY_SECONDS = 30.0
-# Retired reviewers' workspaces are reclaimed this often, in the background (workspace_retention).
+# Retired reviewers' workspaces are reclaimed this often, in the background (workspace_retention),
+# and so are integration checkouts no batch uses, at once when a batch lets one go
+# (batch_integration.reclaim_integration_workspaces).
 RECLAIM_SECONDS = 600.0
 # A run whose passes start nothing (paused, or every account held or full) is looked at again
 # after 1, 2, 4 and 8 s, then every IDLE_MAX_SECONDS, until a command wakes it. Every second, as
@@ -76,6 +78,10 @@ class RunDriver:
         self.timer_task: asyncio.Task | None = None
         self.reclaim_at = monotonic() + RECLAIM_SECONDS
         self.reclaim_task: asyncio.Task | None = None
+        self.integration_reclaim_at = monotonic() + RECLAIM_SECONDS
+        self.integration_reclaim_task: asyncio.Task | None = None
+        self.archive_at = monotonic() + RECLAIM_SECONDS
+        self.archive_task: asyncio.Task | None = None
 
     async def recover(self) -> None:
         """Recover what a restart left and re-arm the driven runs, retrying a transient fault."""
@@ -99,6 +105,10 @@ class RunDriver:
             tasks.append(self.startup_retry_task)
         if self.reclaim_task is not None:
             tasks.append(self.reclaim_task)
+        if self.integration_reclaim_task is not None:
+            tasks.append(self.integration_reclaim_task)
+        if self.archive_task is not None:
+            tasks.append(self.archive_task)
         return tasks
 
     async def _startup_recovery(self) -> bool:
@@ -236,6 +246,8 @@ class RunDriver:
                 except Exception as error:
                     logger.warning("Bounded database maintenance deferred: %s", type(error).__name__)
             self._reclaim_retired()
+            self._reclaim_integration()
+            self._archive_conversations()
             for run_id in tuple(self.armed):
                 if self.driving(run_id):
                     continue
@@ -252,6 +264,56 @@ class RunDriver:
             return
         self.reclaim_at = monotonic() + RECLAIM_SECONDS
         self.reclaim_task = asyncio.create_task(self._reclaim(reclaim), name="taskhub-workspace-reclaim")
+
+    def _archive_conversations(self) -> None:
+        """Start a background pass compressing released conversations' native files and trimming
+        Codex's debug log (conversation_archive.py), every RECLAIM_SECONDS."""
+        archive = getattr(self.hub, "archive_native_conversations", None)
+        if (archive is None or monotonic() < self.archive_at
+                or (self.archive_task is not None and not self.archive_task.done())):
+            return
+        self.archive_at = monotonic() + RECLAIM_SECONDS
+        self.archive_task = asyncio.create_task(self._archive(archive), name="taskhub-conversation-archive")
+
+    @staticmethod
+    async def _archive(archive: Callable) -> None:
+        try:
+            report = await archive()
+        except Exception as error:
+            logger.warning("Archiving released conversations deferred: %s: %s", type(error).__name__, str(error)[:300])
+            return
+        if report.get("files"):
+            logger.info("Compressed %d released conversations' files, %.0f MiB to %.0f MiB", report["files"],
+                        report["bytes"] / 2**20, report["compressed_bytes"] / 2**20)
+
+    def _reclaim_integration(self) -> None:
+        """Start a background pass reclaiming integration checkouts no batch uses: as soon as a
+        batch lets one go (and at start, for those let go before), else every RECLAIM_SECONDS."""
+        reclaim = getattr(self.hub, "reclaim_integration_workspaces", None)
+        if reclaim is None or (self.integration_reclaim_task is not None
+                               and not self.integration_reclaim_task.done()):
+            return
+        due = getattr(self.hub, "integration_workspaces_due", None)
+        if not ((due is not None and due()) or monotonic() >= self.integration_reclaim_at):
+            return
+        self.integration_reclaim_at = monotonic() + RECLAIM_SECONDS
+        self.integration_reclaim_task = asyncio.create_task(
+            self._reclaim_integration_workspaces(reclaim), name="taskhub-integration-reclaim")
+
+    @staticmethod
+    async def _reclaim_integration_workspaces(reclaim: Callable) -> None:
+        try:
+            report = await reclaim()
+        except Exception as error:
+            logger.warning("Reclaiming integration checkouts deferred: %s: %s", type(error).__name__, str(error)[:300])
+            return
+        reclaimed = [item for item in report["workspaces"] if item["state"].startswith("reclaimed")]
+        kept = [item for item in report["workspaces"] if not item["state"].startswith("reclaimed")]
+        if reclaimed:
+            logger.info("Reclaimed %d integration checkouts no batch uses, %.0f MiB; %d left for the next pass",
+                        len(reclaimed), report["reclaimed_bytes"] / 2**20, report["remaining"])
+        for item in kept:
+            logger.warning("Integration checkout %s kept: %s %s", item["workspace"], item["state"], item.get("reason", ""))
 
     @staticmethod
     async def _reclaim(reclaim: Callable) -> None:

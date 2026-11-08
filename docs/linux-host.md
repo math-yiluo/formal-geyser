@@ -70,6 +70,10 @@ When TaskHub's main process ends, systemd ends the whole unit, workers included.
 from a terminal instead, TaskHub moves itself into a scope of its own, and recovery ends
 the workers a dead TaskHub left.
 
+TaskHub and the Lean service each raise their soft open-file limit to the hard one when they
+start, since every worker or Lean process they own holds pipes; the unit needs no
+`LimitNOFILE` unless the hard limit itself is too low.
+
 ## When TaskHub stalls
 
 TaskHub watches itself, since py-spy cannot attach to it without root while
@@ -198,6 +202,9 @@ one with neither is reported under `warnings`. Claude's sandbox denies the same 
 
 2. Inside the VM, follow the same steps as for WSL 2 (packages, lingering, Codex,
    sign-in). Codex, Lean and the Claude Agent SDK all have linux-arm64 builds.
+
+3. To move a running project here from another host, carry its core with `taskctl export-core`
+   and `taskctl import-core` ([DESIGN.md](../DESIGN.md)).
 
 ## Settings that depend on the machine
 

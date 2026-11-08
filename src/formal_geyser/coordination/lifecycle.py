@@ -14,6 +14,7 @@ from .collaboration import Collaboration, contract_substance, new_id
 from .commands import CommandTable
 from .errors import HubError
 from .models import BACKENDS, Actor, Checkpoint, Role, TaskContract, file_name_fields
+from .session_settings import SESSION_BACKEND
 from .stall_watchdog import watched
 from .storage import canonical, digest
 from .worker_names import allocate_worker_number, next_worker_number, worker_identity
@@ -63,6 +64,8 @@ class Lifecycle(Collaboration):
         _creation_backend: Any
         _worker_plan: Any
         _adopt_requested_backend: Any
+        _admission_backend: Any
+        _prepare_backend_switch: Any
         _session_limit: Any
         _saturated: set[str]
         _ramp_started: int | None
@@ -756,7 +759,10 @@ class Lifecycle(Collaboration):
 
         A worker that paused mid-task is waiting, not idle; so is one with saved work or a
         message to handle, one the operator paused (on its own or with its group, or outside
-        the `scope` of a paused run), and one whose account is held or has no free session.
+        the `scope` of a paused run), and one whose account is held or has no free session. For a
+        worker that asked to move to the other backend, that is the account it moves to: a new
+        task starts a new conversation, where it moves (in the Linux pilot, nine Codex workers
+        waiting to move to a full Claude were given new tasks and ran on Codex).
         """
         held = set(self._dispatch_holds(c))
         unavailable = sorted(held | {backend for backend in BACKENDS if self._backend_full(c, backend)})
@@ -764,7 +770,8 @@ class Lifecycle(Collaboration):
         idle = [dict(worker) for worker in c.execute(
             "SELECT * FROM workers w WHERE kind='ordinary' AND work_intention='idle' AND state='idle' "
             "AND active_attempt IS NULL AND pending_wake=0 "
-            "AND backend NOT IN (" + ",".join("?" * len(unavailable)) + ") "
+            "AND COALESCE((SELECT q.backend FROM worker_backend_requests q WHERE q.worker_id=w.id),backend) "
+            "NOT IN (" + ",".join("?" * len(unavailable)) + ") "
             "AND NOT EXISTS(SELECT 1 FROM continuations WHERE preferred_worker=w.id "
             "AND state IN ('eligible','reconsider','waiting')) "
             # A message whose delivery is unresolved belongs to the current conversation.
@@ -1139,6 +1146,10 @@ class Lifecycle(Collaboration):
                 c.execute("SAVEPOINT chosen_claim")
                 try:
                     self._release_conversation(c, named, "new_task")
+                    self._adopt_requested_backend(c, named)  # Also for a worker that had no conversation.
+                    if c.execute("SELECT 1 FROM worker_backend_requests WHERE worker_id=?", (named,)).fetchone():
+                        # Its new account could not start it after all: it takes no session on the old one.
+                        raise HubError("SWITCH_WAITING", "This worker waits to move to the backend it asked for", 409)
                     result["assignment"] = self._claim_opportunity(c, named, candidate, helper["run_id"])
                     c.execute("RELEASE chosen_claim")
                     result.update(outcome="idle_worker", worker_id=named)
@@ -1296,22 +1307,31 @@ class Lifecycle(Collaboration):
         return await self.db.call(lambda c: self.with_workspace_snapshots(
             c, prepared, lambda connection: self._ordinary_turn_completed(connection, worker_id, attempt_id)), write=True)
 
-    def _admission_candidates(self, c, *, reviews, unstartable=(), fresh_reviews=True, pinned=None):
+    def _admission_candidates(self, c, *, reviews, unstartable=(), fresh_reviews=True, pinned=None, moves=()):
         """In one statement, the reviews (or other tasks) _saved_work_possible may accept, in
         admission order (reviews first; then pinned tasks, or reviews of pinned tasks, as they
         were pinned; then priority and age): a superset it then checks exactly. `pinned` keeps
         only the pinned other tasks (True) or only the rest (False). Saved work of a worker
         whose account cannot start a session now
-        (`unstartable`) is left out, as _select_task would skip it; a first turn's pending
-        recruitment decision is not, nor is a review that would get a new reviewer unless
-        `fresh_reviews`. Checking and reading every open task in full took about 1,100
+        (`unstartable`) is left out, as _select_task would skip it, unless the worker, on an
+        account of `moves[1]`, asked to move to one of `moves[0]` (_admission_backend); a first
+        turn's pending recruitment decision is not, nor is a review that would get a new reviewer
+        unless `fresh_reviews`. Checking and reading every open task in full took about 1,100
         statements per admission; on the pilot's busy coordination thread each cost
         milliseconds, two to nine seconds in all."""
         blocked = sorted(unstartable)
+        params = list(blocked)
+        movable = ""
+        if moves:
+            targets, sources = sorted(moves[0]), sorted(moves[1])
+            movable = (" OR w.backend IN (" + ",".join("?" * len(sources)) + ") AND EXISTS(SELECT 1 FROM "
+                       "worker_backend_requests q WHERE q.worker_id=w.id AND q.backend IN ("
+                       + ",".join("?" * len(targets)) + "))")
+            params += sources + targets
         idle_member = (
             "SELECT 1 FROM task_members m JOIN workers w ON w.id=m.worker_id WHERE m.task_id=t.id "
             "AND m.executor=1 AND m.membership_state='member' AND m.runnable AND w.active_attempt IS NULL "
-            "AND w.state='idle' AND w.backend NOT IN (" + ",".join("?" * len(blocked)) + ")")
+            "AND w.state='idle' AND (w.backend NOT IN (" + ",".join("?" * len(blocked)) + ")" + movable + ")")
         # A review goes with the pin of the task it reviews; its own priority is its contract's.
         order = ("ORDER BY COALESCE(json_extract(v.contract_json,'$.kind'),'')<>'review',p.pinned_at IS NULL,p.pinned_at,"
                  + ("COALESCE(json_extract(v.contract_json,'$.priority'),1)" if reviews
@@ -1341,7 +1361,7 @@ class Lifecycle(Collaboration):
                 "AND EXISTS(SELECT 1 FROM task_members m WHERE m.task_id=t.id AND m.executor=1 "
                 "AND m.membership_state='member' AND m.runnable) "
                 f"OR EXISTS({idle_member} AND w.work_intention='working' AND w.current_task_id=t.id))) " + order)
-        return [row[0] for row in c.execute(query, blocked)]
+        return [row[0] for row in c.execute(query, params)]
 
     def _saved_work_possible(self, c, task_id):
         """Exclude busy/held saved executions without materializing task content."""
@@ -1521,7 +1541,7 @@ class Lifecycle(Collaboration):
         if limit < 0:
             return False
         live = c.execute("SELECT COUNT(*) FROM attempts a JOIN workers w ON w.id=a.worker_id "
-                         "WHERE a.ended_at IS NULL AND w.backend=?", (backend,)).fetchone()[0]
+                         "WHERE a.ended_at IS NULL AND " + SESSION_BACKEND + "=?", (backend,)).fetchone()[0]
         return live > limit if admitted else live >= limit
 
     def _ramping(self):
@@ -1558,7 +1578,8 @@ class Lifecycle(Collaboration):
         seconds = self.config.concurrency.launch_seconds
         if seconds and backend not in self._saturated and self._ramping():
             last = c.execute("SELECT MAX(a.created_at) FROM attempts a JOIN workers w ON w.id=a.worker_id "
-                             "WHERE w.kind='ordinary' AND w.backend=? AND a.id<>?", (backend, attempt_id)).fetchone()[0]
+                             "WHERE w.kind='ordinary' AND " + SESSION_BACKEND + "=? AND a.id<>?",
+                             (backend, attempt_id)).fetchone()[0]
             if last is not None and self.clock() - last < seconds * 1000:
                 raise HubError("LAUNCH_SPACING", "Worker sessions are starting one at a time", 409)
         if self._backend_full(c, backend):
@@ -1648,8 +1669,11 @@ class Lifecycle(Collaboration):
             paused = {kind: backends - exempt for kind, backends in stopped.items()}
             fresh_reviews = self._creation_backend(c, "review") not in stopped["review"]
 
-            def startable(worker):
-                return worker["backend"] not in held and (worker["kind"] != "ordinary" or worker["backend"] not in closed)
+            def startable(worker, worker_id=None):
+                # A worker that asked to move needs a session on the account it moves to (None: it waits).
+                backend = self._admission_backend(c, worker_id or worker["id"], worker["kind"], worker["backend"])
+                return (backend is not None and backend not in held
+                        and (worker["kind"] != "ordinary" or backend not in closed))
 
             def unheld(assignment):
                 # The savepoint undoes an admission (and any fresh worker) for a held account,
@@ -1658,10 +1682,16 @@ class Lifecycle(Collaboration):
                 if not worker_id:
                     return assignment
                 worker = self._get(c, "workers", worker_id)
-                if worker["backend"] in held:
+                backend = self._admission_backend(c, worker_id, worker["kind"], worker["backend"])
+                if backend is None:
+                    raise HubError("SWITCH_WAITING", "This worker waits to move to the backend it asked for", 409)
+                if backend in held:
                     raise HubError("DISPATCH_HELD", "This worker's backend account is held", 409)
                 if worker["kind"] == "ordinary":
-                    self._admit_worker_session(c, worker["backend"], assignment["id"])
+                    if backend != worker["backend"]:
+                        # It moves: this session runs, and counts, on the account it asked for.
+                        self._prepare_backend_switch(c, worker_id, assignment["id"])
+                    self._admit_worker_session(c, backend, assignment["id"])
                 return assignment
             runner = Actor(role=Role.RUNNER)
             if scope is None and self.config.repository.enabled:
@@ -1671,13 +1701,15 @@ class Lifecycle(Collaboration):
                          "INTERRUPTION_RESERVED", "CONTINUATION_RESERVED", "REVIEWER_INELIGIBLE",
                          "RECOVERY_REQUIRED", "WORKER_RETIRED", "MEMBERSHIP_ENDED", "LEAN_ENVIRONMENT_MISMATCH",
                          "INTEGRATION_QUEUED", "WORKER_PAUSED", "DISPATCH_HELD", "BACKEND_BUSY",
-                         "LAUNCH_SPACING"}
+                         "LAUNCH_SPACING", "SWITCH_WAITING"}
             def assign_tasks(reviews, pinned=None):
                 # Reviewers are not ordinary workers: only a held account, or their pause, stops them.
                 unstartable = held | paused["review"] if reviews else held | closed | paused["ordinary"]
+                # A worker on an unpaused account that asked to move counts with the account it moves to.
+                moves = () if reviews else (set(BACKENDS) - unstartable, set(BACKENDS) - paused["ordinary"])
                 # In admission order already; a task is read in full only when its turn comes.
                 for task_id in self._admission_candidates(c, reviews=reviews, unstartable=unstartable,
-                                                          fresh_reviews=fresh_reviews, pinned=pinned):
+                                                          fresh_reviews=fresh_reviews, pinned=pinned, moves=moves):
                     while True:
                         outcome, result = self._admit_item(
                             c, "lifecycle_assignment", task_id, task_id, skippable,
@@ -1716,7 +1748,7 @@ class Lifecycle(Collaboration):
                         f"SELECT x.id,x.task_id,x.{owner} AS owner,w.kind,w.backend FROM {table} x "
                         f"LEFT JOIN workers w ON w.id=x.{owner} WHERE x.{predicate} AND (w.id IS NULL OR {free}) "
                         "ORDER BY x.created_at,x.id").fetchall():
-                    if ticket["kind"] is not None and not startable(ticket):
+                    if ticket["kind"] is not None and not startable(ticket, ticket["owner"]):
                         continue  # Both resume on their original worker.
                     if ticket["owner"] in failed_snapshots or not self._scope_admits(c, run_id, scope, ticket["owner"]):
                         continue

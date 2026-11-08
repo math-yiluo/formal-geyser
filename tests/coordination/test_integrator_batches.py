@@ -3,6 +3,7 @@
 import json
 import threading
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -22,6 +23,7 @@ from tests.coordination.test_collaborative_core import (
     start,
     worker_actor,
 )
+from tests.coordination.test_repository import contents, manifest
 from tests.coordination.test_verification_reuse import settle_tree
 
 
@@ -321,6 +323,11 @@ async def test_batch_publishes_one_commit_and_retains_each_independent_review(ba
         assert json.loads(publication["review_json"])["integrator_id"] == assignment["worker_id"]
         assert (await hub.artifact(publication["candidate_id"]))["status"] == "accepted"
     assert (await hub.worker(assignment["worker_id"]))["work_intention"] == "waiting"
+    # The ended batch lets its checkout go at once; its frozen snapshot and commit remain.
+    assert hub.integration_workspaces_due()
+    report = await hub.reclaim_integration_workspaces()
+    assert [item["state"] for item in report["workspaces"]] == ["reclaimed"]
+    assert not Path(batch["workspace"]).exists() and report["workspaces"][0]["commit"] == frozen["commit"]
 
 
 async def test_public_notes_batch_alone_and_never_mix_with_waiting_mathematics(batch_case):
@@ -413,3 +420,46 @@ async def test_an_acceptance_keeps_the_reviewers_integration_notes(batch_case):
     await command(hub, "review.accept", {**basis(reviewer), "integration_notes": NOTES}, actor)
     acceptance = await hub.db.call(lambda c: hub._review_acceptance(c, reviewer["task_id"]))
     assert acceptance["report"]["integration_notes"] == NOTES
+
+
+async def test_a_deferral_lets_its_checkout_go_to_be_recorded_and_reclaimed(batch_case):
+    hub, run, now = batch_case
+    await ready(hub, run, "Contribution waiting for a source page")
+    now[0] += BATCH_DELAY_MS
+    assignment = await choose(hub, run)
+    actor = worker_actor(assignment)
+
+    async def call(name, payload, *, actor=actor, suffix=""):
+        return await command(hub, name, payload, actor)
+
+    prepared = await hub.prepare_integration_batch(actor, call)
+    location = Path(prepared["workspace"])
+    (location / "Integrator-note.md").write_text("A link fixed while preparing.", encoding="utf-8")
+    report = await hub.reclaim_integration_workspaces()  # The open batch uses it.
+    assert location.is_dir() and report["workspaces"] == [] and not hub.integration_workspaces_due()
+    await command(hub, "integrator.defer", {"candidate_id": prepared["items"][0]["candidate_id"],
+                                            "reason": "Waiting for its source page."}, actor)
+    assert hub.integration_workspaces_due()
+    report = await hub.reclaim_integration_workspaces()
+    [item] = report["workspaces"]
+    assert item["state"] == "reclaimed_unfrozen" and not location.exists()
+    assert contents(hub.blobs, item["snapshot"])["Integrator-note.md"] == b"A link fixed while preparing."
+    events = [e for e in await hub.events(limit=1000) if e["kind"] == "integration.workspace_retention"]
+    assert events[-1]["payload"]["workspaces"][0]["snapshot"] == item["snapshot"]
+    assert (await hub.reclaim_integration_workspaces())["workspaces"] == []
+
+
+async def test_a_checkout_no_batch_or_round_recorded_is_reclaimed(batch_case):
+    hub, run, now = batch_case
+    await ready(hub, run, "Contribution")
+    now[0] += BATCH_DELAY_MS
+    assignment = await choose(hub, run)
+    repository = hub._repository()
+    # As a preparation let go before its round was recorded left it (Linux pilot, 2026-11-07).
+    orphan = hub.workspace(assignment["worker_id"]) / ".taskhub-integration" / uuid4().hex
+    repository.prepare(hub.blobs, manifest(hub.blobs, {"Orphan.md": b"left behind"}), repository.head(),
+                       orphan, ["Orphan.md"])
+    report = await hub.reclaim_integration_workspaces()
+    assert [item["state"] for item in report["workspaces"]] == ["reclaimed_unfrozen"]
+    assert not orphan.exists()
+    assert contents(hub.blobs, report["workspaces"][0]["snapshot"])["Orphan.md"] == b"left behind"

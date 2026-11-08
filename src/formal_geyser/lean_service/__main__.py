@@ -10,7 +10,8 @@ from pathlib import Path
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["serve", "supervise", "start", "stop", "restart", "status", "telemetry"])
+    parser.add_argument("command", choices=["serve", "supervise", "start", "stop", "restart", "status", "telemetry",
+                                            "compact"])
     parser.add_argument("--project", type=Path, default=Path.cwd())
     parser.add_argument("--hours", type=float, default=24.0)
     args = parser.parse_args(argv)
@@ -18,6 +19,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         from .server import serve
         return serve(root)
+    if args.command == "compact":
+        from .server import compact_store
+        return compact_store(root)
     if args.command == "supervise":
         from .server import supervise
         return supervise(root)

@@ -23,10 +23,24 @@ formalizectl --project PATH lean-service stop
 jobs are queued again and continue when it next starts. `python -m
 formal_geyser.lean_service COMMAND --project PATH` does the same.
 
+`python -m formal_geyser.lean_service compact --project PATH`, with the service stopped,
+rewrites `service.sqlite3` into a copy that keeps only what `result_days` keeps and gives
+freed pages back from then on, then puts it in place. A database made before 2026-11-08 never
+gave space back: in the Linux pilot it reached 79 GB. A plain `VACUUM` would need about that much
+free space; `compact` needs only the size of the copy. It holds the server's lock, so no service
+starts meanwhile; `start` afterwards.
+
 Its files are in `.task-based/lean-service/`: `service.sqlite3` (jobs, results, estimates,
 machine samples), `service.json` (address of the running server), `service.log`,
 `supervisor-events.jsonl`, `codex-home/` (the sandbox's Codex home) and `scratch/` (one
 directory per running job). Build slots and Lake caches stay in `.task-based/objects/lake/`.
+
+A check reads its sources, digests and scans them, syncs them into a build slot, and records
+and compares the slot's outputs: each pass covers the whole Library. The server runs these
+steps in `bookkeeping_processes` worker processes (8 by default; 0 runs them in its own
+threads). In the Linux pilot on 2026-11-03 that work, in the server's threads, held its one
+interpreter at 120-130% CPU while the machine was 80% idle: a check's Lake build took 3.5 s
+and the whole check 71 s, and development checks waited a median 15 minutes to start.
 
 Only local clients with its operator token can call it; the token is in the user's
 runtime directory, which sandboxed agents cannot read. The supervisor runs in a systemd user
@@ -57,8 +71,15 @@ session fails (`session_fallback`), use the ordinary build. Idle sessions close 
 
 An official check of the same content (environment, snapshot, modules, inspections and
 helper versions) is one job: a second request attaches to it, and a definitive result is
-reused for seven days. An unavailable result (a crash, a timeout, a missing tool) is not
-reused.
+reused for `result_days` (two by default). An unavailable result (a crash, a timeout, a missing
+tool) is not reused. Each reuse is counted with the result's age; `telemetry` reports them under
+`reuses`, the evidence for `result_days`. In the Linux pilot 17,350 of 125,000 checks in 14 days
+could be reused, and the 88 that ran again did so within a day of the first.
+
+A finished job keeps its result and its specification `result_days`, both compressed; then it
+keeps only its telemetry for 90 days. The database frees pages as it goes (incremental
+auto-vacuum): pruning, every hour, gives them back. Evidence is TaskHub's, not the service's:
+TaskHub records every result it accepts.
 
 Each result's `timings` gives the seconds of its steps: the environment probe, reading and
 hashing the sources, the heartbeat scan, the session check or the compilation, the inspections,
@@ -114,7 +135,20 @@ processes took 27%.
   ahead of development checks anyway: with many agents the development checks never run out,
   and the reviews and publications waiting for validations would otherwise starve. A job that
   resumes in the same decision counts for both.
-- Threads: the logical cores (or `threads`). Memory: what is available now, less
+- Threads: the logical cores (or `threads`). A build gets threads by its size, a single-file
+  check one or two, and after its build a job keeps one. A validation gets at most
+  `validation_threads` (4): Lake restores nearly all of its modules from the cache and compiles
+  the few a candidate changes. Until 2026-11-06 it got a thread for each module, up to all 32
+  of the Linux pilot, while of 5,236 validations in three days the median used 0.43 cores and
+  the most 7.3; one or two validations held the machine and over a hundred jobs waited. Once a
+  validation's build has run two minutes, it keeps only the cores its CPU used over the last
+  two minutes, rounded up, plus one: its Lake build cannot start more processes than it was
+  given, so this overcommits the machine by at most those few threads. Builds: at most
+  `build_slots` (8) at once, of every lane. Each holds a build slot with a full copy of the
+  Library's build (9.6 GB in the Linux pilot, where 13 builds at once filled the disk), so a
+  job whose build finds every slot held waits, first come first served, for one to free while
+  it keeps its place among the running jobs; a waiting validation keeps one thread after two
+  minutes, as it uses none. Memory: what is available now, less
   `reserve_gib`, less the room running jobs are still expected to grow by. A job's need is the
   measured peak of jobs on the same modules, with a margin and at least 1 GiB per Lean
   process (1.25 GiB committed): a higher peak raises it at once, a lower one lowers it a tenth
@@ -137,6 +171,27 @@ processes took 27%.
   and the job, if it was queued again, does not start a second run beside the first. A result
   the job gave stands: its processes were confirmed ended. `status` lists such cgroups under
   `cleanup`.
+- A job becomes running, with its threads, only together with the task of its run, once its
+  cgroup and scratch directory exist. A start that fails before then, as when the disk is full,
+  removes the cgroup it made and leaves the job queued, holding nothing; it is tried again after
+  one second, doubling to a minute, and other jobs start meanwhile. A job without its cgroup still
+  ends unavailable.
+- A job record the store cannot write (`database or disk is full`) is kept and written again every
+  second, each time with the job's fields as they are then, so a late write never sets a record
+  back. The job does not wait for it: it runs and ends, and clients waiting for it learn its end.
+  `status` gives the number of records still unwritten under `unwritten`; at a stop the service
+  tries them once more, and a job whose end was still unwritten is queued again at the next start.
+- Stopping a run (`_stopped`) and recording a job's end are carried out to their end even when the
+  job is cancelled again meanwhile, and a job left running or suspended whose run has ended
+  without ending it is stopped as a cancelled run is, at the next decision: queued again, or
+  ended if its client cancelled it or it was stopped for its memory. On 2026-11-05 seven jobs of
+  the Linux pilot stayed running with no run while its disk was full, and once space returned
+  no job started until the service was restarted.
+- A job's next process waits only while the job is suspended. A freeze that fails, even after
+  part of the job froze (its cgroup but not a session it borrows, say), is undone: everything
+  of the job is thawed and it runs on, and a later decision may suspend it again. If what froze
+  cannot be thawed either, the job's run is stopped and it is queued again. Before, a failed
+  freeze left the job running with its next process waiting for a resume that never came.
 
 ## TaskHub
 
@@ -184,6 +239,9 @@ critical_watermark_gib = 1.5 # below it a job is suspended
 per_owner = 2                # running jobs per worker within a class
 aging_minutes = 20
 validation_slots = 4         # waited-for validations that run ahead of development checks
+validation_threads = 4       # the most threads a validation starts with
+build_slots = 8              # the most Lake builds at once, each in a slot with a full Library build; 0: no limit
+bookkeeping_processes = 8    # worker processes for each check's file bookkeeping; 0: the server's threads
 sandbox = "codex"            # or "none"
 warm_gib = 6                 # library .olean pages kept resident
 validation_wait_seconds = 90 # a submission's wait before its validation continues in the background
@@ -192,6 +250,8 @@ session_idle_minutes = 10
 check_minutes = 30           # a development check is stopped after this long; 0: no limit
 validation_minutes = 60      # a validation is stopped after this long; 0: no limit
 process_memory_gib = 12      # a check one of whose Lean processes holds more is stopped; 0: no limit
+result_days = 2              # a finished job's result and specification are kept this long
+share_outputs_gib = 32       # idle build slots' identical outputs compared and shared each hour; 0: off
 ```
 
 ## Not in the service

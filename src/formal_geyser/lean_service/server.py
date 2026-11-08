@@ -185,6 +185,32 @@ def serve(root: Path) -> int:
         lock.release()
 
 
+def compact_store(root: Path) -> int:
+    """Rewrite the service's database small (store.compact), holding the server's own lock so that
+    no service runs meanwhile. Stop the service first (`stop`), which keeps its supervisor from
+    starting it again; `start` afterwards."""
+    from .store import compact
+
+    root = root.resolve()
+    state = state_directory(root)
+    path = state / "service.sqlite3"
+    if not path.is_file():
+        print("This project's Lean service has no database", file=sys.stderr)
+        return 2
+    try:
+        lock = portalocker.Lock(str(state / "serve.lock"), mode="a+b", timeout=0)
+        lock.acquire()
+    except portalocker.exceptions.LockException:
+        print("The Lean service runs: stop it first", file=sys.stderr)
+        return 3
+    try:
+        result = compact(path, result_days=load_config(root).lean_service.result_days)
+    finally:
+        lock.release()
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def supervise(root: Path) -> int:
     """Run the server and start it again whenever it exits, until asked to stop."""
     root = root.resolve()

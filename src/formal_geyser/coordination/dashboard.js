@@ -1728,14 +1728,15 @@ if (typeof document !== 'undefined') {
     line.classList.toggle('hidden', current.kind === 'dispatcher' || current.kind === 'waker');
     el('worker-backend-text').textContent = 'Backend: ' + backendName(now)
       + (own ? ' · ' + (own.model || 'default model') + ' · ' + own.effort + ' effort' : '')
-      + (requested ? ' · moves to ' + backendName(requested) + ' at its next new conversation' : '');
+      + (requested ? ' · moves to ' + backendName(requested) + ' at its next turn' : '');
     const switchable = (current.kind || 'ordinary') === 'ordinary' && current.work_intention !== 'retired' && current.state !== 'retired';
     button.classList.toggle('hidden', !switchable);
     if (!switchable) return;
     const target = requested ? now : now === 'claude' ? 'codex' : 'claude';
     button.textContent = requested ? 'Stay on ' + backendName(now) : 'Switch to ' + backendName(target);
     button.title = requested ? 'Cancels the requested switch.'
-      : 'Its current conversation continues on ' + backendName(now) + '; its next new conversation starts on ' + backendName(target) + '.';
+      : 'Its next turn continues its work in a new conversation on ' + backendName(target)
+        + ', once that account has a free session; it takes no further turn on ' + backendName(now) + '.';
     button.onclick = async () => {
       button.disabled = true;
       try { await command('worker.select_backend', {worker_id: current.id, backend: target}); await refresh(); }

@@ -16,6 +16,7 @@ from .content import TreeView, _path, _relative
 from .draft_paths import is_draft_path
 from .errors import HubError, WorkerWorkspaceError
 from .graph_paths import is_graph_path
+from .library_rest import at_rest, restore_workspace
 from .models import Role
 from .repository import RepositoryStore
 from .storage import canonical, collected, collected_thread_call, snapshot_identity
@@ -123,8 +124,18 @@ class RepositoryCoordination:
         except (ValueError, KeyError, TypeError) as error:
             raise HubError("WORKSPACE_CONFLICT", "Repair the readable .private/repository-refresh.json conflict report before refreshing") from error
 
+    def _restore_library_copy(self, worker_id):
+        """Write back the Library files a resting worker's workspace left out (library_rest), before
+        anything reads it; nothing for a workspace not at rest. Under its workspace lock, off the
+        coordination thread."""
+        written = restore_workspace(self.blobs, self.workspace(worker_id).resolve())
+        if written is not None:
+            logger.info("Restored the Library copy of worker %s: %d files", worker_id, written)
+
     def _refresh_repository_files(self, worker_id, base_commit, head):
-        """Three-way file refresh outside the SQLite executor; private edits survive."""
+        """Three-way file refresh outside the SQLite executor; private edits survive. A workspace at
+        rest gets its Library files back first, so the refresh sees it as it was."""
+        self._restore_library_copy(worker_id)
         repository = self._repository()
         report = self._repository_refresh_report(worker_id)
         resolved = set(report.get("resolved_paths", []))
@@ -242,9 +253,13 @@ class RepositoryCoordination:
 
     async def ensure_library_copy(self, worker_id):
         """Write the Library checkout of a worker that has none yet (a reviewer before its first
-        `lean_check`); the refresh report, or None when it already has one."""
-        if not self.config.repository.enabled or await self.db.read(lambda c: c.execute(
-                "SELECT 1 FROM repository_bases WHERE worker_id=?", (worker_id,)).fetchone()):
+        `lean_check`), or whose checkout is at rest; the refresh report, or None when it already
+        has one."""
+        if not self.config.repository.enabled:
+            return None
+        if await self.db.read(lambda c: c.execute(
+                "SELECT 1 FROM repository_bases WHERE worker_id=?", (worker_id,)).fetchone()) and not at_rest(
+                    self.workspace(worker_id).resolve()):
             return None
         return await self.refresh_repository_worker(worker_id)
 

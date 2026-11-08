@@ -38,6 +38,8 @@ PUBLIC_WIKI_DIRECTORY = "wiki"
 TASK_DIRECTORY = "tasks"
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+VIEWS_KEPT = 3  # Published Library views always kept, the current one among them (prune_public_views).
+VIEW_GRACE_SECONDS = 24 * 3600  # How long a superseded view stays for turns still reading it.
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,199}\Z")
 # Windows device names, with any extension: no portable name may be one.
 DEVICE_NAMES = re.compile(
@@ -737,6 +739,36 @@ class NativeContentStore:
                         self._views.clear()
                     self._views[commit] = (watched, identity, result)
             return result
+
+    def prune_public_views(self, *, now: float | None = None) -> list[str]:
+        """Remove published Library views superseded more than VIEW_GRACE_SECONDS ago, keeping the
+        current one and the VIEWS_KEPT newest; the commits removed. A view is only ever requested at
+        the repository head, and the repository and blob store can make any view again, so an old
+        one is a cache: in the Linux pilot 145 full views, 42.5 GB, none read after it was written,
+        grew about 12 GB a day. A turn still reading a path it was given in an older view finds it
+        gone after the grace period; its next turn is given the current one."""
+        now = time.time() if now is None else now
+        pointer = _path(self.library_root, "current.json")
+        if not _normal_path(pointer).exists():
+            return []
+        current = json.loads(_read(pointer)).get("commit")
+        views = sorted((path for path in _normal_path(self.library_root).iterdir()
+                        if _COMMIT.fullmatch(path.name) and path.is_dir() and not path.is_symlink()),
+                       key=lambda path: path.stat().st_mtime)
+        removed = []
+        for index, view in enumerate(views[:-VIEWS_KEPT]):
+            # The time it was superseded: when the next newer view was installed.
+            if view.name == current or now - views[index + 1].stat().st_mtime < VIEW_GRACE_SECONDS:
+                continue
+            temporary = _plain(self.library_root / f".native-content-{uuid4().hex}")
+            with self._locked():
+                if json.loads(_read(pointer)).get("commit") == view.name:
+                    continue
+                os.replace(view, _normal_path(temporary))
+                self._views.pop(view.name, None)
+            self._discard_temporary(temporary)
+            removed.append(view.name)
+        return removed
 
     def publish_current_view(self, view: PinnedPublicView,
                              *, expected_commit: str | None = None) -> Path:

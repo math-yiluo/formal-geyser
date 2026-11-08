@@ -29,9 +29,9 @@ subscription; API-key billing is refused.
 3. On claude.ai, keep **Settings > Usage > Usage credits** off. Fast mode and usage
    beyond the plan draw on those credits. Claude Code's fast mode is disabled for
    workers, and the runtime stops a turn as soon as it reports overage.
-4. Optional `project.toml` settings under `[claude]`: `model`, `effort`
-   (`low` to `max`, default `high`), `review_effort` and `integrator_effort` (a reviewer's
-   and the Integrator's effort where it differs; `[codex]` takes the same two), `allowed_domains` (hosts sandboxed commands may
+4. `project.toml` settings under `[claude]`: `model` and `effort` (`low` to `max`) of
+   workers on Claude, with no default: where Claude workers can start, a run starts only
+   once both are chosen here or in Project setup. Optional: `allowed_domains` (hosts sandboxed commands may
    reach; `["*"]` by default, which never includes local addresses), and `executable`
    (a Claude Code binary of the audited version instead of the bundled one).
 
@@ -62,20 +62,35 @@ missing, the extra not installed, no `claude.home`) is refused with the reason.
 ### Switching an existing worker
 
 `worker.select_backend` with `{"worker_id", "backend"}` (the dashboard's *Switch to …* on a
-worker's page) moves one worker to the other backend from its next new conversation: a new
-task, a rotation or a new batch. Its current conversation, and any it continues without
-rotating, even after an interruption, stays on its old backend. The move happens when that
-account can start a session (not held and, for a worker, not full); until then the request
-waits and the worker's page says so. A worker between conversations moves at once. Selecting
-its current backend cancels a waiting request. Reviewers, the Integrator and the Dispatcher
-run on Codex and do not switch.
+worker's page) moves one worker to the other backend. A worker between conversations moves at
+once, and so does one whose next turn is a message about no task in hand. A worker in a task
+moves at its next activation, without a further turn in its old conversation:
+
+- admission gives it a session on the new account, not the old one. It waits until that account
+  can start one (not held and, for a worker, not full); the old account's limit does not apply,
+  and its session counts toward the new account from admission;
+- that activation continues its task in a new conversation there, started from its handoff file
+  and a state file like a rotation (reason `backend`).
+
+It takes no further session on the old account, whatever that account's limit. Records bound
+to the old conversation make it wait until they settle: a parked interruption, which resumes in
+its own conversation, an unresolved message delivery, or an unfinished validation of a call made
+in it. A new task goes to it only when its new account has a free session, and starts it there.
+Only if the new account is held between admission and the activation does that one turn
+continue the old conversation, rather than opening a new one on the old account. Until it moves,
+the worker's page says the request waits. Selecting its current backend cancels a waiting
+request, for instance for a worker whose old conversation keeps it waiting. Reviewers, the
+Integrator and the Dispatcher run on Codex and do not switch.
 
 ### Models and effort by role
 
-`runtime.set_role_model` with `{"role": "worker" | "review", "backend", "model", "effort",
-"apply_to_existing"}` chooses the model and effort for conversations that begin later: workers
-on Codex and on Claude separately, reviewers with the Integrator on Codex. `null` for both
-returns a role to the project's `model` and `effort` (`review_effort`, `integrator_effort`).
+`runtime.set_role_model` with `{"role": "worker" | "review" | "integrator", "backend", "model",
+"effort", "apply_to_existing"}` chooses the model and effort for conversations that begin later:
+workers on Codex and on Claude separately, reviewers and the Integrator on Codex, each its own.
+`null` for both returns a role to what project.toml chooses for it (`[codex]` or `[claude]`
+`model` and `effort` for workers, `[reviewers]` and `[integrator]` for the others, whose effort
+may also be the older `review_effort` and `integrator_effort`). No role takes another's, and
+none has a default: a run starts only once each has both.
 Without `"apply_to_existing": true` (the dashboard's *Also existing* box, unticked by default)
 a change reaches only workers created afterwards, and workers that move to that backend later:
 each worker of that role on that backend keeps, for its new conversations, the model and effort
@@ -84,8 +99,11 @@ worker's next new conversation starts with the choice. `role_models` reports, pe
 backend, how many existing workers keep earlier choices (`kept_by_existing`). A conversation
 records the model and effort it began with and keeps them while it continues, after an
 interruption too; one bound before this was recorded keeps the project's. The Dispatcher's
-model is `runtime.set_decision_model`. `GET /v1/runtime/backend` reports all of them
-(`role_models`, `decision_model`), and the dashboard's Project settings edit them.
+model is `runtime.set_decision_model`, the Waker's `runtime.set_waker_model`, and the answer
+deadline `runtime.set_answer_deadline`. `GET /v1/runtime/backend` reports all of them
+(`role_models`, `decision_model`, `waker_model`, `answer_deadline`) and what is still to choose
+(`missing_choices`), and the dashboard's Project settings edit them, before the first run too
+([Project setup](project-setup.md)).
 
 ### The assignment plan
 

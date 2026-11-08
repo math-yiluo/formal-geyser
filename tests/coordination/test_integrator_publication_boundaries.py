@@ -197,7 +197,11 @@ async def test_deferral_rebuilds_without_isolated_candidate_bytes(batch_case):
     )
     rebuilt = await prepare(hub, assignment)
     assert rebuilt["workspace"] != original["workspace"]
-    assert Path(original["workspace"]).is_dir()
+    # The deferral let the first checkout go: the rebuild's preparation recorded and removed it.
+    assert not Path(original["workspace"]).exists()
+    retention = [e["payload"] for e in await hub.events(limit=1000) if e["kind"] == "integration.workspace_retention"]
+    assert [(w["workspace"], w["state"]) for w in retention[-1]["workspaces"]] == [
+        (original["workspace"], "reclaimed_unfrozen")]
     assert all(not (Path(rebuilt["workspace"]) / p).exists() for p in apaths)
     await validate(hub, assignment)
     await submit(hub, assignment)

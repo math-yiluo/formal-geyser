@@ -8,9 +8,12 @@ the new conversations of workers that already exist only when the operator appli
 existing workers; otherwise each of those keeps, for its new conversations on that backend,
 what they started with until then (worker_kept_models). A conversation keeps the
 backend, model and effort it began with for as long as it is continued, after an interruption
-too. A worker moves to its requested backend when its next new conversation begins (a new
-task, a rotation, a new batch) and that account can start a session; until then the request
-waits.
+too. A worker that asked to move to the other backend is admitted only on that account: its
+next session waits for a free, unheld session there, and that activation continues its task in
+a new conversation on it (a rotation, reason `backend`), not first in its old conversation.
+While records bound to the old conversation are unsettled (_switch_blocked) it waits; it never
+takes another session on the account it leaves. A worker between conversations moves at once,
+and a new task is given to a worker that waits to move only when its new account has a session.
 
 No role takes another's model or effort, and none has a default: each is chosen in project.toml
 or by the operator, and a run starts only once every role has both (Hub._require_choices).
@@ -70,6 +73,15 @@ ROLE_EFFORT_KEYS = {"review": "review_effort", "integrator": "integrator_effort"
 CODEX_EFFORT = re.compile(r"[a-z]{1,20}")
 # Admission reads the session limits many times a second; a change applies within this.
 LIMITS_SECONDS = 2.0
+# The account a live session of worker `w` counts toward: its worker's, except while the
+# admission that moves it to its requested backend has prepared that move (a ready or started
+# rotation for it, `_prepare_backend_switch`): then the requested one. The first condition is
+# the one_live_rotation index's own, so the lookup uses it.
+SESSION_BACKEND = (
+    "CASE WHEN EXISTS(SELECT 1 FROM rotations r WHERE r.worker_id=w.id AND r.state IN ('requested','ready','started') "
+    "AND r.state<>'requested' AND r.reason='backend') "
+    "THEN COALESCE((SELECT q.backend FROM worker_backend_requests q WHERE q.worker_id=w.id),w.backend) "
+    "ELSE w.backend END")
 
 
 def bound_settings(worker: dict) -> dict | None:
@@ -102,6 +114,11 @@ class SessionSettings:
         _normalize_worker_fields: Any
         _dispatch_holds: Any
         _backend_full: Any
+        _rotation_blocked: Any
+        _live_rotation: Any
+        _end_rotation: Any
+        _ready_rotation: Any
+        _release_conversation: Any
 
     _session_limits: tuple[float, dict[str, int]] | None = None
 
@@ -189,6 +206,20 @@ class SessionSettings:
             return {"backend": worker["backend"], "kind": worker["kind"], **settings, "new": bound is None}
         return await self.db.read(read)
 
+    def _counted_backend(self, c, worker_id: str) -> str | None:
+        """The account the worker's live session counts toward (SESSION_BACKEND); None without one."""
+        row = c.execute("SELECT " + SESSION_BACKEND + " FROM attempts a JOIN workers w ON w.id=a.worker_id "
+                        "WHERE w.id=? AND a.ended_at IS NULL LIMIT 1", (worker_id,)).fetchone()
+        return row[0] if row else None
+
+    def _switch_possible(self, c, worker_id: str, target: str, kind: str) -> bool:
+        """Whether the worker can start a session on `target` now: not held and, for a worker,
+        not full (its own live session counted there already counts as admitted)."""
+        if target in self._dispatch_holds(c):
+            return False
+        return kind != "ordinary" or not self._backend_full(
+            c, target, admitted=self._counted_backend(c, worker_id) == target)
+
     def _adopt_requested_backend(self, c, worker_id: str) -> None:
         """A worker about to begin a new conversation moves to its requested backend when that
         account can start a session now (not held; for a worker, not full)."""
@@ -198,12 +229,59 @@ class SessionSettings:
             return
         target = row["backend"]
         if target != row["current"]:
-            if target in self._dispatch_holds(c) or (row["kind"] == "ordinary" and self._backend_full(c, target)):
+            if not self._switch_possible(c, worker_id, target, row["kind"]):
                 return
             c.execute("UPDATE workers SET backend=? WHERE id=?", (target, worker_id))
             self._event(c, "worker.backend_switched", worker_id, {"from": row["current"], "to": target},
                         worker_id=worker_id)
         c.execute("DELETE FROM worker_backend_requests WHERE worker_id=?", (worker_id,))
+
+    def _switch_blocked(self, c, worker) -> str | None:
+        """What keeps a worker that asked to move in its current conversation, and so on its
+        backend, for now: a parked interruption, which resumes in its own conversation; recovery;
+        or records bound to the conversation that must settle first (_rotation_blocked)."""
+        if not worker["thread_id"]:
+            return None
+        if worker["state"] == "recovery_required":
+            return "recovery_required"
+        if c.execute("SELECT 1 FROM interruption_checkpoints WHERE worker_id=? AND state='parked'",
+                     (worker["id"],)).fetchone():
+            return "interruption"
+        return self._rotation_blocked(c, worker)
+
+    def _admission_backend(self, c, worker_id: str, kind: str | None, backend: str) -> str | None:
+        """The account an ordinary worker's next session needs: the backend it asked to move to,
+        else its own. A worker waiting to move never takes a session on the account it leaves:
+        while its current conversation keeps it there (_switch_blocked) it waits (None), and it
+        moves once that settles. In the Linux pilot 543 Codex workers asked to move to Claude; one
+        admitted on Codex because a validation in its conversation was still open ran there."""
+        if kind != "ordinary":
+            return backend
+        row = c.execute("SELECT backend FROM worker_backend_requests WHERE worker_id=?", (worker_id,)).fetchone()
+        if row is None or row["backend"] == backend:
+            return backend
+        return None if self._switch_blocked(c, self._get(c, "workers", worker_id)) else row["backend"]
+
+    def _prepare_backend_switch(self, c, worker_id: str, attempt_id: str) -> None:
+        """Admission of a worker that moves: it moves now when there is no conversation to
+        continue (none bound, or a message turn about no task in hand); else this activation
+        continues its task in a new conversation there, the runner releasing the old one after
+        writing its state file (Rotation.rotation_due returns this ready rotation). From here its
+        session counts toward the new account (SESSION_BACKEND)."""
+        worker, attempt = self._get(c, "workers", worker_id), self._get(c, "attempts", attempt_id)
+        if not worker["thread_id"]:
+            self._adopt_requested_backend(c, worker_id)
+            return
+        if attempt["execution_mode"] == "message_only":
+            self._release_conversation(c, worker_id, "backend_switch")
+            return
+        live = self._live_rotation(c, worker_id)
+        if live is not None:
+            if (live["state"] == "ready" and live["reason"] == "backend" and live["thread_id"] == worker["thread_id"]
+                    and live["task_id"] == attempt["task_id"]):
+                return
+            self._end_rotation(c, live["id"], "backend")
+        self._ready_rotation(c, worker, attempt, "backend")
 
     def _session_settings_command(self, c, name: str, p: dict, actor: Actor):
         self._role(actor, Role.OPERATOR)

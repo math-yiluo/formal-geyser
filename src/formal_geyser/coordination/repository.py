@@ -870,27 +870,32 @@ class RepositoryStore:
             return result
 
     def prune_integration_workspace(self, workspace: Path, blobs: BlobStore) -> dict[str, Any]:
-        """Remove only a finalized, unchanged owned checkout; retain its evidence.
+        """Remove an owned checkout that no open batch uses; its exact files stay recorded.
+
+        A frozen checkout still equal to its frozen snapshot needs nothing more: that snapshot
+        and its commit live outside it. Any other one, never frozen, changed after freezing, or
+        left part-way through preparation when its batch was deferred, recovered, emptied or
+        cancelled, is first read in full into an exact snapshot that the session receipt
+        records, and only then removed. In the Linux pilot such checkouts were kept for good:
+        40 of them, about 10 GB, on 2026-11-07. A checkout holding what a snapshot leaves out
+        (private files, drafts, graphs, build directories) is kept, and so is a linked one.
 
         Only the session record is read and updated under the checkout's lock. The walk, the
-        snapshot that shows the checkout unchanged and the removal touch that ended checkout
-        alone: under the repository lock they took over 30 seconds once other threads kept
-        the interpreter busy, and worker checkouts waiting for the lock failed (Linux pilot).
+        snapshot and the removal touch that ended checkout alone: under the repository lock
+        they took over 30 seconds once other threads kept the interpreter busy, and worker
+        checkouts waiting for the lock failed (Linux pilot).
         """
         workspace, metadata = self._session_path(workspace)
         if not workspace.exists():
             return {"workspace": str(workspace), "state": "already_absent", "bytes": 0}
         with self._session_locked(metadata):
             self._owned()
-            receipt = self._read_json(metadata)
-            if receipt.get("workspace") != str(workspace) or receipt.get("repository") != str(self.path):
+            session = self._read_json(metadata)
+            if session.get("workspace") != str(workspace) or session.get("repository") != str(self.path):
                 raise RepositoryError("Refusing to prune an unowned integration workspace")
             if not workspace.exists():
                 return {"workspace": str(workspace), "state": "already_absent", "bytes": 0}
-            _, _, session = self._session(workspace)
         final = session.get("final")
-        if final is None:
-            return {"workspace": str(workspace), "state": "retained_unfrozen", "bytes": 0}
         total = 0
         for base, directories, names in os.walk(workspace, followlinks=False):
             for name in [*directories, *names]:
@@ -902,14 +907,21 @@ class RepositoryStore:
                     return {"workspace": str(workspace), "state": "retained_extra_files", "bytes": 0}
                 if path.is_file():
                     total += path.stat().st_size
-        # Only a checkout read in full is known to be unchanged before it is removed.
+        # Read in full: an exact snapshot stores every file the checkout holds (all but .git, whose
+        # frozen objects the repository already has) before any of it is removed.
         snapshot = blobs.snapshot(workspace, max_files=self.max_files, max_bytes=self.max_bytes, exact=True)
-        if snapshot != final["snapshot"]:
-            return {"workspace": str(workspace), "state": "retained_modified", "bytes": 0}
-        # The immutable snapshot and commit already live outside this checkout.
+        if final is not None and snapshot == final["snapshot"]:
+            # The immutable snapshot and commit already live outside this checkout.
+            record = {"workspace": str(workspace), "state": "reclaimed", "bytes": total,
+                      "snapshot": snapshot, "commit": final["commit"]}
+        else:
+            # Its working files exist only here: the receipt keeps their snapshot.
+            record = {"workspace": str(workspace), "bytes": total, "snapshot": snapshot,
+                      "state": "reclaimed_unfrozen" if final is None else "reclaimed_modified",
+                      "phase": session.get("phase")}
+            if final is not None:
+                record["commit"] = final["commit"]
         # Keep the session receipt, including the pruning record, for recovery.
-        record = {"workspace": str(workspace), "state": "reclaimed", "bytes": total,
-                  "snapshot": snapshot, "commit": final["commit"]}
         with self._session_locked(metadata):
             if self._read_json(metadata) != session:
                 return {"workspace": str(workspace), "state": "retained_modified", "bytes": 0}

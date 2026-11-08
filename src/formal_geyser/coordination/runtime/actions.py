@@ -136,11 +136,12 @@ def validate_gateway(name: str, arguments: object) -> dict[str, Any]:
 
 
 def _type(schema: dict[str, Any]) -> str:
-    """A field's type; a small object shows its fields, one level deep."""
+    """A field's type; a small object (a pause predicate's seven fields, say) shows its fields,
+    one level deep."""
     if "enum" in schema:
         return "|".join(str(value) for value in schema["enum"])
     fields = schema.get("properties")
-    if isinstance(fields, dict) and 0 < len(fields) <= 6:
+    if isinstance(fields, dict) and 0 < len(fields) <= 7:
         required = schema.get("required", [])
         return "{" + ", ".join(name if name in required else f"[{name}]" for name in fields) + "}"
     kind = schema.get("type", "value")

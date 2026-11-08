@@ -153,3 +153,35 @@ async def test_the_driver_reclaims_in_the_background_one_pass_at_a_time():
     release.set()
     await first
     assert driver.stop() == [first]
+
+
+async def test_the_driver_reclaims_integration_checkouts_as_soon_as_a_batch_lets_one_go():
+    release, passes = asyncio.Event(), []
+
+    class Hub:
+        due = False
+
+        def integration_workspaces_due(self):
+            return self.due
+
+        async def reclaim_integration_workspaces(self):
+            passes.append(1)
+            self.due = False
+            await release.wait()
+            return {"workspaces": [{"workspace": "w", "state": "reclaimed_unfrozen", "bytes": 1}],
+                    "reclaimed_bytes": 1, "remaining": 0}
+
+    fake = Hub()
+    driver = RunDriver(fake, make_runner=lambda *args: None, resume_runs=False)
+    driver._reclaim_integration()
+    assert driver.integration_reclaim_task is None  # Nothing let go, and not ten minutes yet.
+    fake.due = True
+    driver._reclaim_integration()
+    first = driver.integration_reclaim_task
+    await asyncio.sleep(0)
+    fake.due = True
+    driver._reclaim_integration()  # A pass still runs: no second one.
+    assert driver.integration_reclaim_task is first and passes == [1]
+    release.set()
+    await first
+    assert first in driver.stop()

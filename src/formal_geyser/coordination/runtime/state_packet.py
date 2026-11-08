@@ -14,7 +14,8 @@ from .handoff import TASK_DIRECTORY, HandoffCheck
 
 REASONS = {"idle": "the conversation had been idle", "context": "the conversation's context grew large",
            "instructions": "your standing instructions changed",
-           "handoff": "an earlier conversation ended and left your handoff file"}
+           "handoff": "an earlier conversation ended and left your handoff file",
+           "backend": "you moved to another model backend, as the operator asked"}
 
 
 def state_path(task_id: str) -> str:
@@ -36,6 +37,8 @@ def wait_text(predicate: dict[str, Any]) -> str:
     parts += [f"a change to task `{item['task_id']}` that meets: {item['need']}"
               for item in predicate.get("subscriptions", [])]
     parts += [f"the machine validation of `{artifact}`" for artifact in predicate.get("validations", [])]
+    parts += [f"the outcome of candidate `{candidate}`: published, rejected, deferred or withdrawn"
+              for candidate in predicate.get("publications", [])]
     parts += [f"the answer to your question `{question}`" for question in predicate.get("answers", [])]
     if predicate.get("external_response_id"):
         parts.append(f"the answer to request `{predicate['external_response_id']}`")

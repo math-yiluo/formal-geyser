@@ -1,16 +1,26 @@
 """The Lean service's own records: jobs and their results, estimates and machine samples.
 
 Jobs survive the service: one queued, running or suspended when the service stops is queued
-again when it starts. Results of official checks are kept for reuse by content; telemetry
-(queue time, running time, CPU time, peak memory, machine samples) is kept for tuning and
-long-term evaluation.
+again when it starts. Results of finished jobs are kept `[lean_service] result_days` for their
+callers and for reuse by content; then a job keeps only its telemetry (queue time, running time,
+CPU time, peak memory) for TELEMETRY_DAYS, as machine samples and reuses are, for tuning and
+long-term evaluation. Evidence is TaskHub's: it records every result it accepts.
+
+The Linux pilot kept results seven days, uncompressed, and its database never gave space back:
+it reached 79 GB, 0.7 GB of it free, growing about 10 GB a day. Of 125,000 checks there in 14
+days, 17,350 could be reused by content; 88 ran again, every one within a day of the first. So
+results are kept two days by default and compressed, an expired job also drops its
+specification, new databases free their pages as they go (incremental auto-vacuum), and
+`compact` rewrites an existing one, with the service stopped, into a small copy that does.
 """
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
+import zlib
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -65,17 +75,83 @@ CREATE TABLE IF NOT EXISTS machine_samples(
   queued INTEGER NOT NULL,
   suspended INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reuses(
+  at REAL NOT NULL,
+  job_id TEXT NOT NULL,
+  lane TEXT NOT NULL,
+  age_seconds REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS reuses_at ON reuses(at);
 """
-RESULT_DAYS = 7  # Results of finished jobs, for reuse and for late readers.
+RESULT_DAYS = 2.0  # The default of [lean_service] result_days.
 TELEMETRY_DAYS = 90
+PRUNE_ROWS = 500  # Jobs expired in one transaction: the lock is let go between them.
+VACUUM_PAGES = 25_000  # Free pages given back in one transaction (about 100 MB).
+# A JSON column written since 2026-11-08 holds its text compressed, after this prefix. One written
+# before holds the text itself; both are read.
+PACKED = b"z1"
+
+
+def pack(text: str) -> bytes:
+    return PACKED + zlib.compress(text.encode("utf-8"), 6)
+
+
+def unpack(value: Any) -> str | None:
+    """The text of a stored JSON column: compressed, as pack writes it, or plain."""
+    if isinstance(value, bytes):
+        return (zlib.decompress(value[len(PACKED):]) if value.startswith(PACKED) else value).decode("utf-8")
+    return value
+
+
+def _decoded(row: dict[str, Any]) -> dict[str, Any]:
+    for name in ("spec_json", "result_json"):
+        if name in row:
+            row[name] = unpack(row[name])
+    return row
+
+
+def _prune(db: sqlite3.Connection, now: float, result_days: float, lock: threading.Lock | None = None) -> dict[str, int]:
+    """Expire finished jobs past `result_days` (their result and specification), delete what is past
+    TELEMETRY_DAYS, then give the freed pages back if the database frees them as it goes; the
+    counts. `lock`, when given, is held for one bounded step at a time."""
+    hold = lock or threading.Lock()
+    expired = 0
+    while True:
+        with hold:
+            count = db.execute(
+                "UPDATE jobs SET result_json=NULL,spec_json='' WHERE rowid IN (SELECT rowid FROM jobs "
+                "WHERE finished_at<? AND state='done' AND (result_json IS NOT NULL OR length(spec_json)>0) LIMIT ?)",
+                (now - result_days * 86400, PRUNE_ROWS)).rowcount
+        expired += count
+        if count < PRUNE_ROWS:
+            break
+    with hold:
+        deleted = db.execute("DELETE FROM jobs WHERE finished_at<?", (now - TELEMETRY_DAYS * 86400,)).rowcount
+        db.execute("DELETE FROM machine_samples WHERE at<?", (now - TELEMETRY_DAYS * 86400,))
+        db.execute("DELETE FROM reuses WHERE at<?", (now - TELEMETRY_DAYS * 86400,))
+        incremental = db.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+    freed = 0
+    while incremental:
+        with hold:
+            free = db.execute("PRAGMA freelist_count").fetchone()[0]
+            if not free:
+                break
+            # Each row of the pragma frees one page: it runs only as far as it is read.
+            db.execute(f"PRAGMA incremental_vacuum({min(free, VACUUM_PAGES)})").fetchall()
+        freed += min(free, VACUUM_PAGES)
+    return {"expired": expired, "deleted": deleted, "pages_freed": freed}
 
 
 class Store:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, result_days: float = RESULT_DAYS):
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.result_days = result_days
         self._lock = threading.Lock()
         self._db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
         self._db.row_factory = sqlite3.Row
+        if not self._db.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone():
+            # Only a database without tables yet takes it; `compact` gives it to an existing one.
+            self._db.execute("PRAGMA auto_vacuum=INCREMENTAL")
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript(SCHEMA)
@@ -86,12 +162,14 @@ class Store:
 
     def _rows(self, sql: str, args=()) -> list[dict[str, Any]]:
         with self._lock:
-            return [dict(row) for row in self._db.execute(sql, args).fetchall()]
+            return [_decoded(dict(row)) for row in self._db.execute(sql, args).fetchall()]
 
     def insert(self, row: dict[str, Any]) -> None:
-        names = ",".join(row)
+        stored = {**row, **({"spec_json": pack(row["spec_json"])} if isinstance(row.get("spec_json"), str) else {})}
+        names = ",".join(stored)
         with self._lock:
-            self._db.execute(f"INSERT INTO jobs({names}) VALUES({','.join('?' * len(row))})", tuple(row.values()))
+            self._db.execute(f"INSERT INTO jobs({names}) VALUES({','.join('?' * len(stored))})",
+                             tuple(stored.values()))
 
     def update(self, job_id: str, **fields: Any) -> None:
         with self._lock:
@@ -107,7 +185,10 @@ class Store:
     def _update(self, job_id: str, fields: dict[str, Any]) -> None:
         if "result" in fields:
             result = fields.pop("result")
-            fields["result_json"] = None if result is None else json.dumps(result)
+            fields["result_json"] = None if result is None else pack(json.dumps(result))
+        for name in ("spec_json", "result_json"):
+            if isinstance(fields.get(name), str):
+                fields[name] = pack(fields[name])
         assignments = ",".join(f"{name}=?" for name in fields)
         self._db.execute(f"UPDATE jobs SET {assignments} WHERE id=?", (*fields.values(), job_id))
 
@@ -118,11 +199,23 @@ class Store:
     def live(self) -> list[dict[str, Any]]:
         return self._rows("SELECT * FROM jobs WHERE state IN ('queued','running','suspended') ORDER BY submitted_at,id")
 
-    def reusable(self, content_key: str, since: float) -> dict[str, Any] | None:
+    def reusable(self, content_key: str, since: float | None = None) -> dict[str, Any] | None:
+        """The latest definitive completed result of this content still kept (finished since `since`,
+        by default within result_days); each reuse is counted, with the result's age."""
+        now = time.time()
         rows = self._rows("SELECT * FROM jobs WHERE content_key=? AND state='done' AND outcome='completed' "
                           "AND definitive=1 AND finished_at>=? AND result_json IS NOT NULL "
-                          "ORDER BY finished_at DESC LIMIT 1", (content_key, since))
-        return rows[0] if rows else None
+                          "ORDER BY finished_at DESC LIMIT 1",
+                          (content_key, now - self.result_days * 86400 if since is None else since))
+        if not rows:
+            return None
+        try:
+            with self._lock:
+                self._db.execute("INSERT INTO reuses(at,job_id,lane,age_seconds) VALUES(?,?,?,?)",
+                                 (now, rows[0]["id"], rows[0]["lane"], max(0.0, now - rows[0]["finished_at"])))
+        except sqlite3.Error:
+            pass  # Only a count: a full disk, say, must not cost the reuse.
+        return rows[0]
 
     def estimate(self, key: str) -> dict[str, Any] | None:
         rows = self._rows("SELECT * FROM estimates WHERE key=?", (key,))
@@ -147,12 +240,8 @@ class Store:
             self._db.execute(f"INSERT OR REPLACE INTO machine_samples({names}) VALUES({','.join('?' * len(fields))})",
                              tuple(fields.values()))
 
-    def prune(self, now: float) -> None:
-        with self._lock:
-            self._db.execute("UPDATE jobs SET result_json=NULL WHERE finished_at<? AND result_json IS NOT NULL",
-                             (now - RESULT_DAYS * 86400,))
-            self._db.execute("DELETE FROM jobs WHERE finished_at<?", (now - TELEMETRY_DAYS * 86400,))
-            self._db.execute("DELETE FROM machine_samples WHERE at<?", (now - TELEMETRY_DAYS * 86400,))
+    def prune(self, now: float) -> dict[str, int]:
+        return _prune(self._db, now, self.result_days, self._lock)
 
     def telemetry(self, since: float) -> dict[str, Any]:
         """Per lane: jobs, queue and running time, CPU time and peak memory; the machine's load."""
@@ -182,4 +271,43 @@ class Store:
         machine = self._rows("SELECT count(*) AS samples,avg(cpu_busy) AS cpu_busy,min(memory_available) AS "
                              "memory_available_min,avg(threads_in_use) AS threads_in_use,max(queued) AS queued_max "
                              "FROM machine_samples WHERE at>=?", (since,))[0]
-        return {"since": since, "lanes": lanes, "machine": machine}
+        # How old a result was when it was reused: what result_days should cover.
+        ages = sorted(row["age_seconds"] for row in self._rows("SELECT age_seconds FROM reuses WHERE at>=?", (since,)))
+        reuses = {"count": len(ages), "result_days": self.result_days,
+                  **({"age_hours_p50": ages[len(ages) // 2] / 3600,
+                      "age_hours_p95": ages[min(len(ages) - 1, int(len(ages) * 0.95))] / 3600,
+                      "age_hours_max": ages[-1] / 3600} if ages else {})}
+        return {"since": since, "lanes": lanes, "machine": machine, "reuses": reuses}
+
+
+def compact(path: Path, *, result_days: float = RESULT_DAYS, now: float | None = None) -> dict[str, Any]:
+    """Rewrite the database at `path`, with the service stopped, into a copy that keeps only what
+    `result_days` keeps and gives freed pages back as it goes (incremental auto-vacuum), then put
+    it in place. A plain VACUUM needs about as much free space as the file; this needs only the
+    size of the copy. The bytes before and after."""
+    path = Path(path)
+    before = path.stat().st_size + sum(
+        (path.with_name(path.name + suffix).stat().st_size for suffix in ("-wal", "-shm")
+         if path.with_name(path.name + suffix).exists()), 0)
+    copy = path.with_name(path.name + ".compact")
+    copy.unlink(missing_ok=True)
+    db = sqlite3.connect(str(path), isolation_level=None)
+    try:
+        counts = _prune(db, time.time() if now is None else now, result_days)
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        db.execute("PRAGMA auto_vacuum=INCREMENTAL")  # VACUUM INTO writes the copy with it.
+        db.execute("VACUUM INTO ?", (str(copy),))
+    finally:
+        db.close()
+    check = sqlite3.connect(str(copy))
+    try:
+        if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise sqlite3.DatabaseError("The compacted copy failed its integrity check; the original is unchanged")
+        if check.execute("PRAGMA auto_vacuum").fetchone()[0] != 2:
+            raise sqlite3.DatabaseError("The compacted copy does not free pages as it goes; the original is unchanged")
+    finally:
+        check.close()
+    for suffix in ("-wal", "-shm"):
+        path.with_name(path.name + suffix).unlink(missing_ok=True)
+    os.replace(copy, path)
+    return {**counts, "bytes_before": before, "bytes_after": path.stat().st_size}

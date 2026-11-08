@@ -8,10 +8,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, cast
+from uuid import uuid4
 
 import portalocker
 
@@ -24,6 +27,7 @@ from .content import (
     _hash,
     _normal_path,
     _path,
+    _plain,
     _read,
     _sha,
 )
@@ -35,6 +39,9 @@ from .snapshot_limits import MAX_SNAPSHOT_BYTES
 from .storage import canonical, digest
 
 GRAPH_FILES = ("definitions.json", "proofs.json")
+REVISIONS_KEPT = 200  # The newest shared DAG revisions always kept (DagFiles.prune).
+REVISION_DAYS = 7  # Older revisions stay this long, as merge bases for updates read from them.
+_REVISION = re.compile(r"revision-(\d+)-[0-9a-f]{64}")
 CHECKER_PATH = ".private/taskhub-reference/check_dags.py"
 
 
@@ -133,6 +140,28 @@ class DagFiles:
         with self._installation_lock():
             view = self.content._tree(_path(self.root, f"revision-{revision}-{key}"), files, metadata)
         return self.reference(revision, key, view.manifest_sha256)
+
+    def prune(self, head_revision: int, *, now: float | None = None) -> int:
+        """Remove revisions no update can still merge from: below the REVISIONS_KEPT newest and older
+        than REVISION_DAYS. Revision 0, the original pair, stays. An update made from a removed
+        revision is refused as a revision conflict, to be read again and merged. In the Linux pilot
+        2,630 revisions, each a full copy of the pair, held 8.7 GB; about 125 were made a day."""
+        now = time.time() if now is None else now
+        removed = 0
+        with self._installation_lock():
+            for directory in list(_normal_path(self.root).iterdir()):
+                match = _REVISION.fullmatch(directory.name)
+                if match is None or not directory.is_dir() or directory.is_symlink():
+                    continue
+                revision = int(match.group(1))
+                if (revision == 0 or revision > head_revision - REVISIONS_KEPT
+                        or now - directory.stat().st_mtime < REVISION_DAYS * 86400):
+                    continue
+                temporary = _plain(self.root / f".native-content-{uuid4().hex}")
+                os.replace(directory, _normal_path(temporary))
+                self.content._discard_temporary(temporary)
+                removed += 1
+        return removed
 
     @contextmanager
     def _installation_lock(self):
@@ -309,6 +338,10 @@ class SharedDags:
                 files = merge_dag_files(base_files, current_files, files)
             reference = self.dag_files.install(head["revision"] + 1, files, summary=p["summary"],
                 worker_id=worker["id"], worker_name=worker["display_name"], task_id=task["id"])
+            try:
+                self.dag_files.prune(reference["revision"])
+            except (OSError, ValueError):  # ContentError is a ValueError; the next update retries.
+                pass
             return PreparedDagUpdate(reference)
 
         try:
