@@ -94,6 +94,38 @@ def test_an_exact_snapshot_reads_every_file(tmp_path, monkeypatch):
     assert exact != first and store.snapshot(source) == exact  # What it read is remembered.
 
 
+def test_remembered_files_are_bounded_over_all_workspaces_and_share_their_paths(tmp_path, monkeypatch):
+    # On the pilot on 2026-11-09 each of up to 256 remembered workspaces held the Library's
+    # 42,700 files, about 21 MB each, and TaskHub grew to 11.8 GiB.
+    from formal_geyser.coordination import storage
+
+    monkeypatch.setattr(storage, "SNAPSHOT_SETTLED_NANOSECONDS", 0)
+    monkeypatch.setattr(storage, "SNAPSHOT_CACHED_FILES", 5)
+    store = BlobStore(tmp_path / "objects")
+    workspaces = []
+    for name in ("one", "two", "three"):
+        work = tmp_path / name
+        work.mkdir()
+        for file in ("a.lean", "b.lean"):
+            (work / file).write_text(name + file, encoding="utf-8")
+        store.snapshot(work)
+        workspaces.append(work)
+    # Six files would pass five: the least recently snapshotted workspace is forgotten.
+    assert len(store.known_hashes(workspaces[0])) == 0
+    two, three = store.known_hashes(workspaces[1]), store.known_hashes(workspaces[2])
+    assert len(two) == len(three) == 2 and store._cached_files == 4
+    identity, sha = three["a.lean"]
+    assert identity == storage.snapshot_identity((workspaces[2] / "a.lean").stat())
+    assert sha == store.put(b"threea.lean")
+    assert next(name for name in store._file_hashes[str(workspaces[1].resolve())] if name == "a.lean") is next(
+        name for name in store._file_hashes[str(workspaces[2].resolve())] if name == "a.lean")
+    # A workspace whose files are about to go is not remembered, nor kept from before.
+    store.snapshot(workspaces[1], exact=True, remember=False)
+    assert len(store.known_hashes(workspaces[1])) == 0 and store._cached_files == 2
+    store.forget(workspaces[2])
+    assert len(store.known_hashes(workspaces[2])) == 0 and store._cached_files == 0
+
+
 def test_a_snapshot_still_refuses_links(tmp_path):
     store = BlobStore(tmp_path / "objects")
     source = tmp_path / "source"

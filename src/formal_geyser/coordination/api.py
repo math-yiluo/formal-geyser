@@ -19,6 +19,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from .. import allocator
 from .errors import HubError
 from .library_metrics import LibraryMetrics, seconds_to_next_hour
 from .local_operator import COOKIE, issue_token, operator_request, sign_in
@@ -40,6 +41,7 @@ from .transcripts import TranscriptStore, inline_message_bodies
 logger = logging.getLogger(__name__)
 DEFAULT_MAX_COMMAND_BYTES = 262144
 OVERVIEW_SECONDS = 3.0  # The longest the dashboard's overview is shared before it is built again.
+RELEASE_MEMORY_SECONDS = 300.0  # How often TaskHub gives freed memory back (release_memory).
 
 
 class ProjectOwner:
@@ -152,10 +154,12 @@ def create_app(
     resume_runs: bool = True,
     stall_watchdog: bool = False,
     environment_holds: bool = False,
+    release_memory: bool = False,
 ) -> FastAPI:
     """Serve the operator API; runs driven before a restart resume unless resume_runs is false.
     `stall_watchdog` writes every thread's stack to the log when the service stalls;
-    `environment_holds` holds new sessions while this machine cannot sandbox agents' commands."""
+    `environment_holds` holds new sessions while this machine cannot sandbox agents' commands;
+    `release_memory` gives the allocator's freed memory back every few minutes (allocator)."""
     if max_command_bytes < 1:
         raise ValueError("max_command_bytes must be positive")
     root = root.resolve()
@@ -174,6 +178,17 @@ def create_app(
                 logger.warning("Counting the published Library failed: %s", library_metrics.error)
             await asyncio.sleep(seconds_to_next_hour(time.time()))
             await asyncio.to_thread(library_metrics.refresh)
+
+    async def release_memory_periodically() -> None:
+        """Give the system back what the allocator freed, and say how much this process holds."""
+        while True:
+            await asyncio.sleep(RELEASE_MEMORY_SECONDS)
+            before = allocator.private_memory()
+            await asyncio.to_thread(allocator.trim)
+            after = allocator.private_memory()
+            if before is not None and after is not None:
+                logger.info("TaskHub holds %.2f GiB of private memory (%.2f GiB given back)",
+                            after / 2**30, max(0, before - after) / 2**30)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -211,6 +226,8 @@ def create_app(
                 watchdog.start()
             driver.start_timer()
             library_count = asyncio.create_task(count_library_hourly(), name="taskhub-library-count")
+            releasing = (asyncio.create_task(release_memory_periodically(), name="taskhub-release-memory")
+                         if release_memory else None)
             try:
                 yield
             finally:
@@ -218,6 +235,8 @@ def create_app(
                     watchdog.stop()
                 tasks = driver.stop()
                 tasks.append(library_count)
+                if releasing is not None:
+                    tasks.append(releasing)
                 app.state.git_sync.stop()
                 if app.state.git_sync_task is not None:
                     tasks.append(app.state.git_sync_task)

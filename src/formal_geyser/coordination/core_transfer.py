@@ -6,8 +6,8 @@
   instance's Git repository (the `library/` view on disk is refreshed only when read, so it can lag),
   with their hashes;
 - `tasks.json`: every unfinished work task, its current contract, its number (Task N), its
-  operator priority and pin, and the task it came from (reviews and the Integrator's task go with their candidates and
-  batches, which stay behind);
+  operator priority and pin, the task it came from, and whether it had a worker (reviews and the
+  Integrator's task go with their candidates and batches, which stay behind);
 - `drafts/<task>/`: each carried task's current shared draft;
 - `dags/`: the current shared planning DAGs;
 - `literature.json` and `literature/`: every registered source, with the project's own copies;
@@ -23,7 +23,9 @@ holds; it starts again at revision 1 with the new instance's environment. A requ
 input that names something the new instance does not have (an artifact, a finished or
 unfinished-elsewhere task) is removed, and the task's context says what it was. Workers,
 conversations, workspaces, candidates, reviews, evidence and history stay with the old instance;
-no run is started.
+no run is started. A carried task that had a worker keeps its number X for its first executor
+in the new instance, Worker X (worker_names.kept_worker_number); `keep_carried_worker_numbers`
+does the same for an instance seeded before this, renumbering its workers.
 """
 from __future__ import annotations
 
@@ -45,7 +47,9 @@ from .config import load_config
 from .errors import HubError
 from .models import Actor, Command, Role
 from .task_names import work_task_order
+from .text_bounds import shorten
 from .wiki import _TEMPLATES as STARTER_PAGES
+from .worker_names import IMMUTABLE_WORKER_NUMBER, allocate_worker_number, keep_worker_numbers
 
 FORMAT = 1
 OPERATOR = Actor(role=Role.OPERATOR)
@@ -218,7 +222,12 @@ def _export(project: Path, state: Path, destination: Path, db: sqlite3.Connectio
     environments = sorted(aid for aid, record in artifacts.items() if record["kind"] == "lean.environment")
     _write_json(destination / "references.json", {"artifacts": artifacts, "tasks": tasks_named})
 
-    # The carried tasks, with their drafts.
+    # The carried tasks, with their drafts, and whether each had a worker: its number is then
+    # kept for its first executor in the new instance (import_core).
+    staffed = {row[0] for row in db.execute(
+        "SELECT m.task_id FROM task_members m JOIN workers w ON w.id=m.worker_id WHERE w.kind='ordinary' "
+        "AND m.executor=1 UNION SELECT a.task_id FROM attempts a JOIN workers w ON w.id=a.worker_id "
+        "WHERE w.kind='ordinary'")}
     heads = {row["task_id"]: dict(row) for row in db.execute("SELECT * FROM native_draft_heads")}
     records: list[dict[str, Any]] = []
     drafts = 0
@@ -226,7 +235,7 @@ def _export(project: Path, state: Path, destination: Path, db: sqlite3.Connectio
         entry = {"id": tid, "state": current[tid]["state"], "revision": current[tid]["current_revision"],
                  "created_at": current[tid]["created_at"], "contract": contracts[tid],
                  "origin_task_id": origins.get(tid), "priority": None, "pinned_at": None, "draft": None,
-                 "number": numbers.get(tid)}
+                 "number": numbers.get(tid), "had_worker": tid in staffed}
         if tid in admission:
             entry["priority"] = admission[tid]["priority"]
             entry["pinned_at"] = admission[tid]["pinned_at"]
@@ -387,7 +396,7 @@ def carried_contract(entry: dict, carried: set[str], references: dict, environme
         block = "\n\n" + header + "\n" + "\n".join("- " + n for n in kept)
         block += f"\n- and {len(notes) - len(kept)} more (see references.json in the transfer bundle)"
         if len(block) > room:
-            block = block[:max(0, room)]
+            block = shorten(block, room) if room > 0 else ""
     contract["context"] = context + block
     return contract
 
@@ -492,6 +501,10 @@ async def import_core(hub, bundle: Path) -> dict:
         c.execute("UPDATE task_name_sequence SET next_number=max(next_number,?) WHERE id=1",
                   (int(core.get("next_task_number") or 0),))
     await hub.db.call(continue_numbers, write=True)
+    # A task that had a worker keeps its number for its first executor here: Task X's is Worker X.
+    kept = _kept_numbers(entries)
+    if kept:
+        await hub.db.call(lambda c: keep_worker_numbers(c, kept, hub.clock()), write=True)
     for entry in entries:
         if entry.get("priority") is not None:
             await command("task.set_priority", "priority:" + entry["id"],
@@ -507,9 +520,72 @@ async def import_core(hub, bundle: Path) -> dict:
     summary = {"bundle_id": core["bundle_id"], "tasks": len(entries), "drafts": drafts,
                "dag_revision": dag_revision, "literature_skipped": skipped_literature,
                "environment": environment, "library_commit": core["library_commit"],
-               "record": str(record_dir)}
+               "kept_worker_numbers": len(kept), "record": str(record_dir)}
     _write_json(record_dir / "import.json", {**summary, "finished_at": time.time()})
     return summary
+
+
+def _kept_numbers(entries: list[dict]) -> dict[str, int]:
+    """Task id -> its number, for each carried task that had a worker in the old instance."""
+    return {entry["id"]: int(entry["number"]) for entry in entries
+            if entry.get("had_worker") and entry.get("number") is not None}
+
+
+async def keep_carried_worker_numbers(hub, bundle: Path) -> dict:
+    """For an instance seeded from `bundle` before carried tasks kept their numbers: keep them
+    now and renumber its workers as if they had been kept from the start, with the service stopped.
+
+    Each task of the bundle that had a worker keeps its number X. Its first executor here, if it
+    has one, becomes Worker X; any other worker whose number a task keeps takes the next number
+    no task keeps. Worker numbers are otherwise immutable; this is the one place that changes
+    them, and each change is an event (`worker.renumbered`)."""
+    entries = json.loads((bundle.resolve() / "tasks.json").read_text(encoding="utf-8"))
+    if not all("had_worker" in entry for entry in entries):
+        raise HubError("CORE_FORMAT", "This bundle's tasks.json does not say which tasks had a worker "
+                       "(had_worker); export it again", 422)
+    keep = _kept_numbers(entries)
+
+    def apply(c):
+        numbers = {row[0]: row[1] for row in c.execute("SELECT id,task_number FROM tasks")}
+        keep_here = {tid: number for tid, number in keep.items() if tid in numbers}
+        wrong = [tid for tid, number in keep_here.items() if numbers[tid] != number]
+        if wrong:
+            raise HubError("CORE_TARGET_MISMATCH", f"{len(wrong)} tasks have other numbers here than in the bundle", 409)
+        workers = {row[0]: row[1] for row in c.execute("SELECT id,worker_number FROM workers WHERE kind='ordinary'")}
+        first: dict[str, str] = {}  # Each task's first executor here.
+        for row in c.execute("SELECT task_id,initial_worker_id FROM task_lifecycle WHERE initial_worker_id IS NOT NULL"):
+            first[row[0]] = row[1]
+        for row in c.execute("SELECT task_id,worker_id FROM task_members WHERE executor=1 ORDER BY joined_at,rowid"):
+            first.setdefault(row[0], row[1])
+        target: dict[str, int] = {}
+        taken_by: dict[str, str] = {}
+        for tid, number in sorted(keep_here.items(), key=lambda item: item[1]):
+            worker_id = first.get(tid)
+            if worker_id is not None and worker_id in workers and worker_id not in target:
+                # A worker takes one number: its first task's.
+                target[worker_id], taken_by[tid] = number, worker_id
+        kept_numbers = set(keep_here.values()) | {row[0] for row in c.execute("SELECT worker_number FROM kept_worker_numbers")}
+        moving = sorted((worker_id for worker_id, number in workers.items()
+                         if target.get(worker_id, number) != number
+                         or (worker_id not in target and number in kept_numbers)), key=lambda w: workers[w])
+        c.execute("DROP TRIGGER IF EXISTS immutable_worker_number")
+        c.executemany("UPDATE workers SET worker_number=NULL WHERE id=?", [(worker_id,) for worker_id in moving])
+        for tid, number in keep_here.items():
+            c.execute("INSERT OR IGNORE INTO kept_worker_numbers(task_id,worker_number,worker_id,kept_at) "
+                      "VALUES(?,?,NULL,?)", (tid, number, hub.clock()))
+            if tid in taken_by:
+                c.execute("UPDATE kept_worker_numbers SET worker_id=? WHERE task_id=?", (taken_by[tid], tid))
+        changes = []
+        for worker_id in moving:
+            number = target[worker_id] if worker_id in target else allocate_worker_number(c)
+            c.execute("UPDATE workers SET worker_number=? WHERE id=?", (number, worker_id))
+            task_id = next((tid for tid, taker in taken_by.items() if taker == worker_id), None)
+            change = {"from": workers[worker_id], "to": number, "task_id": task_id}
+            hub._event(c, "worker.renumbered", worker_id, change, worker_id=worker_id)
+            changes.append({"worker_id": worker_id, **change})
+        c.execute(IMMUTABLE_WORKER_NUMBER)
+        return {"kept": len(keep_here), "taken": len(taken_by), "renumbered": changes}
+    return await hub.db.call(apply, write=True)
 
 
 # What `taskctl init --from-library` takes from a directory (bootstrap.capture_library).
@@ -519,8 +595,10 @@ _SKIPPED_FILES = frozenset({"lakefile.lean", "lakefile.md"})
 
 
 def _source(path: str) -> bool:
+    from ..bootstrap import library_source  # Lean and Markdown sources, license and notice files.
+
     parts = path.split("/")
-    return (path.lower().endswith((".lean", ".md")) and path.casefold() not in _SKIPPED_FILES
+    return (library_source(parts[-1]) and path.casefold() not in _SKIPPED_FILES
             and not any(part.casefold() in _SKIPPED_DIRECTORIES for part in parts[:-1]))
 
 

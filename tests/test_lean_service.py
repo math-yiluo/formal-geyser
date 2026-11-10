@@ -524,7 +524,8 @@ async def test_a_job_that_ends_while_it_is_measured_is_left_to_its_release():
 
     def running(group_of):
         job = SimpleNamespace(sched=SimpleNamespace(state="running", observed_memory=0, observed_commit=0),
-                              borrowed=[], peak_committed=0, row={}, cpu_samples=collections.deque())
+                              borrowed=[], peak_committed=0, peak_observed=0, row={},
+                              cpu_samples=collections.deque())
         job.group = group_of(job)
         return job
 
@@ -646,7 +647,7 @@ async def test_a_freeze_that_fails_is_undone_and_the_job_runs_on():
 async def test_a_job_without_its_cgroup_ends_unavailable_instead_of_waiting(proof_case, monkeypatch):
     hub, _, artifact = proof_case
 
-    def unavailable():
+    def unavailable(**limits):
         raise cgroups.Unavailable("The user's systemd manager is unreachable")
 
     monkeypatch.setattr(service_module, "JobGroup", unavailable)
@@ -667,11 +668,14 @@ def stuck_groups():
     class Group:
         peak_private_memory = 0
 
-        def __init__(self):
+        def __init__(self, **limits):
             self.suspended = False
 
         def usage(self):
             return Usage(0.0, 0, 0, 0, 0)
+
+        def oom_kills(self):
+            return 0
 
         def largest_process(self):
             return 0
@@ -758,8 +762,8 @@ def counted_groups():
     live: set[Path] = set()
 
     class Group(JobGroup):
-        def __init__(self):
-            super().__init__()
+        def __init__(self, **limits):
+            super().__init__(**limits)
             live.add(self.path)
 
         def close(self):
@@ -1291,6 +1295,58 @@ async def test_a_resident_session_holding_the_large_process_ends_with_the_check(
     await service._limit_memory(calm)
     assert calm.memory_limited is None and not calm.task.cancelled()
     calm.task.cancel()
+
+
+async def test_a_check_whose_process_the_kernel_ended_for_memory_ends_unavailable_saying_so(proof_case, monkeypatch):
+    # On the pilot on 2026-11-09 the kernel ended a development check's Lean process at 18.6 GiB
+    # when the machine's memory ran out; the check was recorded as completed with a process
+    # ended by a signal, and its worker ran the same check twice more.
+    hub, _, artifact = proof_case
+
+    class Ended(JobGroup):
+        def oom_kills(self):
+            return 1
+
+    monkeypatch.setattr(service_module, "JobGroup", Ended)
+    service = LeanService(hub.root, LeanServiceConfig(process_memory_gib=12), runner=FakeRunner(),
+                          measure=lambda: (64 * GIB, 128 * GIB), threads=8)
+    await service.start()
+    try:
+        job = await service.submit(spec(hub, snapshot=artifact["snapshot"]))
+        done = await service.wait(job["id"], 50)
+        compilation = done["result"]["compilation"]
+        assert done["state"] == "done" and done["requeues"] == 0
+        assert compilation["process"]["memory_limited"] and compilation["process"]["ended_by_system"]
+        assert compilation["reason"].startswith("The check was stopped: the machine's memory ran out")
+        assert done["result"]["definitive"] is False and done["result"]["doctor"]["ok"]
+        row = service.store.get(job["id"])
+        assert row["outcome"] == "completed" and service.store.estimate(row["estimate_key"]) is None
+    finally:
+        await service.close()
+
+
+def test_a_job_and_a_session_are_bounded_by_the_process_limit_for_each_thread():
+    limits = service_module.job_memory_limits(LeanServiceConfig(process_memory_gib=12), 1)
+    assert limits == {"memory_max": (12 + service_module.JOB_MEMORY_SLACK_GIB) * GIB, "swap_max": 12 * GIB}
+    assert service_module.job_memory_limits(LeanServiceConfig(process_memory_gib=12), 4)["swap_max"] == 48 * GIB
+    assert service_module.job_memory_limits(LeanServiceConfig(process_memory_gib=0), 4) == {}
+
+
+async def test_resident_sessions_are_bounded_as_a_one_thread_job(proof_case):
+    hub, _, _ = proof_case
+    service = LeanService(hub.root, LeanServiceConfig(process_memory_gib=2), runner=FakeRunner())
+    assert service.sessions.group_limits == {"memory_max": (2 + service_module.JOB_MEMORY_SLACK_GIB) * GIB,
+                                             "swap_max": 2 * GIB}
+
+
+def test_a_development_check_ended_by_the_system_says_what_to_do():
+    request = executor.CheckRequest.model_validate({
+        "environment": {}, "blobs": "/b", "directory": "/w", "modules": ["Draft"]})
+    result = executor.memory_limited(request, "interactive", 12, 3 * GIB, by_system=True)
+    reason = result["compilation"]["reason"]
+    assert reason.startswith("The development check was stopped: the machine's memory ran out")
+    assert "check again later" in reason and "3.0 GiB" in reason and result["definitive"] is False
+    assert result["compilation"]["process"]["error"].startswith("Stopped: the system ended a Lean process")
 
 
 def test_a_development_check_stopped_for_its_memory_says_what_to_do():

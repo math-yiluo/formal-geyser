@@ -228,15 +228,24 @@ test('the controls console pauses after turn or resumes Everyone and each group 
   const claude = {id: 'c', backend: 'claude', kind: 'ordinary', active_attempt: null, state: 'idle', group_control: null};
   const integrator = {id: 'i', backend: 'codex', kind: 'integrator', active_attempt: 'z', state: 'running'};
   const rows = Object.fromEntries(controlConsole(run, [finishing, reviewer, claude, integrator]).map(row => [row.key, row]));
-  assert.deepEqual(Object.keys(rows), ['run', 'codex', 'codex.workers', 'codex.reviewers', 'claude']);
+  assert.deepEqual(Object.keys(rows), ['run', 'codex', 'codex.workers', 'codex.reviewers', 'claude', 'integrator']);
   assert.deepEqual(rows.run.actions, ['pause_after_turn', 'pause']);
   assert.equal(rows.run.text, 'Running · 3 turns in progress');
   assert.deepEqual(rows['codex.workers'].actions, ['resume']);
   assert.equal(rows['codex.workers'].text, 'Paused after turns · 1 turn still running');
   assert.deepEqual(rows['codex.reviewers'].actions, ['pause_after_turn']);
   assert.deepEqual(rows.codex.actions, ['pause_after_turn', 'resume']);  // Its workers and reviewers apart.
-  assert.equal(rows.codex.live, 2);  // The Integrator is in no group.
+  assert.equal(rows.codex.live, 2);  // The Integrator is in no Codex group, only its own.
   assert.equal(rows.claude.text, 'Running');
+  // The Integrator has its own row, apart from the Codex reviewers.
+  assert.equal(rows.integrator.label, 'Integrator');
+  assert.equal(rows.integrator.live, 1);
+  assert.deepEqual(rows.integrator.actions, ['pause_after_turn']);
+  const held = {...run, groups: {...groups, integrator: {control: 'paused', state: 'paused', pause_mode: 'after_turn'}}};
+  const integratorHeld = Object.fromEntries(controlConsole(held, [integrator]).map(row => [row.key, row]));
+  assert.equal(integratorHeld.integrator.text, 'Paused after turns · 1 turn still running');
+  assert.deepEqual(integratorHeld.integrator.actions, ['resume']);
+  assert.equal(integratorHeld['codex.reviewers'].text, 'Running');
   assert.deepEqual(personControl(run, finishing), {individual: null, group: 'paused', running: false, afterTurn: true, finishing: true});
   assert.match(projectStatus({runs: [run], workers: [finishing], service}).text, /paused after turns: Codex workers/);
   // While everyone is paused, Claude alone was resumed.

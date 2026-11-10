@@ -99,7 +99,7 @@ async def test_caller_environment_is_passed_without_shell_expansion(tmp_path):
 async def test_a_process_that_cannot_enter_its_cgroup_never_runs_the_command(tmp_path, monkeypatch):
     marker = tmp_path / "ran"
     enter = cgroups.enter
-    monkeypatch.setattr(process_module.cgroups, "enter", lambda cgroup, command: enter(cgroup / "absent", command))
+    monkeypatch.setattr(process_module.cgroups, "enter", lambda cgroup, command, **options: enter(cgroup / "absent", command, **options))
     with pytest.raises(ProcessHostError, match="could not enter"):
         await OwnedProcessHost.start([sys.executable, "-c", f"open({str(marker)!r}, 'w')"], cwd=tmp_path)
     assert not marker.exists()

@@ -147,7 +147,8 @@ def operation_tools() -> list[dict[str, Any]]:
                   ["artifact_id", "reason"]),
         _function("taskhub_stage",
                   "Stage an immutable contribution and workspace snapshot for validation while "
-                  "continuing this activation. Include every contributing worker in the manifest's coauthors. "
+                  "continuing this activation. The manifest's coauthors are optional: existing workers of this "
+                  "instance who contributed. "
                   "The snapshot covers your workspace outside .private: every Lean file there needs a nonempty "
                   "Markdown file with the same path and name and no proof holes. Only the record's Lean/Markdown pair "
                   "and the manifest's repository_paths are integrated.",
@@ -159,7 +160,7 @@ def operation_tools() -> list[dict[str, Any]]:
                    "summary": {"type": "string", "minLength": 1},
                    "input_refs": {"type": "array", "items": {"type": "string"}, "maxItems": 200},
                    "coauthors": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 32,
-                                 "description": "Worker N names or IDs of the task participants who contributed to these files."},
+                                 "description": "Optional: Worker N names or IDs of existing workers who contributed to these files."},
                    "replaces": {"type": "string", "minLength": 1,
                                 "description": "Exact rejected, withdrawn, or review-invalidated candidate ID replaced by these files in the same task."}},
                   ["paths", "summary"]),

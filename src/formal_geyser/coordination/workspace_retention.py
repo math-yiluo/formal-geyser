@@ -223,7 +223,7 @@ class WorkspaceRetention:
                 # workspace at rest counts the Library files a restore would write back.
                 try:
                     record = read_record(work)
-                    current = (self.blobs.snapshot(work, exact=True) if record is None
+                    current = (self.blobs.snapshot(work, exact=True, remember=False) if record is None
                                else rested_snapshot(self.blobs, work, record))
                 except (OSError, ValueError, KeyError, TypeError) as error:
                     logger.warning("Retired worker %s keeps its workspace: it cannot be read: %s", worker_id, error)
@@ -232,6 +232,7 @@ class WorkspaceRetention:
                     logger.warning("Retired worker %s keeps its workspace: it differs from its last snapshot", worker_id)
                     continue
             done.append((worker_id, reclaim_workspace(work, kept)))
+            self.blobs.forget(work)  # Its files have gone.
             record_path(work).unlink(missing_ok=True)  # Never run again: nothing is restored.
         return done
 

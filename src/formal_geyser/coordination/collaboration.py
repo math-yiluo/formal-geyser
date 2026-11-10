@@ -13,6 +13,7 @@ from .errors import HubError
 from .integration_notes import checked_integration_notes
 from .models import Actor, Role, TaskContract, file_name_fields
 from .storage import canonical, digest, snapshot_entries
+from .text_bounds import shorten
 
 
 def new_id():
@@ -343,7 +344,7 @@ class Collaboration:
             if introduction is None:
                 introduction = p["kind"] + ": " + task["contract"]["title"]
             elif len(introduction) > 4000:
-                introduction = introduction[:4000]
+                introduction = shorten(introduction, 4000)
                 introduction_source = "authored_record_excerpt"
         if not isinstance(introduction, str) or not introduction.strip() or len(introduction) > 4000:
             raise HubError("INTRODUCTION_REQUIRED", "Supply a brief artifact introduction of at most 4000 characters", 422)
@@ -351,7 +352,7 @@ class Collaboration:
                                          producer=author_id, input_refs=refs, source_paths=publication_paths)
         self._bind_publication_repository(c, attempt, artifact, publication_paths)
         review_contract = TaskContract(
-            title="Review: " + task["contract"]["title"][:280],
+            title=shorten("Review: " + task["contract"]["title"], 300),
             objective="Review the exact immutable candidate, its evidence, and the host task contract. "
                       "Reject demonstrated defects with concrete suggestions, or independently accept the candidate. "
                       "After acceptance, end this turn; the dedicated Integrator performs final integration, "
@@ -700,9 +701,11 @@ class Collaboration:
             return self._task(c, task["id"])
         return None
 
-    def _new_worker(self, c, *, kind="ordinary", backend=None):
-        # Without a backend the operator's current choice for fresh workers applies.
-        payload = {"kind": kind, **({"backend": backend} if backend else {})}
+    def _new_worker(self, c, *, kind="ordinary", backend=None, number=None):
+        # Without a backend the operator's current choice for fresh workers applies; without a
+        # number, the next one (a task's kept number is given only to its first executor).
+        payload = {"kind": kind, **({"backend": backend} if backend else {}),
+                   **({"worker_number": number} if number is not None else {})}
         worker = self._dispatch(c, "worker.register", payload, Actor(role=Role.RUNNER))
         return worker["id"]
 

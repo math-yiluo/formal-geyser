@@ -219,11 +219,10 @@ tasks and also require identical content; incompatible requests fail explicitly.
 
 ## Contributions and completion
 
-Submit immutable candidates with an introduction, entry files, and all actual
-contributing coauthors, including authors of reused drafts and for `wiki_submit`.
-Coauthors must identify existing workers but need not belong to this task;
-attribution grants no membership or permissions. Shared membership alone is not
-a contribution.
+Submit immutable candidates with an introduction and entry files. Coauthors are
+optional (also for `wiki_submit`): they may name existing workers of this instance who
+contributed, need not belong to this task, and gain no membership or permissions. A
+reused draft whose author has no identity here needs no coauthor entry.
 Never self-review through any identity. Submission does not complete the task.
 Correct rejected or invalidated candidates using explicit `replaces`, retaining
 the original authorship and coauthors. To correct a candidate still awaiting

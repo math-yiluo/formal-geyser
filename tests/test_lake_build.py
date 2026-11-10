@@ -184,7 +184,8 @@ async def real_tooling(tmp_path):
         lean_version=version.stdout.strip(),
         local_execution="trusted-code-only",
     )
-    return LeanTooling(env, BlobStore(tmp_path / "state/blobs"))
+    # The test stands in for the Lean service, which supplies the runner of its jobs.
+    return LeanTooling(env, BlobStore(tmp_path / "state/blobs"), runner)
 
 
 async def test_real_lake_incremental_build_and_deleted_import(real_tooling, tmp_path):
@@ -373,6 +374,42 @@ async def test_real_kernel_replay_rejects_a_theorem_the_kernel_never_checked(rea
     source(root, "Proof.lean", "import Stmt\ntheorem proof : ¬Stmt := id\n")
     honest = await real_tooling.compile(root, ["Stmt", "Proof"])
     assert honest["ok"] and honest["kernel_replay"]["replayed_modules"] == ["Stmt", "Proof"], honest
+
+
+async def test_real_replay_of_several_modules_holds_a_name_they_reach_twice(real_tooling, tmp_path):
+    root = tmp_path / "input"
+    source(root, "Base.lean", "def base : Nat := 1\n")
+    source(root, "Mid.lean", "import Base\ndef mid : Nat := base\n")
+    source(root, "Top.lean", "import Mid\ndef top : Nat := mid\n")
+    # One name in two modules that never import each other, as Lean names some instances itself.
+    source(root, "Left.lean", "def clash : Nat := 1\n")
+    source(root, "Right.lean", "def clash : Nat := 2\n")
+    source(root, "LeftUse.lean", "import Left\ndef leftUse : Nat := clash\n")
+    source(root, "RightUse.lean", "import Right\ndef rightUse : Nat := clash\n")
+    # The same theorem twice is one declaration to Lean's import and to replay.
+    source(root, "SameOne.lean", "theorem same : (1 : Nat) = 1 := rfl\n")
+    source(root, "SameTwo.lean", "theorem same : (1 : Nat) = 1 := by rfl\n")
+    modules = ["Base", "Mid", "Top", "Left", "Right", "LeftUse", "RightUse", "SameOne", "SameTwo"]
+    async with real_tooling.compilation(root, modules, kernel_replay=False) as compiled:
+        assert compiled["ok"], compiled
+        build = Path(compiled["build_directory"])
+
+        async def replay(*names):
+            return await real_tooling.kernel_replay(build, list(names), [])
+        # Top reaches Base through Mid, which is not replayed with them.
+        through = await replay("Base", "Top")
+        assert not through["ok"] and through["held_name"] == "base", through
+        assert (await replay("Base", "Mid", "Top"))["ok"]
+        for pair in (("Left", "Right"), ("Left", "RightUse"), ("LeftUse", "RightUse")):
+            held = await replay(*pair)
+            assert not held["ok"] and held["held_name"] == "clash" and failed_check_verdict(held) == "unavailable", held
+        for alone in ("Base", "Top", "Left", "RightUse"):
+            assert (await replay(alone))["ok"], alone
+        assert (await replay("SameOne", "SameTwo"))["ok"]
+    official = await real_tooling.compile(root, modules)
+    assert official["ok"], official["kernel_replay"]
+    assert official["kernel_replay"]["split_groups"][0]["held_name"] == "clash", official["kernel_replay"]
+    assert sorted(official["kernel_replay"]["replayed_modules"]) == sorted(modules)
 
 
 async def test_real_shared_prebuilt_mathlib_import(real_tooling, tmp_path, monkeypatch):

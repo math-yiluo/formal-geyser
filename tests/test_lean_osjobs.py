@@ -153,3 +153,59 @@ async def test_time_spent_suspended_does_not_count_against_the_timeout(tmp_path)
     paused = await ProcessRunner().run(sleeper, cwd=tmp_path, timeout=1.0, register=False,
                                        paused=lambda: min(1.0, time.monotonic() - started))
     assert not paused.timed_out and paused.returncode == 0
+
+
+async def test_a_groups_processes_are_the_first_the_kernel_ends_and_stay_within_its_memory_bounds(tmp_path):
+    # On the pilot on 2026-11-09 the memory ran out with every process scored alike, and the
+    # kernel ended TaskHub, the largest, and every worker with it.
+    group = JobGroup(memory_max=512 * 2**20, swap_max=256 * 2**20)
+    try:
+        assert (group.path / "memory.max").read_text().strip() == str(512 * 2**20)
+        if (group.path / "memory.swap.max").exists():
+            assert (group.path / "memory.swap.max").read_text().strip() == str(256 * 2**20)
+        result = await ProcessRunner().run(
+            [sys.executable, "-c", "print(open('/proc/self/oom_score_adj').read().strip())"],
+            cwd=tmp_path, group=group, register=False)
+        assert result.returncode == 0 and result.stdout.strip() == "1000", result.stderr
+        assert group.oom_kills() == 0
+    finally:
+        group.close()
+    assert not group.path.exists()
+
+
+async def test_a_process_tree_outside_a_lean_job_keeps_its_score(tmp_path):
+    own = Path("/proc/self/oom_score_adj").read_text().strip()
+    result = await ProcessRunner().run(
+        [sys.executable, "-c", "print(open('/proc/self/oom_score_adj').read().strip())"],
+        cwd=tmp_path, register=False)
+    assert result.returncode == 0 and result.stdout.strip() == own
+
+
+def test_a_failed_move_into_the_cgroup_runs_nothing(tmp_path):
+    import subprocess
+
+    marker = tmp_path / "ran"
+    argv = cgroups.enter(tmp_path / "missing", [sys.executable, "-c", f"open({str(marker)!r}, 'w')"],
+                         oom_score_adj=1000)
+    assert subprocess.run(argv, capture_output=True).returncode != 0 and not marker.exists()
+
+
+def test_oom_kills_and_memory_headroom_read_the_cgroup_files(tmp_path):
+    assert cgroups.oom_kills(tmp_path) == 0 and cgroups.memory_headroom(tmp_path) is None
+    (tmp_path / "memory.events").write_text("low 0\nhigh 0\nmax 4\noom 1\noom_kill 2\noom_group_kill 0\n")
+    assert cgroups.oom_kills(tmp_path) == 2
+    (tmp_path / "memory.max").write_text("max\n")
+    (tmp_path / "memory.current").write_text(str(3 * 2**30))
+    (tmp_path / "memory.stat").write_text(f"anon {2**30}\nfile {int(2.5 * 2**30)}\n")
+    assert cgroups.memory_headroom(tmp_path) is None  # No bound.
+    (tmp_path / "memory.max").write_text(f"{2**30}\n")
+    # Of 3 GiB held, 2.5 are page cache, which the kernel reclaims first: 0.5 GiB of 1 is taken.
+    assert cgroups.memory_headroom(tmp_path) == 2**29
+    (tmp_path / "memory.stat").write_text("file 0\n")
+    assert cgroups.memory_headroom(tmp_path) == 0  # Past the bound reads as nothing left.
+
+
+def test_a_scope_takes_further_properties():
+    argv = cgroups.scope_command("x.scope", ["/bin/true"], delegate=True, properties=["MemoryMax=1073741824"])
+    assert argv[-3:] == ["--property=MemoryMax=1073741824", "--", "/bin/true"]
+    assert "--property=Delegate=yes" in argv

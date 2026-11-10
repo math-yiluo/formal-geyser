@@ -362,7 +362,8 @@ class LeanTooling:
         Compilation trusts what elaboration put in the environment: `debug.skipKernelTC`
         or an unchecked addition can record a theorem the kernel never checked, and the
         target inspection would accept it. The helper replays the modules against one
-        environment of their other imports, with the algorithm of Lean's leanchecker.
+        environment of their other imports, with the algorithm of Lean's leanchecker. Several
+        modules that reach one name twice are reported with `held_name` and replay nothing.
         """
         executable = self.executable()
         helper = replay_helper()
@@ -383,6 +384,12 @@ class LeanTooling:
         if isinstance(outcome, dict) and outcome.get("protocol") == REPLAY_PROTOCOL:
             if result.ok and outcome.get("verdict") == "verified":
                 return {**report, "ok": True, "constants": outcome.get("constants")}
+            if isinstance(outcome.get("held"), str):
+                # Several modules replayed together reach one name twice, which says nothing about any
+                # of them: lake_build._replay_groups replays them in smaller groups.
+                report.update(held_name=outcome["held"], held_module=outcome.get("module"),
+                              reason="Modules replayed together reach two declarations named " + outcome["held"])
+                return report
             if isinstance(outcome.get("finding"), str):
                 report["problem_module"] = outcome.get("module")
                 report["reason"] = ("The kernel rejected a declaration recorded in " + str(outcome.get("module"))

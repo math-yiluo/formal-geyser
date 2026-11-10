@@ -20,7 +20,7 @@ import tomli_w
 import typer
 import uvicorn
 
-from .. import cgroups
+from .. import allocator, cgroups
 from .api import ProjectOwner, create_app
 from .config import initialize, load_config
 from .errors import HubError
@@ -304,6 +304,23 @@ def import_core_command(
     _emit(_perform(run))
 
 
+@app.command("keep-worker-numbers")
+def keep_worker_numbers_command(
+    ctx: typer.Context,
+    bundle: Annotated[Path, typer.Argument(help="The bundle this instance was seeded from.")],
+):
+    """For an instance seeded before carried tasks kept their numbers, with the service stopped:
+    each carried task that had a worker keeps its number X for its first executor, Worker X, and
+    the workers are renumbered to match."""
+    def run():
+        if ctx.obj.url:
+            raise ValueError("Renumber locally while the service is stopped; --url is not supported")
+        from .core_transfer import keep_carried_worker_numbers
+
+        return asyncio.run(_local(ctx.obj, lambda hub: keep_carried_worker_numbers(hub, bundle)))
+    _emit(_perform(run))
+
+
 @app.command("prepare")
 def prepare_instance(
     ctx: typer.Context,
@@ -528,6 +545,7 @@ def serve(
 ):
     """Serve the local API. Runs that were being driven resume; new runs start only when driven."""
     def start():
+        allocator.limit_arenas()  # Before any thread starts: each would take an arena of its own.
         _service_logging()
         bind_host = "127.0.0.1" if host == "localhost" else host
         if not is_loopback(bind_host):
@@ -543,7 +561,8 @@ def serve(
         # those threads did about a fifth less work.
         sys.setswitchinterval(float(os.environ.get("TASKHUB_SWITCH_INTERVAL", SWITCH_INTERVAL)))
         config = uvicorn.Config(
-            create_app(ctx.obj.root, resume_runs=resume, stall_watchdog=True, environment_holds=True),
+            create_app(ctx.obj.root, resume_runs=resume, stall_watchdog=True, environment_holds=True,
+                       release_memory=True),
             host=bind_host,
             port=port,
             workers=1,
@@ -836,14 +855,15 @@ def run_resume(ctx: typer.Context, run_id: str):
 def run_pause_group_after_turn(ctx: typer.Context, group: str,
                                run_id: Annotated[str | None, typer.Option()] = None):
     """Pause a group once its members' running turns end on their own; nothing new starts for
-    them. GROUP is codex, codex.workers, codex.reviewers or claude."""
+    them. GROUP is codex, codex.workers, codex.reviewers, claude or integrator (the Integrator
+    alone, which no other group includes; it may be paused before it exists)."""
     _emit(_perform(lambda: _command(ctx, "group.pause_after_turn", {"group": group, "run_id": run_id})))
 
 
 @run_app.command("resume-group")
 def run_resume_group(ctx: typer.Context, group: str, run_id: Annotated[str | None, typer.Option()] = None):
     """Resume a group, also while everyone else is paused. GROUP is codex, codex.workers,
-    codex.reviewers or claude."""
+    codex.reviewers, claude or integrator."""
     _emit(_perform(lambda: _command(ctx, "group.resume", {"group": group, "run_id": run_id}, drive=True)))
 
 

@@ -777,13 +777,14 @@ function personControl(run, value) {
   return {individual, group, running, afterTurn, finishing: afterTurn && live};
 }
 
-// The groups paused after turn or resumed together (Hub CONTROL_GROUPS). The Integrator and the
-// Dispatcher are in none: they follow Everyone.
+// The groups paused after turn or resumed together (Hub CONTROL_GROUPS). The Integrator is a group
+// of its own, on any backend (null), in no other; the Dispatcher and the Waker are in none.
 const CONTROL_GROUPS = [
   {key: 'codex', label: 'All Codex', backend: 'codex', kinds: ['ordinary', 'review']},
   {key: 'codex.workers', label: 'Codex workers', backend: 'codex', kinds: ['ordinary']},
   {key: 'codex.reviewers', label: 'Codex reviewers', backend: 'codex', kinds: ['review']},
   {key: 'claude', label: 'All Claude', backend: 'claude', kinds: ['ordinary', 'review']},
+  {key: 'integrator', label: 'Integrator', backend: null, kinds: ['integrator']},
 ];
 
 function turnsLabel(count) {
@@ -801,7 +802,7 @@ function controlConsole(run, workers = []) {
     actions: run.state === 'running' ? ['pause_after_turn', 'pause'] : run.pause_after_turn && everyone ? ['resume', 'pause'] : ['resume']}];
   for (const group of CONTROL_GROUPS) {
     const view = run.groups?.[group.key] || {control: null, state: run.state === 'running' ? 'running' : 'paused'};
-    const members = workers.filter(value => (value.backend || 'codex') === group.backend
+    const members = workers.filter(value => (group.backend === null || (value.backend || 'codex') === group.backend)
       && group.kinds.includes(value.kind || 'ordinary') && value.work_intention !== 'retired');
     const running = members.filter(live).length;
     let text;

@@ -128,15 +128,22 @@ def root() -> Path:
         return _ROOT
 
 
+def current_root() -> Path | None:
+    """This process's owned cgroup if it has been set up (root), without setting it up."""
+    return _ROOT
+
+
 def scope_command(unit: str, command: Sequence[str], *, delegate: bool = False,
-                  bound_to: str | None = None) -> list[str]:
+                  bound_to: str | None = None, properties: Sequence[str] = ()) -> list[str]:
     """`command` in a new scope `unit` of the user's systemd manager, which outlives this
-    process's own unit; with `bound_to`, it ends when that unit does."""
+    process's own unit; with `bound_to`, it ends when that unit does. `properties` are further
+    unit properties, such as "MemoryMax=…"."""
     argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--unit=" + unit]
     if delegate:
         argv.append("--property=Delegate=yes")
     if bound_to is not None:
         argv += ["--property=BindsTo=" + bound_to, "--property=After=" + bound_to]
+    argv += ["--property=" + item for item in properties]
     return [*argv, "--", *command]
 
 
@@ -149,9 +156,15 @@ def end_unit(unit: str) -> None:
         pass
 
 
-def enter(cgroup: Path, command: Sequence[str]) -> list[str]:
-    """`command`, run by a process that first moves itself into `cgroup`."""
-    return ["/bin/sh", "-c", 'echo 0 > "$0" && exec "$@"', str(cgroup / "cgroup.procs"), *command]
+def enter(cgroup: Path, command: Sequence[str], *, oom_score_adj: int | None = None) -> list[str]:
+    """`command`, run by a process that first moves itself into `cgroup`. With `oom_score_adj`,
+    that process, and so every process of its tree, is first in line when the kernel ends a
+    process because memory ran out: an unprivileged process may raise its own value, never lower
+    it, and a failure to raise it does not stop the command."""
+    if oom_score_adj is None:
+        return ["/bin/sh", "-c", 'echo 0 > "$0" && exec "$@"', str(cgroup / "cgroup.procs"), *command]
+    script = 'echo 0 > "$0" || exit 1; { echo "$1" > /proc/self/oom_score_adj; } 2>/dev/null; shift; exec "$@"'
+    return ["/bin/sh", "-c", script, str(cgroup / "cgroup.procs"), str(oom_score_adj), *command]
 
 
 def relative(cgroup: Path) -> str:
@@ -218,6 +231,39 @@ def signal(cgroup: Path, number: int) -> None:
             os.kill(pid, number)
         except ProcessLookupError:
             pass
+
+
+def limit_memory(cgroup: Path, memory_max: int | None, swap_max: int | None = None) -> None:
+    """Bound the memory, and the swap, that the cgroup's processes may hold together: past
+    `memory_max` the kernel reclaims the cgroup's own pages and swaps them out, and past both it
+    ends one of the cgroup's processes, never a process elsewhere. A system that does not account
+    memory or swap leaves that bound out."""
+    for name, value in (("memory.max", memory_max), ("memory.swap.max", swap_max)):
+        if value is not None and (cgroup / name).exists():
+            (cgroup / name).write_text(str(max(0, int(value))))
+
+
+def oom_kills(cgroup: Path) -> int:
+    """How many processes of the cgroup, or below it, the kernel has ended for want of memory,
+    whether the cgroup's own limit, an enclosing one or the machine's memory ran out."""
+    try:
+        return int(_keys(cgroup / "memory.events").get("oom_kill", 0))
+    except (FileNotFoundError, ValueError):
+        return 0
+
+
+def memory_headroom(cgroup: Path) -> int | None:
+    """What the cgroup may still take before its memory.max, counting its page cache as free
+    (the kernel reclaims it first); None when it has no limit or none is readable."""
+    try:
+        limit = (cgroup / "memory.max").read_text().strip()
+        if limit == "max":
+            return None
+        current = int((cgroup / "memory.current").read_text())
+        cached = int(_keys(cgroup / "memory.stat").get("file", 0))
+        return max(0, int(limit) - (current - cached))
+    except (FileNotFoundError, ValueError):
+        return None
 
 
 def remove(cgroup: Path) -> None:

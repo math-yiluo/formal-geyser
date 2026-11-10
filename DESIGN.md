@@ -11,9 +11,10 @@ domain. It contains no mathematical workload, proof corpus, or fixed reasoning p
 LLM workers are Codex or Claude Code conversations that work in ordinary files. Each
 worker keeps the backend it was created with until the operator moves it, which takes effect
 at its next activation in a new conversation; the operator chooses the backend for
-workers created next, unless the project's assignment plan fixes it by role and worker
-number, and each account runs at most its configured number of sessions at once
-(`docs/claude-backend.md`). TaskHub coordinates
+workers created next, unless the project's assignment plan fixes it by worker number, and
+each account runs at most its configured number of sessions at once
+(`docs/claude-backend.md`). Reviewers, the Integrator and the decision helpers run on
+Codex whatever backend workers use: their models are chosen for Codex only. TaskHub coordinates
 admission, waits, review, publication, and recovery with deterministic rules. It is
 not a model supervising the workers' reasoning.
 
@@ -56,7 +57,10 @@ trees; use Git branches. Package and dependency versions stay as locked.
   owns published source history (published Library and wiki content is authoritative
   at its exact commit). A published Library view (`library/<commit>/`) is a cache of its
   commit: after each publication, views superseded more than a day ago are removed, but the
-  current one and the three newest stay.
+  current one and the three newest stay. A view's files are read against their hashes
+  outside the content lock, and not again while they keep their identities; moving
+  `library/current.json` to a view takes the lock only to check those identities and replace
+  the pointer, one move at a time.
 - **Coordination storage.** Audited SQL-only status and message-signal reads use four
   read-only WAL connections; mutations, native-file reconciliation and delivery
   creation stay serialized on one writer with FULL durability. Command replies retain
@@ -434,12 +438,15 @@ trees; use Git branches. Package and dependency versions stay as locked.
 
 ## 6. Review, integration, and publication
 
-- **Authorship.** Candidates identify all actual contributing workers, including
-  authors of reused drafts. Coauthors must have existing identities but need not
-  belong to the submission's task. Attribution grants no execution or maintenance
-  permissions. Membership does not establish authorship.
-- **Reviewer eligibility.** Authors and coauthors (including through new identities)
-  are never assigned their artifact's review. They see its status and receive revision feedback.
+- **Authorship.** A candidate's author is the worker that submits it. Coauthors are
+  optional: they name existing workers of this instance that contributed, need not
+  belong to the submission's task, and gain no execution or maintenance permissions.
+  An author with no identity here, such as one of a draft carried from a previous
+  instance, needs no coauthor entry or other attribution. Coauthors are inherited by
+  a correction and let one of them correct the candidate without naming it in `replaces`.
+- **Reviewer eligibility.** Each review runs under a new disposable `Reviewer N`
+  identity that never authors, so no author or coauthor reviews its own artifact.
+  Authors and coauthors see its status and receive revision feedback.
 - **Dispatch.** A review starts only after machine validation has accepted its exact
   candidate: the newest validation for the candidate's policy is an unqualified
   acceptance bound to the reviewed bytes and basis, the same evidence publication
@@ -624,7 +631,17 @@ trees; use Git branches. Package and dependency versions stay as locked.
   the check's threads processes at once, at least 100 modules each; a group that passes records
   its markers as it passes, and the first failing group's report is the replay's. On 11-07 one
   edit to a widely imported module left about 5,200 modules to replay, about 4 s each, in one
-  process.
+  process. A group must not reach one name twice: none of its modules may be reached through an
+  import outside it, and no two modules it reaches may declare one name. So each group is a run of
+  consecutive modules in import order, and a group of several modules that still reaches a name
+  twice (the Library may declare one name in two modules that never import each other) is reported
+  as held before anything is replayed, and replayed again as its two halves, down to single
+  modules. On 11-08 the Mac pilot's first full replay of 21,146 modules failed in every
+  round-robin group, which reached members through other groups, and at 33 declarations its
+  Library holds twice. A process keeps the memory its heaviest declaration took until it ends,
+  so a group has at most 250 modules and more groups than processes wait their turn: in the
+  next attempt ten processes of about 2,100 modules each grew to 13-14 GiB and exhausted the
+  VM's 46 GiB, and the stopped check lost every group still running.
 - **Snapshot size.** A candidate snapshot holds its author's whole Library checkout, and the
   integration workspace holds the Library and its batch, so both grow with the Library. Each
   is bounded by the platform maximum of 100,000 files and 1 GiB and by the pinned
@@ -803,6 +820,16 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
   keeps what ended processes used, and private memory sampled every second. Suspended time does not count
   against a check's timeout. Telemetry (queue and running time, CPU, peak memory,
   suspensions, restarts, machine samples) is kept 90 days, results 7.
+- **Memory never takes TaskHub.** Every Lean service process has `oom_score_adj` 1000, so
+  when memory runs out the kernel ends a Lean process, never TaskHub or a worker. The kernel
+  bounds what each job's cgroup holds (a resident session's too): `process_memory_gib` for
+  each of its threads plus 8 GiB for the library pages it reads, and as much again in swap.
+  The service's scope has `MemoryMax` from `service_memory_gib` (default 60% of the machine's
+  memory; set when the supervisor starts the server), and free memory for scheduling is what
+  is left within it. A check one of whose processes the kernel ended for want of memory ends
+  unavailable and says so ("the machine's memory ran out"), not as a finding, and sizes no
+  later job. On the pilot on 2026-11-09 a development check grew to 18.6 GiB under a 24 GiB
+  limit, every process had the same score, and the kernel ended TaskHub and every worker.
 - **Faults clear themselves.** A job becomes running only once its cgroup, its scratch
   directory and its run all exist; a start that fails before then (a full disk, say) leaves it
   queued, holding nothing, and it is tried again from one second, doubling to a minute, while
@@ -833,7 +860,8 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
 - **Configuration.** `[lean_service]`: `threads` (default the logical cores), `reserve_gib`,
   `commit_reserve_gib`, `low_watermark_gib`, `critical_watermark_gib`, `per_owner`,
   `aging_minutes`, `sandbox` (`codex` or `none`), `warm_gib`, `validation_wait_seconds`,
-  `sessions` (0 turns resident sessions off), `session_idle_minutes`.
+  `sessions` (0 turns resident sessions off), `session_idle_minutes`, `process_memory_gib`,
+  `service_memory_gib` (0: no bound).
 
 ## 8. Communication
 
@@ -940,6 +968,15 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
   Once owned-process closure is confirmed (job-object probes, also after a coordinator
   restart), the original conversation continues with a new input; the old turn is
   never replayed and publication checks are never waived.
+- **TaskHub's memory stays bounded.** Between snapshots TaskHub remembers each settled
+  workspace file's identity and hash, so an unchanged file is not read again. It remembers at
+  most 4,000,000 files over all workspaces (about 93 Library checkouts, about 0.6 GB), packed
+  one value each with paths shared between workspaces; the least recently snapshotted
+  workspace is forgotten first, and a workspace put at rest or reclaimed is not remembered.
+  TaskHub allows glibc two allocator arenas and gives freed memory back every five minutes,
+  logging what it holds. On the pilot on 2026-11-09 the cache was bounded at 256 workspaces of
+  42,700 files each (about 6 GB), about 90 arenas held 4.3 GiB of freed memory, and the kernel
+  ended TaskHub at 11.8 GiB when the machine's memory ran out.
 - **Failure backoff.** Consecutive identical stopped-worker failures back off for 1, 2,
   4 minutes, doubling up to 60 minutes; at five repeats one operator notice is kept for
   that failure signature. An infrastructure failure never becomes a voluntary pause,
@@ -1001,8 +1038,11 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
 - **A group's control.** `group.pause_after_turn` and `group.resume` (dashboard:
   Controls; `taskctl run pause-group-after-turn` / `resume-group`) apply to a group:
   all Codex workers and reviewers (`codex`), Codex workers (`codex.workers`) or
-  reviewers (`codex.reviewers`) alone, or all Claude workers and reviewers (`claude`).
-  The Integrator and the Dispatcher are in no group. A paused group's members pause
+  reviewers (`codex.reviewers`) alone, all Claude workers and reviewers (`claude`), or
+  the Integrator (`integrator`), a group of its own that no other includes and that can be
+  paused before the Integrator exists: paused, no integration batch starts or goes on,
+  and resumed under a paused run, its batches run (the Integrator is made if needed). The
+  Dispatcher and the Waker are in no group. A paused group's members pause
   after turn as with `worker.pause_after_turn`, and no new worker or reviewer starts
   on its account: a new worker takes the next number of an account whose workers run,
   and a review waits for its reviewer. A group resumed while the run is paused runs in
@@ -1109,7 +1149,8 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
   and the operator's priorities and pins. No worker, conversation, workspace, candidate,
   review, evidence, build output or history comes along. Export reads one snapshot of the
   ledger and may run while the service serves; it writes a bundle outside the project. The
-  new instance is initialized from the bundle's Library, which import checks file by file,
+  new instance is initialized from the bundle's Library, which import checks file by file
+  (Lean and Markdown sources, and the license and notice files that travel with ported code),
   and then seeded with the service stopped. A carried task keeps its id, so what its words,
   the DAGs and its draft say of other carried tasks still holds; it starts again at
   revision 1 under the new environment. A requirement, input, parent or subject that
@@ -1117,7 +1158,12 @@ machine's cores and memory are used fully and safely (`lean_service/`, `docs/lea
   removed, and the task's context says what it was and where its result now is. Reviews
   and the Integrator's task stay with their candidates and batches. Import starts no run,
   records what it did under `.task-based/core-transfer/<bundle>/`, and repeats nothing when
-  run again after a failure.
+  run again after a failure. A carried task that had a worker in the old instance keeps its
+  own number X for its first executor: Task X's first executor here is Worker X, always a
+  new worker (no idle worker is offered for it and `task.join` refuses one). Tasks published
+  later, carried tasks that never had a worker, and later executors take the next number no
+  task keeps. `taskctl keep-worker-numbers` brings an instance seeded before this in line by
+  renumbering its workers, the one change of a worker number (`worker.renumbered`).
 - **CLI:** `taskctl` (coordination) and `formalizectl` (Lean domain).
 - **Git sharing** (optional): reviewed source, public wiki, and generated state under
   `taskhub/` on one branch. Private notes, messages, transcripts, credentials, and live

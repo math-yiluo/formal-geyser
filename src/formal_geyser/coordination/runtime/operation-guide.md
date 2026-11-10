@@ -51,8 +51,8 @@ edited README, with `wiki_submit`:
 }
 ```
 
-List every actual coauthor by existing `Worker N` name, including authors of reused
-drafts. Attribution grants no task permissions. Supply `replaces` to correct an
+`coauthors` is optional and names only existing workers of this instance by `Worker N`
+name. Attribution grants no task permissions. Supply `replaces` to correct an
 exact rejected candidate. `wiki_submit` freezes this contribution and keeps the
 activation working; it does not complete the task. Independent review and
 Integrator publication remain required. Public Markdown-only integration skips

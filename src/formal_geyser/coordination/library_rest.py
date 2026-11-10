@@ -81,7 +81,8 @@ def rest_workspace(blobs, work: Path, base_commit: str, base_snapshot: str, kept
     if at_rest(work):
         return 0, 0
     files: dict[str, tuple[tuple[int, ...], str]] = {}
-    manifest = blobs.snapshot(work, exact=True, record=files)
+    # Its Library files go next: remembering their hashes would only hold memory (BlobStore).
+    manifest = blobs.snapshot(work, exact=True, record=files, remember=False)
     base = _manifest(blobs, base_snapshot)
     keep = {path.relative_to(work).as_posix() for path in kept if path.is_relative_to(work)}
     candidates = sorted(path for path, (_, sha) in files.items() if base.get(path) == sha and path not in keep)

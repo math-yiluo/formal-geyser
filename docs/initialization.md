@@ -10,7 +10,9 @@ uv run taskctl init ~/my-instance --domain lean --from-library ~/existing-librar
 
 Omit `--from-library` for an initially empty mathematical Library. The source
 directory may also be the new instance directory. The importer copies Lean and
-Markdown files while preserving module paths and the original files. It excludes
+Markdown files, and the license, notice and copying files of ported code (`LICENSE`,
+`NOTICE`, `COPYING`, `LICENCE-MIT`, `NOTICE.txt` and the like), while preserving
+module paths and the original files. Other files are not imported. It excludes
 Git/runtime/private directories and dependency/build caches. Lake project
 configuration is not imported: this runtime compiles directly with its registered
 environment. An existing `lean-toolchain` or Mathlib entry in `lake-manifest.json`

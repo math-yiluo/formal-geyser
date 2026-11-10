@@ -42,7 +42,7 @@ def submission_schema(object_type: str) -> dict:
             "repository_paths": {"type": "array", "items": {"type": "string"}, "maxItems": 10000},
             "input_refs": {"type": "array", "items": {"type": "string"}, "maxItems": 200},
             "coauthors": {"type": "array", "items": {"type": "string"}, "maxItems": 32,
-                          "description": "All workers who actually contributed; membership alone is not authorship."},
+                          "description": "Optional: existing workers of this instance who contributed."},
             "replaces": {"type": "string", "minLength": 1},
             "policy": {"type": "string", "description": "Normally omitted; if supplied it must match the exact domain policy."},
         },

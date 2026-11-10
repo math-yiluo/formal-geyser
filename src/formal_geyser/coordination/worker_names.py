@@ -26,6 +26,18 @@ OPAQUE_FIELDS = frozenset({
 })
 
 
+IMMUTABLE_WORKER_NUMBER = ("CREATE TRIGGER IF NOT EXISTS immutable_worker_number "
+                           "BEFORE UPDATE OF worker_number ON workers "
+                           "WHEN OLD.worker_number IS NOT NULL AND NEW.worker_number IS NOT OLD.worker_number "
+                           "BEGIN SELECT RAISE(ABORT,'Worker numbers are immutable'); END")
+# A task carried from another instance where it had a worker keeps its own number, X, for its
+# first executor here, Worker X (core_transfer). No other worker takes X; worker_id is the worker
+# that took it. Tasks published here, and carried tasks that never had a worker, keep none.
+KEPT_WORKER_NUMBERS = ("CREATE TABLE IF NOT EXISTS kept_worker_numbers(task_id TEXT PRIMARY KEY,"
+                       "worker_number INTEGER NOT NULL UNIQUE CHECK(worker_number>=0),worker_id TEXT UNIQUE,"
+                       "kept_at INTEGER NOT NULL)")
+
+
 def initialize_agent_names(connection) -> None:
     """Initialize disjoint stable identities for ordinary workers and reviewers."""
     connection.execute("BEGIN IMMEDIATE")
@@ -38,10 +50,8 @@ def initialize_agent_names(connection) -> None:
         connection.execute("INSERT OR IGNORE INTO reviewer_name_sequence VALUES(1,1)")
         connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS workers_number_idx ON workers(worker_number)")
         connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS reviewers_number_idx ON workers(reviewer_number)")
-        connection.execute("CREATE TRIGGER IF NOT EXISTS immutable_worker_number "
-                           "BEFORE UPDATE OF worker_number ON workers "
-                           "WHEN OLD.worker_number IS NOT NULL AND NEW.worker_number IS NOT OLD.worker_number "
-                           "BEGIN SELECT RAISE(ABORT,'Worker numbers are immutable'); END")
+        connection.execute(IMMUTABLE_WORKER_NUMBER)
+        connection.execute(KEPT_WORKER_NUMBERS)
         connection.execute("CREATE TRIGGER IF NOT EXISTS immutable_reviewer_number "
                            "BEFORE UPDATE OF reviewer_number ON workers "
                            "WHEN OLD.reviewer_number IS NOT NULL AND NEW.reviewer_number IS NOT OLD.reviewer_number "
@@ -59,15 +69,51 @@ def initialize_agent_names(connection) -> None:
 
 
 def allocate_worker_number(connection) -> int:
-    """Allocate inside the transaction that creates an ordinary worker."""
-    row = connection.execute("UPDATE worker_name_sequence SET next_number=next_number+1 "
-                             "WHERE id=1 RETURNING next_number-1").fetchone()
-    return int(row[0])
+    """Allocate inside the transaction that creates an ordinary worker: the next number that no
+    task keeps (kept_worker_number)."""
+    number = next_worker_number(connection)
+    connection.execute("UPDATE worker_name_sequence SET next_number=? WHERE id=1", (number + 1,))
+    return number
 
 
 def next_worker_number(connection) -> int:
     """The number the next ordinary worker gets."""
-    return int(connection.execute("SELECT next_number FROM worker_name_sequence WHERE id=1").fetchone()[0])
+    return unkept_number(connection, int(connection.execute(
+        "SELECT next_number FROM worker_name_sequence WHERE id=1").fetchone()[0]))
+
+
+def unkept_number(connection, start: int) -> int:
+    """The first number from `start` on that no task keeps for its first executor."""
+    kept = {row[0] for row in connection.execute(
+        "SELECT worker_number FROM kept_worker_numbers WHERE worker_number>=?", (start,))}
+    while start in kept:
+        start += 1
+    return start
+
+
+def kept_worker_number(connection, task_id: str) -> int | None:
+    """The number Task X keeps for its first executor while it has none: X, when it was carried
+    from an instance where it had a worker (core_transfer)."""
+    row = connection.execute("SELECT worker_number FROM kept_worker_numbers WHERE task_id=? AND worker_id IS NULL",
+                             (task_id,)).fetchone()
+    return None if row is None else int(row[0])
+
+
+def keep_worker_numbers(connection, numbers: dict[str, int], now: int) -> int:
+    """Keep each task's number (task id -> its number) for its first executor; returns how many
+    were not kept already. A number another worker already has cannot be kept."""
+    taken = {row[0] for row in connection.execute("SELECT worker_number FROM workers WHERE worker_number IS NOT NULL")}
+    added = 0
+    for task_id, number in numbers.items():
+        if connection.execute("SELECT 1 FROM kept_worker_numbers WHERE task_id=?", (task_id,)).fetchone():
+            continue
+        if number in taken:
+            raise HubError("WORKER_NUMBER_TAKEN", f"Worker {number} exists already: renumber the instance's "
+                           "workers first (keep_carried_worker_numbers)", 409)
+        connection.execute("INSERT INTO kept_worker_numbers(task_id,worker_number,worker_id,kept_at) VALUES(?,?,NULL,?)",
+                           (task_id, number, now))
+        added += 1
+    return added
 
 
 def allocate_reviewer_number(connection) -> int:

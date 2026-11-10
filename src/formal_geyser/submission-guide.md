@@ -54,11 +54,10 @@ candidate snapshots and publication. Keep your own notes in `.private/notes`.
 This is a format template, not a ready mathematical task or a valid submission.
 Use real names, files, citation IDs, hashes, and locations. For this entry module,
 the required pair is `Project/Definitions.lean` and `Project/Definitions.md`.
-List all actual contributing coauthors, including the authors of reused drafts,
-whether or not they belong to this task. Use existing worker identities; attribution
-does not grant task membership or permissions. These identities affect independent
-review eligibility. Shared membership alone is not a contribution.
-The same rule applies to wiki and supporting-note submissions.
+`coauthors` is optional: it may name existing workers of this instance who
+contributed, whether or not they belong to this task. Attribution grants no task
+membership or permissions. A reused draft whose author has no identity here (for
+example from a previous instance) needs no coauthor entry and no other attribution step.
 
 Optional `data.qualifications` holds author scope notes for the reviewer to assess
 against the task. It does not automatically block machine validation. Explain

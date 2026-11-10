@@ -1,6 +1,7 @@
 """Official validation replays compiled modules through the kernel; sources cannot bypass it."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from formal_geyser.mathematical_artifacts import (
 from formal_geyser.registry import RegistryError
 from formal_geyser.schemas import EnvironmentRecord
 from formal_geyser.tooling import LeanTooling, failed_check_verdict
-from tests.conftest import FakeRunner
+from tests.conftest import VERIFIED_REPLAY, FakeRunner
 
 MISMATCH = {"finding": "while replaying declaration 'proof':\n(kernel) declaration type mismatch", "module": "Two"}
 
@@ -98,6 +99,40 @@ async def test_a_kernel_rejection_is_a_finding_and_a_replay_failure_is_unavailab
     if verdict == "rejected":
         assert report["kernel_replay"]["problem_module"] == "Two"
         assert report["reason"] == "The kernel rejected a declaration recorded in Two"
+
+
+async def test_modules_that_reach_a_name_twice_are_replayed_apart(proof_case, tmp_path):
+    class Holding(FakeRunner):
+        """The helper holds a name for any two modules, as it would for two that both declare it."""
+
+        async def run(self, argv, **kwargs):
+            if len(argv) > 2 and Path(argv[2]).name == "KernelReplay.lean":
+                several = len(json.loads(Path(argv[-2]).read_text(encoding="utf-8"))["modules"]) > 1
+                self.kernel_replay = (4, {"held": "clash", "module": "One"}) if several else VERIFIED_REPLAY
+            return await super().run(argv, **kwargs)
+    hub, _, _ = proof_case
+    runner = Holding()
+    directory = tmp_path / "source"
+    two_modules(directory)
+    report = await tooling_for(hub, runner).compile(directory, ["One", "Two"])
+    assert report["ok"], report
+    assert runner.replays == [["One", "Two"], ["One"], ["Two"]]
+    assert report["kernel_replay"]["split_groups"] == [{"modules": 2, "held_name": "clash"}]
+    assert report["kernel_replay"]["replayed_modules"] == ["One", "Two"]
+    # Both passed apart, so neither is replayed again.
+    again = await tooling_for(hub, runner).compile(directory, ["One", "Two"])
+    assert again["ok"] and again["kernel_replay"]["replayed_modules"] == []
+
+
+async def test_a_held_name_is_never_a_finding(proof_case, tmp_path):
+    hub, _, _ = proof_case
+    directory = tmp_path / "source"
+    two_modules(directory)
+    runner = FakeRunner(kernel_replay=(4, {"held": "clash", "module": "One"}))
+    report = await tooling_for(hub, runner).compile(directory, ["One", "Two"])
+    # The fake holds it for each module alone too, which the real helper never does.
+    assert not report["ok"] and failed_check_verdict(report) == "unavailable"
+    assert report["kernel_replay"]["held_name"] == "clash" and "problem_module" not in report["kernel_replay"]
 
 
 @pytest.mark.parametrize("construct", [

@@ -5,8 +5,10 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 from formal_geyser.coordination.config import initialize
+from formal_geyser.coordination.errors import HubError
 from formal_geyser.coordination.hub import Hub
 from formal_geyser.coordination.models import (
     Actor,
@@ -31,7 +33,7 @@ from tests.coordination.test_collaborative_core import claim, machine, publish, 
 
 PLAN = AssignmentConfig(worker_backends=["codex", "claude"],
                         worker_rotation=["conservative", "conservative", "aggressive", "aggressive"],
-                        reviewer_backend="claude", integrator_backend="codex")
+                        reviewer_backend="codex", integrator_backend="codex")
 
 
 async def command(hub, name, payload=None):
@@ -58,7 +60,7 @@ async def test_the_plan_sets_each_new_agents_backend_and_rotation_by_role_and_nu
             (3, "claude", "aggressive"), (4, "codex", "conservative")]
         reviewer = await command(hub, "worker.register", {"kind": "review"})
         integrator = await command(hub, "worker.register", {"kind": "integrator"})
-        assert (reviewer["backend"], reviewer["rotation_mode"]) == ("claude", None)
+        assert (reviewer["backend"], reviewer["rotation_mode"]) == ("codex", None)
         assert (integrator["backend"], integrator["rotation_mode"]) == ("codex", None)
         status = await hub.backend_status()
         assert status["next_worker"] == {"number": 5, "backend": "claude"}
@@ -116,16 +118,40 @@ async def test_an_activation_opens_its_harness_for_the_agents_role(tmp_path, mon
 
 
 async def test_the_operators_choice_applies_where_the_plan_leaves_the_backend_open(tmp_path):
-    hub = await planned(tmp_path, assignment=AssignmentConfig(reviewer_backend="claude"))
+    hub = await planned(tmp_path)
     try:
         await command(hub, "runtime.select_backend", {"backend": "claude"})
         assert (await command(hub, "worker.register"))["backend"] == "claude"
+        # The operator's choice is for workers: reviewers and the Integrator stay on Codex.
+        assert (await command(hub, "worker.register", {"kind": "review"}))["backend"] == "codex"
         await command(hub, "runtime.select_backend", {"backend": "codex"})
         assert (await command(hub, "worker.register"))["backend"] == "codex"
-        assert (await command(hub, "worker.register", {"kind": "review"}))["backend"] == "claude"
         assert (await command(hub, "worker.register", {"kind": "integrator"}))["backend"] == "codex"
     finally:
         await hub.close()
+
+
+async def test_reviewers_and_the_integrator_run_on_codex_when_workers_run_on_claude(tmp_path):
+    # The Mac pilot, 2026-11-08: workers on Claude, no backend named for the other roles, and its
+    # first candidate's reviewer was made on Claude, where no reviewer model is chosen.
+    hub = await planned(tmp_path, new_worker_backend="claude")
+    try:
+        assert (await command(hub, "worker.register"))["backend"] == "claude"
+        for kind in ("review", "integrator", "dispatcher", "waker"):
+            assert (await command(hub, "worker.register", {"kind": kind}))["backend"] == "codex", kind
+        # Nor can a caller name Claude for them.
+        with pytest.raises(HubError) as refused:
+            await command(hub, "worker.register", {"kind": "review", "backend": "claude"})
+        assert refused.value.code == "INVALID_INPUT" and "run on Codex" in refused.value.message
+    finally:
+        await hub.close()
+
+
+@pytest.mark.parametrize("role", ["reviewer_backend", "integrator_backend"])
+def test_a_plan_cannot_put_reviewers_or_the_integrator_on_claude(role):
+    with pytest.raises(ValidationError, match="run on Codex"):
+        AssignmentConfig(**{role: "claude"})
+    AssignmentConfig(**{role: "codex"})  # Older project files say so; that still loads.
 
 
 async def test_a_full_backend_holds_new_worker_sessions_but_never_a_review(tmp_path):

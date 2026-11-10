@@ -300,14 +300,30 @@ def stopped_at(path: str, text: str, processing: tuple[tuple[int, int], ...] | l
 
 
 def memory_limited(request: CheckRequest, lane: str, limit_gib: float, observed: int,
-                   result: dict[str, Any] | None = None) -> dict:
+                   result: dict[str, Any] | None = None, *, by_system: bool = False) -> dict:
     """The result of a check stopped because one of its Lean processes held more than `limit_gib`
     of private memory: unavailable, as one past its time (failed_check_verdict). `result` is
     what the check had found by then, such as its doctor's report and its sources' digest,
     which every reader of a result takes for granted; a check stopped before it had them
-    reports them unknown."""
+    reports them unknown. `by_system`: the kernel ended one of its processes when memory ran
+    out (the Lean service's processes are the first it ends), and `observed` is the most its
+    processes were seen to hold."""
     held = f"{observed / 2**30:.1f} GiB"
-    if lane == "interactive":
+    if by_system:
+        if lane == "interactive":
+            reason = (f"The development check was stopped: the machine's memory ran out and the system ended one "
+                      f"of its Lean processes, the largest then running. The check was last seen holding {held}; "
+                      f"a check may use {limit_gib:g} GiB. If it held much less, other checks filled the memory: "
+                      "check again later. Otherwise an elaboration, a kernel reduction or an inspection in it "
+                      "grows without bound: find the step that grows by checking smaller pieces, and without "
+                      "inspections; keep large terms out of statements by naming large intermediate objects as "
+                      "definitions of their own.")
+        else:
+            reason = (f"The check was stopped: the machine's memory ran out and the system ended one of its Lean "
+                      f"processes; the check was last seen holding {held}. That is no finding about the "
+                      "candidate: the check is unavailable and is tried again later.")
+        stopped = f"Stopped: the system ended a Lean process when memory ran out; the check held {held}"
+    elif lane == "interactive":
         reason = (f"The development check was stopped: one of its Lean processes held {held} of memory, more "
                   f"than the {limit_gib:g} GiB a check may use. An elaboration, a kernel reduction or an "
                   "inspection in it grows without bound or far past what the Library's checks need. Find the "
@@ -318,10 +334,12 @@ def memory_limited(request: CheckRequest, lane: str, limit_gib: float, observed:
                   f"{limit_gib:g} GiB a check may use. That is no finding about the candidate: the check is "
                   "unavailable and is tried again later. Its kernel replay or inspection, which Lean does not "
                   "bound by heartbeats, may grow without bound.")
+    if not by_system:
+        stopped = f"Stopped: a Lean process held {held}, past the limit of {limit_gib:g} GiB"
     # The process error makes a client reading results with earlier code take it as unavailable too.
-    stopped = f"Stopped: a Lean process held {held}, past the limit of {limit_gib:g} GiB"
     compilation = {"ok": False, "proof_accepted": False, "validation_method": "lean-service", "reason": reason,
-                   "process": {"memory_limited": True, "memory": observed, "error": stopped},
+                   "process": {"memory_limited": True, "memory": observed, "error": stopped,
+                               **({"ended_by_system": True} if by_system else {})},
                    "diagnostics": {"messages": [], "other_output": [], "errors": 0, "warnings": 0},
                    "modules": [{"module": module} for module in request.modules],
                    "built_modules": [], "reused_modules": []}

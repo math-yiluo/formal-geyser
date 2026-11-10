@@ -47,7 +47,8 @@ def build_output_limit(output_bytes: int, sources: dict[str, bytes]) -> int:
 
 def _replay_keys(build_directory: Path, sources: dict[str, bytes], modules: Sequence[str],
                  identity: str) -> dict[str, str]:
-    """Replay keys for the requested modules and every project module they import.
+    """Replay keys for the requested modules and every project module they import, in import
+    order: each module after the project modules it imports (_replay_groups relies on it).
 
     Replay re-checks a module's own declarations and trusts its imports as compiled,
     so a key names the module's compiled parts and, recursively, those of the project
@@ -96,36 +97,72 @@ def _record_replays(store: Path, keys: Sequence[str]) -> None:
 # `threads` processes, each with at least this many modules, since each loads its environment
 # again. In the Linux pilot one edit to a widely imported module left about 5,200 modules to
 # replay, about 4 s each, in one process.
+#
+# A group must not reach one name twice (KernelReplay.lean): no member may be reached through an
+# import outside the group, and no two modules it reaches may declare one name. A group is a run of
+# consecutive modules in import order, so whatever lies on an import path between two members is a
+# member too (on 11-08 the round-robin groups of the Mac pilot's first full replay broke this). Order
+# cannot help where the Library declares one name in two modules that never import each other, as the
+# Linux pilot's Library did for 33 declarations on 11-08, mostly instances Lean named itself. So a
+# group that reaches a name twice is replayed again as its two halves, down to single modules, which
+# replay as leanchecker replays them.
+#
+# A process also keeps the memory its heaviest declaration took until it ends: in that first full
+# replay ten processes of about 2,100 modules each grew to 13-14 GiB within minutes and exhausted the
+# VM's 46 GiB, and the Lean service stopped the check, losing every group still running. So a group
+# has at most REPLAY_GROUP_MOST_MODULES; more groups than processes wait their turn, each process ends
+# soon after its heaviest declaration, and a stop loses only the groups then running.
 REPLAY_GROUP_MODULES = 100
+REPLAY_GROUP_MOST_MODULES = 250
 
 
-async def _replay_groups(tooling, build_directory: Path, pending: list[str], libraries, threads: int,
-                         record) -> dict:
-    """Replay `pending` in up to `threads` processes at once. `record(modules)` keeps the markers
-    of each group that passes as it passes, so a replay stopped or failed later keeps that work.
-    The report is the first failing group's, or the first group's, for all of `pending`."""
-    groups = max(1, min(max(1, threads), len(pending) // REPLAY_GROUP_MODULES))
-    parts = [pending[index::groups] for index in range(groups)]
-
-    async def one(part: list[str]) -> dict:
-        report = await tooling.kernel_replay(build_directory, part, libraries)
-        if report["ok"]:
-            await record(part)
-        return report
-    if groups == 1:
-        return await one(parts[0])
-    running = [asyncio.ensure_future(one(part)) for part in parts]
+async def _all_or_none(coroutines) -> list:
+    """Run `coroutines` at once. The first error, or a cancellation, stops the others too and is
+    raised as it was."""
+    running = [asyncio.ensure_future(coroutine) for coroutine in coroutines]
     try:
-        reports = await asyncio.gather(*running)
+        return list(await asyncio.gather(*running))
     except BaseException:
-        # The first error, or a cancellation, stops the other groups too; it is raised as it was.
         for task in running:
             task.cancel()
         await asyncio.gather(*running, return_exceptions=True)
         raise
+
+
+async def _replay_groups(tooling, build_directory: Path, pending: list[str], libraries, threads: int,
+                         record) -> dict:
+    """Replay `pending`, listed in import order (_replay_keys), in up to `threads` processes at once,
+    each a run of consecutive modules, at most REPLAY_GROUP_MOST_MODULES. `record(modules)` keeps the
+    markers of each group that passes as it passes, so a replay stopped or failed later keeps that
+    work. The report is the first failing group's, or the first group's, for all of `pending`, with
+    every group that ran to a verdict and every group that was split because it reached a name twice."""
+    groups = max(1, min(max(1, threads), len(pending) // REPLAY_GROUP_MODULES),
+                 -(-len(pending) // REPLAY_GROUP_MOST_MODULES))
+    bounds = [len(pending) * index // groups for index in range(groups + 1)]
+    parts = [pending[bounds[index]:bounds[index + 1]] for index in range(groups)]
+    processes = asyncio.Semaphore(max(1, threads))
+    split: list[dict] = []
+
+    async def one(part: list[str]) -> list[tuple[list[str], dict]]:
+        async with processes:
+            report = await tooling.kernel_replay(build_directory, part, libraries)
+        if report["ok"]:
+            await record(part)
+        elif len(part) > 1 and isinstance(report.get("held_name"), str):
+            split.append({"modules": len(part), "held_name": report["held_name"]})
+            middle = len(part) // 2
+            first, second = await _all_or_none([one(part[:middle]), one(part[middle:])])
+            return first + second
+        return [(part, report)]
+    verdicts = [item for items in await _all_or_none([one(part) for part in parts]) for item in items]
+    reports = [report for _, report in verdicts]
+    if len(reports) == 1:
+        return reports[0]
     failed = next((report for report in reports if not report["ok"]), None)
     merged = {**(failed or reports[0]), "replayed_modules": list(pending),
-              "groups": [{"modules": len(part), "ok": report["ok"]} for part, report in zip(parts, reports)]}
+              "groups": [{"modules": len(part), "ok": report["ok"]} for part, report in verdicts]}
+    if split:
+        merged["split_groups"] = split
     if failed is None:
         constants = [report.get("constants") for report in reports]
         merged["constants"] = sum(constants) if all(isinstance(item, int) for item in constants) else None

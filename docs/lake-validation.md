@@ -8,7 +8,9 @@ declaration of the built project modules to the kernel again, loading their othe
 imports once and trusting them as compiled; development checks skip it. A kernel
 rejection is a finding naming the module; a replay that cannot load its environment
 is unavailable. A closure whose exact compiled bytes already passed is not replayed
-again. Definitions, proposition statements and proofs retain independent semantic
+again. A long replay runs in several processes, each a run of consecutive modules in
+import order; a group that reaches one name twice, as two modules that never import
+each other may both declare it, is replayed again in halves, down to single modules. Definitions, proposition statements and proofs retain independent semantic
 review against their Markdown and cited literature. Module-wide axiom audits are
 not run.
 

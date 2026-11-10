@@ -12,6 +12,7 @@ uses the ordinary build.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -233,11 +234,12 @@ class SessionPool:
     """The service's resident sessions, keyed by worker, working directory and environment."""
 
     def __init__(self, *, sandbox, limit: int = 6, idle_seconds: float = 600.0,
-                 command: Callable[[Path], list[str]] | None = None):
+                 command: Callable[[Path], list[str]] | None = None, group_limits: dict[str, int] | None = None):
         self.sandbox = sandbox
         self.limit = limit
         self.idle_seconds = idle_seconds
         self.command = command or (lambda lean: [str(lean), "--server"])
+        self.group_limits = dict(group_limits or {})  # Each session's JobGroup memory bounds.
         self.sessions: dict[str, Session] = {}
         self._starting = asyncio.Lock()
 
@@ -301,7 +303,7 @@ class SessionPool:
                        LAKE_CACHE_DIR=str(cache), LAKE_ARTIFACT_CACHE="true", LAKE_RESTORE_ARTIFACTS="true",
                        LEAN_NUM_THREADS=str(max(1, threads)), TMPDIR=str(temporary))
             command, env = self.sandbox.wrap(self.command(executable), cwd=root, env=env, writable=[root, cache])
-            group = await asyncio.to_thread(JobGroup)
+            group = await asyncio.to_thread(functools.partial(JobGroup, **self.group_limits))
             try:
                 host = await OwnedProcessHost.start(command, cwd=root, env=env, max_frame_bytes=FRAME_BYTES,
                                                     startup_timeout=60.0, group=group, register=False)

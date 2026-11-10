@@ -51,8 +51,8 @@ taskctl backend set codex
 ```
 
 `set` applies to workers created from then on, including new collaborators, over the
-assignment plan's `worker_backends`; reviewers and the Integrator follow the plan, else the
-project's `new_worker_backend`. Decision helpers always run on the Codex account. `show` reports the current choice and, for each backend,
+assignment plan's `worker_backends`. Reviewers, the Integrator and the decision helpers always
+run on the Codex account, whatever backend workers use. `show` reports the current choice and, for each backend,
 its workers, its token usage, its live sessions and limit, and any account hold. The same status is at
 `GET /v1/runtime/backend`; the switch is the operator command
 `runtime.select_backend` with `{"backend": "codex" | "claude"}`. Selecting Claude
@@ -107,17 +107,18 @@ deadline `runtime.set_answer_deadline`. `GET /v1/runtime/backend` reports all of
 
 ### The assignment plan
 
-`project.toml` can fix the backend, and a worker's rotation mode, by role. For reviewers and
-the Integrator the plan's backend applies; for new workers the operator's choice, once made,
-overrides it:
+`project.toml` can fix new workers' backend, and an agent's rotation mode, by role. For new
+workers the operator's choice, once made, overrides the plan's backend. Reviewers and the
+Integrator run on Codex: their models are chosen for Codex only, so `reviewer_backend` and
+`integrator_backend`, kept for older project files, may only be `"codex"`, and `"claude"` is
+refused when the project loads. (Until 2026-11-08 they followed the project's
+`new_worker_backend`, so a project whose workers were on Claude made Claude reviewers.)
 
 ```toml
 [assignment]
 worker_backends = ["codex", "claude"]      # by worker number, repeating: even Codex, odd Claude
 worker_rotation = ["conservative", "conservative", "aggressive", "aggressive"]
-reviewer_backend = "claude"
 reviewer_rotation = "conservative"     # reviewers' own mode; unset follows the project
-integrator_backend = "codex"
 ```
 
 A list applies by worker number: Worker 0 takes its first entry, Worker 1 the next. The

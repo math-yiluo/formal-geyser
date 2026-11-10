@@ -17,7 +17,8 @@ from .models import BACKENDS, Actor, Checkpoint, Role, TaskContract, file_name_f
 from .session_settings import SESSION_BACKEND
 from .stall_watchdog import watched
 from .storage import canonical, digest
-from .worker_names import allocate_worker_number, next_worker_number, worker_identity
+from .text_bounds import shorten
+from .worker_names import kept_worker_number, next_worker_number, unkept_number, worker_identity
 from .workspace_preparation import SnapshotRequired
 
 logger = logging.getLogger(__name__)
@@ -241,7 +242,7 @@ class Lifecycle(Collaboration):
                 # Historical targets belong in the repair brief, not unavailable
                 # admission inputs. Exact new proof targets can be bound by revision.
                 repair = self._dispatch(c, "task.publish", {"deduplicate": False, "contract": {
-                    "title": ("Restore current evidence: " + task["contract"]["title"])[:300],
+                    "title": shorten("Restore current evidence: " + task["contract"]["title"], 300),
                     "objective": "Establish independently accepted and published replacement evidence for the original completed task's acceptance conditions. Identify exact replacement references and their correspondence; a repair plan alone does not restore invalid evidence.",
                     "domain": task["contract"]["domain"],
                     "acceptance_policy": task["contract"]["domain"] + ".peer@1",
@@ -977,12 +978,15 @@ class Lifecycle(Collaboration):
         # for the other tasks: a claim ends the pass, and a decision begun only adds its own.
         exhausted, offers = self._exhausted_decisions(c), self._new_worker_offers(c)
         executed = self._executors_among(c, [worker["id"] for worker in idle])
+        # A task that keeps its number has a new worker as its first executor, never an idle one.
+        keeping = {row[0] for row in c.execute("SELECT task_id FROM kept_worker_numbers WHERE worker_id IS NULL")}
 
         def choices(task_id):
             """The idle workers a decision would choose among for this task; none when a new
-            worker takes it without one (the decisions' account is held, or they kept failing)."""
+            worker takes it without one (the decisions' account is held, or they kept failing,
+            or the task keeps its number for its first executor)."""
             available = [worker for worker in idle if worker["id"] not in executed.get(task_id, ())]
-            if available and "codex" not in held and task_id not in exhausted:
+            if available and "codex" not in held and task_id not in exhausted and task_id not in keeping:
                 return available
             return []
 
@@ -1082,8 +1086,13 @@ class Lifecycle(Collaboration):
         c.execute("SAVEPOINT fresh_claim")
         worker_id = None
         try:
-            self._skip_full_numbers(c)
-            worker_id = self._new_worker(c, kind="ordinary")
+            kept = kept_worker_number(c, candidate["task_id"]) if candidate["opportunity"] == "initial" else None
+            if kept is None:
+                self._skip_full_numbers(c)
+                worker_id = self._new_worker(c, kind="ordinary")
+            else:
+                worker_id = self._new_worker(c, kind="ordinary", backend=self._kept_number_backend(c, kept),
+                                             number=kept)
             result = self._claim_opportunity(c, worker_id, candidate, run_id)
         except HubError as error:
             c.execute("ROLLBACK TO fresh_claim")
@@ -1599,15 +1608,27 @@ class Lifecycle(Collaboration):
         another account of the plan is free, it is the first later number on a free account.
         Each account keeps its numbers, and the skipped ones stay unused."""
         number, plan = next_worker_number(c), self._worker_plan(c)
-        held = set(self._dispatch_holds(c)) | self._paused_backends(c, "ordinary")
-        free = {backend for backend in plan if backend not in held and not self._backend_full(c, backend)}
+        free = self._free_plan_backends(c, plan)
         while free and self.config.assignment.backend("ordinary", number) not in free:
-            number += 1
+            number = unkept_number(c, number + 1)  # A number a task keeps is never skipped to.
         return number
 
+    def _free_plan_backends(self, c, plan):
+        held = set(self._dispatch_holds(c)) | self._paused_backends(c, "ordinary")
+        return {backend for backend in plan if backend not in held and not self._backend_full(c, backend)}
+
     def _skip_full_numbers(self, c):
-        for _ in range(self._free_number(c) - next_worker_number(c)):
-            allocate_worker_number(c)
+        c.execute("UPDATE worker_name_sequence SET next_number=max(next_number,?) WHERE id=1", (self._free_number(c),))
+
+    def _kept_number_backend(self, c, number):
+        """The account of a new worker that takes the number its task keeps: the plan's for that
+        number, or, when that account is held, full or paused, another free account of the plan
+        (the number cannot move instead). Without a plan, the operator's or the project's choice."""
+        plan = self._worker_plan(c)
+        if not plan:
+            return None
+        planned, free = self.config.assignment.backend("ordinary", number), self._free_plan_backends(c, plan)
+        return planned if planned in free or not free else next(b for b in dict.fromkeys(plan) if b in free)
 
     def _admit_item(self, c, savepoint, subject, task_id, skippable, operation):
         """Run one admission candidate; isolate its failure from every other item."""

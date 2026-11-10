@@ -11,6 +11,7 @@ job is sized from what this one really used.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import math
 import os
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .. import offload
+from .. import cgroups, offload
 from ..coordination.models import LeanServiceConfig
 from ..coordination.storage import collected_thread_call, digest
 from ..lake_dedupe import SlotDeduper
@@ -65,6 +66,27 @@ START_RETRY_SECONDS, START_RETRY_MAX_SECONDS = 1.0, 60.0
 # Library's 8,674 and a candidate's 755) and failed before Lean ran. A longer command reads its
 # arguments from a file instead (argument_file_command).
 ARGUMENT_FILE_LIMIT = 1000
+# A job's cgroup may hold, in memory, `process_memory_gib` for each of its threads and this much
+# beside: the Library .olean pages it reads are charged to the first cgroup that reads them, and
+# a development check whose own memory stays within its limit must not lose them to reclaim.
+JOB_MEMORY_SLACK_GIB = 8
+
+
+def job_memory_limits(config: LeanServiceConfig, threads: int) -> dict[str, int]:
+    """The bounds of a job's, or a resident session's, cgroup (JobGroup): the kernel keeps what its
+    processes hold in memory within `process_memory_gib` for each thread, plus the pages it reads
+    (JOB_MEMORY_SLACK_GIB), and as much again in swap, so that one whose growth outruns the
+    service's one-second measurement (_limit_memory) takes neither the machine's memory nor its
+    swap. Without a process limit there is no bound."""
+    if not config.process_memory_gib:
+        return {}
+    own = config.process_memory_gib * max(1, threads) * GIB
+    return {"memory_max": int(own + JOB_MEMORY_SLACK_GIB * GIB), "swap_max": int(own)}
+
+
+def measure_memory() -> tuple[int, int] | None:
+    """Free memory and commit (machine.memory), within the service's own scope's memory limit."""
+    return machine_module.memory(cgroups.current_root())
 
 
 def argument_file_command(argv, directory: Path) -> tuple[list[str], Path]:
@@ -132,6 +154,7 @@ class ServiceJob:
         self.cancel_requested = False
         self.abandoned = False
         self.memory_limited: int | None = None  # What its largest process held when it was stopped for it.
+        self.peak_observed = 0  # The most private memory its processes and borrowed sessions held at a sample.
         self.borrowed: list[JobGroup] = []  # A resident session's processes, while this job uses them.
         self.suspended_since: float | None = None
         self.run_paused_base = 0.0  # Suspended seconds before the current run started.
@@ -165,6 +188,10 @@ class JobRunner:
     def __init__(self, service: LeanService, job: ServiceJob):
         self.service = service
         self.job = job
+        # The kernel's kills in each borrowed session's cgroup when the job took it, and how many
+        # of the session's processes it killed while the job used it.
+        self._kills_at_borrow: dict[int, int] = {}
+        self.session_kills = 0
 
     def paused_seconds(self) -> float:
         """How long the job has been suspended in all, which a time limit leaves out."""
@@ -180,14 +207,26 @@ class JobRunner:
     def borrow(self, group: JobGroup) -> None:
         """While the job uses a resident session, suspending the job suspends the session too."""
         self.job.borrowed.append(group)
+        self._kills_at_borrow[id(group)] = group.oom_kills()
         if self.job.sched.state == "suspended":
             group.suspend()
 
     def give_back(self, group: JobGroup) -> None:
         if group in self.job.borrowed:
             self.job.borrowed.remove(group)
+            self.session_kills += self._session_kills(group)
+            self._kills_at_borrow.pop(id(group), None)
             if group.suspended:
                 group.resume()
+
+    def _session_kills(self, group: JobGroup) -> int:
+        return max(0, group.oom_kills() - self._kills_at_borrow.get(id(group), 0))
+
+    def kernel_kills(self) -> int:
+        """How many of the job's processes, its borrowed sessions' included, the kernel ended for
+        want of memory during its run."""
+        own = self.job.group.oom_kills() if self.job.group is not None else 0
+        return own + self.session_kills + sum(self._session_kills(group) for group in self.job.borrowed)
 
     async def run(self, argv, *, cwd: Path, timeout: float | None = None, output_limit: int = 1048576,
                   env=None, stdin: bytes | None = None):
@@ -242,7 +281,7 @@ class LeanService:
         self.deduper = SlotDeduper(self.root / ".task-based" / "objects" / "lake")
         self.sandbox = sandbox or Unsandboxed()
         self.process_runner = runner or ProcessRunner()
-        self.measure = measure or machine_module.memory
+        self.measure = measure or measure_memory
         self.threads = threads or self.config.threads or machine_module.logical_cores()
         self.clock = clock
         self.instance = uuid4().hex
@@ -269,7 +308,8 @@ class LeanService:
         # delays every running job, and each job's result gives its share (`event_loop_lag`).
         self.loop_lag = 0.0
         self.sessions = SessionPool(sandbox=self.sandbox, limit=self.config.sessions,
-                                    idle_seconds=self.config.session_idle_minutes * 60, command=session_command)
+                                    idle_seconds=self.config.session_idle_minutes * 60, command=session_command,
+                                    group_limits=job_memory_limits(self.config, 1))
         self.warm_changed = asyncio.Event()
 
     # Lifecycle
@@ -544,7 +584,7 @@ class LeanService:
         together with the task of its run; until then a failure leaves it queued, holding nothing."""
         now = self.clock()
         try:
-            group = await asyncio.to_thread(JobGroup)
+            group = await asyncio.to_thread(functools.partial(JobGroup, **job_memory_limits(self.config, threads)))
         except OSError as error:
             # No process of the job may run outside its cgroup: it ends, unavailable.
             logger.error("Lean job %s could not start: %s", job.id, error)
@@ -671,8 +711,9 @@ class LeanService:
         lane = job.sched.lane
         minutes = {"interactive": self.config.check_minutes, "official": self.config.validation_minutes}.get(lane, 0)
         lag = self.loop_lag
+        runner = JobRunner(self, job)
         try:
-            result = await run_check(job.spec.request, runner=JobRunner(self, job), threads=threads,
+            result = await run_check(job.spec.request, runner=runner, threads=threads,
                                      scratch=job.scratch, sessions=self.sessions if self.config.sessions else None,
                                      owner=job.row["owner"], time_limit=minutes * 60 if minutes else None,
                                      time_limit_reason=stopped_reason(lane, minutes * 60) if minutes else None,
@@ -690,6 +731,21 @@ class LeanService:
             result = {"error": {"type": "RuntimeError", "message": f"{type(error).__name__}: {error}"},
                       "definitive": False}
             outcome = "failed"
+        try:
+            killed = await asyncio.to_thread(runner.kernel_kills)
+        except OSError:
+            killed = 0  # Its cgroup is unreadable: what the run reported stands.
+        if killed:
+            # The kernel ended one of its processes when memory ran out: whatever the run then
+            # reported, such as a Lean process ended by a signal, is no finding about the check.
+            group = job.group
+            observed = max(job.peak_observed, group.peak_private_memory if group is not None else 0)
+            logger.warning("Lean job %s: the kernel ended %d of its processes for want of memory; it held %.1f GiB",
+                           job.id, killed, observed / GIB)
+            job.memory_limited = observed
+            result = memory_limited(job.spec.request, lane, self.config.process_memory_gib, observed,
+                                    result=result if outcome == "completed" else None, by_system=True)
+            outcome = "completed"
         await self._finish(job, result, outcome)
 
     async def _release(self, job: ServiceJob) -> bool:
@@ -898,6 +954,7 @@ class LeanService:
             borrowed = await asyncio.to_thread(session_group.usage)
             job.sched.observed_memory += borrowed.private_memory
             job.sched.observed_commit += borrowed.committed_memory
+        job.peak_observed = max(job.peak_observed, job.sched.observed_memory)
         job.peak_committed = max(job.peak_committed, usage.peak_committed_memory)
         job.row["peak_private_memory"] = max(job.row.get("peak_private_memory") or 0, group.peak_private_memory)
         samples, now = job.cpu_samples, time.monotonic()

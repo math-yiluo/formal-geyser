@@ -87,9 +87,17 @@ CREATE TRIGGER IF NOT EXISTS {_table}_state_{_operation.lower()}
 
 
 
+# The (backend, kind) a paused run's AdmissionScope names for the Integrator's own control group
+# (Hub CONTROL_GROUPS "integrator"), which is on any backend.
+INTEGRATOR_GROUP = (None, "integrator")
+
+
 class BatchIntegration:
     _batch_admission_hint: tuple | None = None
     if TYPE_CHECKING:
+        _worker_control: Any
+        _group_of: Any
+        _group_controls: Any
         _workspace_snapshot: Any
         _wake_after_batch: Any
         _release_conversation: Any
@@ -231,17 +239,31 @@ class BatchIntegration:
                 continue  # A concrete candidate blocker never halts other work.
         return result
 
+    def _integrator_admitted(self, c, run_id, scope, worker_id):
+        """Whether the run admits the Integrator now: as anyone, or, while the run is paused, with
+        its group resumed, which admits an Integrator made after the scope was read too."""
+        return (self._scope_admits(c, run_id, scope, worker_id)
+                or INTEGRATOR_GROUP in getattr(scope, "groups", ()))
+
     def _batch_assignment(self, c, run_id, scope):
         if not self._batch_enabled(c):
             if scope is not None or not self._enable_integrator(c):
                 return None
         control = c.execute("SELECT * FROM integrator_control WHERE id=1").fetchone()
+        # The Integrator's own control, else its group's (Hub CONTROL_GROUPS "integrator"), which
+        # the operator can set before the Integrator exists: paused, no batch starts or goes on.
+        run = c.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if run is not None and (
+                self._worker_control(c, run_id, control["worker_id"]) if control["worker_id"]
+                else self._group_of(self._group_controls(c, run_id), None, "integrator")) == "paused":
+            return None
         batch = c.execute("SELECT * FROM integration_batches WHERE ended_at IS NULL").fetchone()
         created = batch is None
         if batch is None:
-            if scope is not None and control["worker_id"] not in scope:
-                # An individual resume creates no new work, except that a resumed Integrator
-                # receives the next batch under the usual rules.
+            if (scope is not None and control["worker_id"] not in scope
+                    and INTEGRATOR_GROUP not in getattr(scope, "groups", ())):
+                # An individual resume creates no new work, except that a resumed Integrator, on
+                # its own or with its group, receives the next batch under the usual rules.
                 return None
             waiting = self._batch_waiting(c)
             if not waiting["count"]:
@@ -277,7 +299,7 @@ class BatchIntegration:
             if (
                 worker["active_attempt"]
                 or worker["state"] == "recovery_required"
-                or not self._scope_admits(c, run_id, scope, worker_id)
+                or not self._integrator_admitted(c, run_id, scope, worker_id)
             ):
                 return None
             task_id = control["task_id"]
@@ -339,7 +361,7 @@ class BatchIntegration:
         if (
             worker["active_attempt"]
             or worker["state"] == "recovery_required"
-            or not self._scope_admits(c, run_id, scope, worker["id"])
+            or not self._integrator_admitted(c, run_id, scope, worker["id"])
         ):
             return None
         if worker["work_intention"] == "waiting" and not created:

@@ -89,8 +89,11 @@ class OwnedProcessHost:
             if register:
                 from .ownership import register_tree
                 receipt = register_tree(cwd.resolve(), cgroup)
+            # A Lean service job's processes are the first the kernel ends when memory runs out.
+            adjust = getattr(group, "oom_score_adj", None) if group is not None else None
             process = await asyncio.create_subprocess_exec(
-                *cgroups.enter(cgroup, command), cwd=str(cwd), env=dict(env) if env is not None else None,
+                *cgroups.enter(cgroup, command, oom_score_adj=adjust), cwd=str(cwd),
+                env=dict(env) if env is not None else None,
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE, limit=max_frame_bytes + 1, start_new_session=True,
             )

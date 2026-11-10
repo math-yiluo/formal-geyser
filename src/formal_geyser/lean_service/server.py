@@ -29,6 +29,7 @@ from ..coordination.local_operator import issue_token, operator_request
 from ..coordination.runtime.process import raise_open_files_limit
 from ..coordination.storage import atomic_json
 from .client import state_directory
+from .machine import memory_limit
 from .sandbox import CodexSandbox, Unavailable, Unsandboxed
 from .service import LeanService
 from .warm import WarmSet
@@ -231,11 +232,14 @@ def supervise(root: Path) -> int:
         while not stop.exists():
             started = time.monotonic()
             # The server's own delegated scope, which ends with this supervisor's, so that a new
-            # supervisor never finds two servers.
+            # supervisor never finds two servers. It bounds what the server and its processes
+            # hold together (service_memory_gib), read again at each start.
             unit = f"formal-geyser-lean-{uuid4().hex}.scope"
+            limit = _memory_limit(root)
             command = cgroups.scope_command(
                 unit, [sys.executable, "-m", "formal_geyser.lean_service", "serve", "--project", str(root)],
-                delegate=True, bound_to=cgroups.own_unit())
+                delegate=True, bound_to=cgroups.own_unit(),
+                properties=[f"MemoryMax={limit}"] if limit is not None else [])
             with (state / "service.log").open("ab") as log:
                 process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                                            cwd=str(root), env=cgroups.bus_environment())
@@ -252,6 +256,16 @@ def supervise(root: Path) -> int:
         (state / "supervisor.json").unlink(missing_ok=True)
         lock.release()
     return 0
+
+
+def _memory_limit(root: Path) -> int | None:
+    """The memory bound of the server's scope, in bytes (machine.memory_limit); with a project
+    configuration that cannot be read, the default share of the machine's memory."""
+    try:
+        gib = load_config(root).lean_service.service_memory_gib
+    except Exception:
+        gib = None  # The server itself then reports the configuration's error.
+    return memory_limit(gib)
 
 
 def _event(state: Path, record: dict) -> None:

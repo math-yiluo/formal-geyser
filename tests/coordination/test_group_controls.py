@@ -2,10 +2,12 @@
 Codex's workers or reviewers alone, without model execution."""
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from formal_geyser.coordination.errors import HubError
-from formal_geyser.coordination.hub import control_applies, group_control
+from formal_geyser.coordination.hub import control_applies, group_control, upgrade_group_controls
 from formal_geyser.coordination.models import ProjectConfig
 from tests.coordination.publication_helpers import new_hub
 from tests.coordination.test_collaborative_core import claim, machine, publish, stage, start
@@ -191,11 +193,18 @@ def _controlled_per_person(hub, c, run_id, control):
 
 async def test_group_controls_are_read_per_group_with_the_same_people_as_per_person(case):
     hub, run = case
-    people = []
+    people, made_on_claude = [], []
     for backend in ("codex", "claude"):
         for kind in ("ordinary", "review"):
             for _ in range(3):
-                people.append((await command(hub, "worker.register", {"backend": backend, "kind": kind}))["id"])
+                # Reviewers are made on Codex now; those made on Claude before 2026-11-08 remain.
+                made = await command(hub, "worker.register",
+                                     {"backend": "codex" if kind == "review" else backend, "kind": kind})
+                people.append(made["id"])
+                if kind == "review" and backend == "claude":
+                    made_on_claude.append(made["id"])
+    await hub.db.call(lambda c: c.executemany("UPDATE workers SET backend='claude' WHERE id=?",
+                                              [(worker_id,) for worker_id in made_on_claude]), write=True)
     retired, own = people[::5], people[1::3]
 
     def arrange(c, groups, controls, run_state, after_turn):
@@ -225,3 +234,23 @@ async def test_group_controls_are_read_per_group_with_the_same_people_as_per_per
                     seen.update(found)
     # Every unretired person was controlled in some arrangement, and no retired one but by its own control.
     assert set(people) - set(retired) <= seen and not (set(retired) - set(own)) & seen
+
+
+def test_an_older_group_controls_table_learns_the_integrators_group():
+    # Before 2026-11-08 the scope check named only the Codex and Claude groups.
+    c = sqlite3.connect(":memory:", isolation_level=None)
+    c.execute("CREATE TABLE runs(id TEXT PRIMARY KEY)")
+    c.execute("INSERT INTO runs VALUES('r')")
+    c.execute("CREATE TABLE group_controls(scope TEXT PRIMARY KEY CHECK(scope IN ('codex','codex.workers',"
+              "'codex.reviewers','claude')),run_id TEXT NOT NULL REFERENCES runs(id),"
+              "control TEXT NOT NULL CHECK(control IN ('paused','resumed')),created_at INTEGER NOT NULL)")
+    c.execute("INSERT INTO group_controls VALUES('codex.reviewers','r','paused',1)")
+    with pytest.raises(sqlite3.IntegrityError):
+        c.execute("INSERT INTO group_controls VALUES('integrator','r','paused',2)")
+    upgrade_group_controls(c)
+    c.execute("INSERT INTO group_controls VALUES('integrator','r','paused',2)")
+    assert c.execute("SELECT scope,control FROM group_controls ORDER BY scope").fetchall() == [
+        ("codex.reviewers", "paused"), ("integrator", "paused")]
+    upgrade_group_controls(c)  # Once is enough; again it changes nothing.
+    with pytest.raises(sqlite3.IntegrityError):
+        c.execute("INSERT INTO group_controls VALUES('everyone','r','paused',3)")

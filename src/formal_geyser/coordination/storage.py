@@ -6,11 +6,12 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -174,10 +175,43 @@ def digest(value) -> str:
 SKIPPED_DIRECTORIES = frozenset({".git", ".lake", ".venv", "__pycache__", ".taskhub-integration", ".private"})
 # A file changed this recently is read again: its metadata might not yet identify its content.
 SNAPSHOT_SETTLED_NANOSECONDS = 2_000_000_000
-# Workspaces whose files' hashes a BlobStore remembers between snapshots (about 0.5 MB each).
-# 64 were fewer than the Linux pilot's workspaces active at once (about 50 live sessions, new
-# reviewers and the workers between turns), so many turns read and hashed every file again.
-SNAPSHOT_DIRECTORIES = 256
+# Files whose hashes a BlobStore remembers between snapshots, over all workspaces; the least
+# recently snapshotted workspaces are forgotten first. It was 256 workspaces, set when one held
+# about 1,400 files: on the pilot on 2026-11-09 each held the Library's 42,700, about 21 MB of
+# cache each, and TaskHub grew to 11.8 GiB until the kernel ended it when memory ran out. Each
+# file now costs about 150 bytes (one packed value, its path shared between workspaces): this
+# holds about 93 workspaces of the Library, in about 0.6 GB.
+SNAPSHOT_CACHED_FILES = 4_000_000
+# A remembered file is one value: its identity (snapshot_identity), each number in 9 bytes,
+# then its SHA-256's 32.
+_NUMBER_BYTES, _DIGEST_BYTES = 9, 32
+
+
+def _pack_identity(identity: tuple[int, ...]) -> bytes:
+    return b"".join(number.to_bytes(_NUMBER_BYTES, "little", signed=True) for number in identity)
+
+
+def _unpack_identity(packed: bytes) -> tuple[int, ...]:
+    return tuple(int.from_bytes(packed[start:start + _NUMBER_BYTES], "little", signed=True)
+                 for start in range(0, len(packed), _NUMBER_BYTES))
+
+
+class KnownHashes(Mapping[str, tuple[tuple[int, ...], str]]):
+    """A workspace's remembered files (BlobStore.known_hashes): each one's identity and hash,
+    unpacked as it is read."""
+
+    def __init__(self, packed: dict[str, bytes]):
+        self._packed = packed
+
+    def __getitem__(self, name: str) -> tuple[tuple[int, ...], str]:
+        value = self._packed[name]
+        return _unpack_identity(value[:-_DIGEST_BYTES]), value[-_DIGEST_BYTES:].hex()
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._packed)
+
+    def __len__(self) -> int:
+        return len(self._packed)
 
 
 # Empty files Claude Code's sandbox creates at a workspace's top while a command runs, to mount its
@@ -255,8 +289,10 @@ class BlobStore:
         self._lock = threading.RLock()
         self._cache: OrderedDict[str, tuple[tuple[int, int, int], bytes]] = OrderedDict()
         self._cached_bytes = 0
-        # Per snapshot directory, each settled file's identity and hash (snapshot).
-        self._file_hashes: OrderedDict[str, dict[str, tuple[tuple[int, ...], str]]] = OrderedDict()
+        # Per snapshot directory, each settled file's identity and hash, packed (snapshot), and
+        # how many files that is over all directories (SNAPSHOT_CACHED_FILES).
+        self._file_hashes: OrderedDict[str, dict[str, bytes]] = OrderedDict()
+        self._cached_files = 0
         self.root.mkdir(parents=True, exist_ok=True)
 
     def put(self, body: bytes) -> str:
@@ -322,10 +358,12 @@ class BlobStore:
 
     def snapshot(self, directory: Path, *, max_files: int | None = None,
                  max_bytes: int | None = None, exact: bool = False,
-                 record: dict[str, tuple[tuple[int, ...], str]] | None = None) -> str:
+                 record: dict[str, tuple[tuple[int, ...], str]] | None = None, remember: bool = True) -> str:
         """The directory's files by content. An exact snapshot reads every file: content evidence,
         such as a candidate. Otherwise a settled file unchanged since the last snapshot keeps its
-        hash. `record`, when given, receives each file's identity and hash."""
+        hash. `record`, when given, receives each file's identity and hash. Without `remember`
+        the directory's files are not remembered, nor kept from an earlier snapshot: its files are
+        about to go (a workspace put at rest or reclaimed)."""
         max_files, max_bytes = snapshot_bounds(
             self.max_files if max_files is None else max_files,
             self.max_bytes if max_bytes is None else max_bytes,
@@ -346,7 +384,7 @@ class BlobStore:
         key = str(directory)
         with self._lock:
             known = {} if exact else self._file_hashes.get(key, {})
-        current: dict[str, tuple[tuple[int, ...], str]] = {}
+        current: dict[str, bytes] = {}
         files: list[dict[str, str]] = []
         total = 0
         for relative, entry in snapshot_entries(directory):
@@ -359,32 +397,47 @@ class BlobStore:
             if size > max_bytes - total:
                 raise ValueError("Snapshot byte limit exceeded")
             identity = snapshot_identity(info)
+            packed = _pack_identity(identity)
             cached = known.get(relative)
-            if cached is not None and cached[0] == identity:
-                sha = cached[1]
+            if cached is not None and cached[:-_DIGEST_BYTES] == packed:
+                sha = cached[-_DIGEST_BYTES:].hex()
             else:
                 with open(entry.path, "rb") as stream:
                     body = stream.read(size + 1)
                 if len(body) != size:
                     raise ValueError("Snapshot file changed during capture")
                 sha = self.put(body)
-            if time.time_ns() - max(info.st_mtime_ns, info.st_ctime_ns) >= SNAPSHOT_SETTLED_NANOSECONDS:
-                current[relative] = (identity, sha)
+            if (remember
+                    and time.time_ns() - max(info.st_mtime_ns, info.st_ctime_ns) >= SNAPSHOT_SETTLED_NANOSECONDS):
+                # One copy of each path for every workspace that holds it: the Library's are alike.
+                current[sys.intern(relative)] = packed + bytes.fromhex(sha)
             if record is not None:
                 record[relative] = (identity, sha)
             total += size
             files.append({"path": relative, "sha256": sha})
         with self._lock:
-            self._file_hashes[key] = current
-            self._file_hashes.move_to_end(key)
-            while len(self._file_hashes) > SNAPSHOT_DIRECTORIES:
-                self._file_hashes.popitem(last=False)
+            earlier = self._file_hashes.pop(key, None)
+            if earlier is not None:
+                self._cached_files -= len(earlier)
+            if remember:
+                self._file_hashes[key] = current
+                self._cached_files += len(current)
+                while self._cached_files > SNAPSHOT_CACHED_FILES and len(self._file_hashes) > 1:
+                    _, oldest = self._file_hashes.popitem(last=False)
+                    self._cached_files -= len(oldest)
         return self.put_json({"files": sorted(files, key=lambda x: x["path"])})
 
-    def known_hashes(self, directory: Path) -> dict[str, tuple[tuple[int, ...], str]]:
+    def forget(self, directory: Path) -> None:
+        """Forget the files remembered for `directory` (snapshot), whose files have gone."""
+        with self._lock:
+            earlier = self._file_hashes.pop(str(Path(directory).resolve()), None)
+            if earlier is not None:
+                self._cached_files -= len(earlier)
+
+    def known_hashes(self, directory: Path) -> Mapping[str, tuple[tuple[int, ...], str]]:
         """Each settled file the last snapshot of `directory` read: its identity and hash."""
         with self._lock:
-            return self._file_hashes.get(str(Path(directory).resolve()), {})
+            return KnownHashes(self._file_hashes.get(str(Path(directory).resolve()), {}))
 
     def restore(self, sha: str, destination: Path) -> None:
         destination.mkdir(parents=True, exist_ok=False)

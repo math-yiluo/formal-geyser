@@ -16,7 +16,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from ..bootstrap_runtime import bind_contract, require_contract_environment, require_ready
-from .batch_integration import BATCH_SCHEMA, BatchIntegration
+from .batch_integration import BATCH_SCHEMA, INTEGRATOR_GROUP, BatchIntegration
 from .claude_profiles import CLAUDE_PROFILES_SCHEMA, ClaudeProfiles
 from .codex_profiles import CODEX_PROFILES_SCHEMA, CodexProfiles
 from .collaboration import AT_LEAST_SUBSTANCE_SQL, SAME_SUBSTANCE_SQL
@@ -75,6 +75,7 @@ from .worker_names import (
     allocate_worker_number,
     initialize_agent_names,
     is_reserved_identity,
+    kept_worker_number,
     next_worker_number,
     worker_identity,
 )
@@ -129,19 +130,46 @@ def control_applies(alias: str, group: str = "NULL") -> str:
 
 
 # The groups the operator pauses after turn or resumes together: all of a backend's workers and
-# reviewers, or Codex's workers or reviewers alone. The Integrator and the Dispatcher are in none.
-CONTROL_GROUPS = {"codex": ("codex", ("ordinary", "review")), "codex.workers": ("codex", ("ordinary",)),
-                  "codex.reviewers": ("codex", ("review",)), "claude": ("claude", ("ordinary", "review"))}
+# reviewers, or Codex's workers or reviewers alone; and the Integrator, a group of its own on any
+# backend (None) that no other group includes. The Dispatcher and the Waker are in none.
+CONTROL_GROUPS: dict[str, tuple[str | None, tuple[str, ...]]] = {
+    "codex": ("codex", ("ordinary", "review")), "codex.workers": ("codex", ("ordinary",)),
+    "codex.reviewers": ("codex", ("review",)), "claude": ("claude", ("ordinary", "review")),
+    "integrator": (None, ("integrator",))}
+
+
+def upgrade_group_controls(connection) -> None:
+    """Rebuild group_controls when its scope check predates the Integrator's group (2026-11-08):
+    SQLite cannot change a CHECK constraint in place. Its rows are kept."""
+    row = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='group_controls'").fetchone()
+    if row is None or "'integrator'" in row[0]:
+        return
+    scopes = ",".join(f"'{scope}'" for scope in CONTROL_GROUPS)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute(f"CREATE TABLE group_controls_upgraded(scope TEXT PRIMARY KEY CHECK(scope IN ({scopes})),"
+                           "run_id TEXT NOT NULL REFERENCES runs(id),"
+                           "control TEXT NOT NULL CHECK(control IN ('paused','resumed')),created_at INTEGER NOT NULL)")
+        connection.execute("INSERT INTO group_controls_upgraded(scope,run_id,control,created_at) "
+                           "SELECT scope,run_id,control,created_at FROM group_controls")
+        connection.execute("DROP TABLE group_controls")
+        connection.execute("ALTER TABLE group_controls_upgraded RENAME TO group_controls")
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
 
 
 def group_control(worker: str, run: str | None) -> str:
     """SQL: the group control that applies to the worker row ``worker`` in run ``run`` (SQL; None
-    for any run): its role's group (Codex workers or reviewers) before its backend's. A group
-    control is kept only while it differs from what applies around it (Hub._on_group_control)."""
+    for any run): its role's group (Codex workers or reviewers) before its backend's, and the
+    Integrator's for the Integrator. A group control is kept only while it differs from what
+    applies around it (Hub._on_group_control)."""
     where = f"g.run_id={run} AND " if run else ""
-    return (f"(SELECT g.control FROM group_controls g WHERE {where}{worker}.kind IN ('ordinary','review') "
+    return (f"(SELECT g.control FROM group_controls g WHERE {where}(({worker}.kind IN ('ordinary','review') "
             f"AND g.scope IN ({worker}.backend,{worker}.backend||CASE {worker}.kind WHEN 'ordinary' "
-            "THEN '.workers' ELSE '.reviewers' END) AND (SELECT state FROM project_lifecycle WHERE id=1)='running' "
+            f"THEN '.workers' ELSE '.reviewers' END)) OR ({worker}.kind='integrator' AND g.scope='integrator')) "
+            "AND (SELECT state FROM project_lifecycle WHERE id=1)='running' "
             "ORDER BY length(g.scope) DESC LIMIT 1)")
 
 
@@ -212,6 +240,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIn
         """Quarantine unfinished local execution until its owned processes are confirmed quiet."""
         initialize_agent_names(c)  # Manages its own transaction.
         initialize_task_names(c)  # So does this; it numbers work tasks that have no number.
+        upgrade_group_controls(c)  # And this; it lets the Integrator's group be recorded.
         c.execute("BEGIN IMMEDIATE")
         try:
             self._restore_dispatch_hold(c)
@@ -758,7 +787,10 @@ class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIn
     @staticmethod
     def _group_of(controls, backend, kind):
         """The group control that applies to a backend's workers or reviewers (kind): their
-        role's group's, else their backend's. The Integrator and the Dispatcher have none."""
+        role's group's, else their backend's; the Integrator's own group's, on any backend. The
+        Dispatcher and the Waker have none."""
+        if kind == "integrator":
+            return controls.get("integrator")
         if kind not in {"ordinary", "review"}:
             return None
         return controls.get(backend + (".workers" if kind == "ordinary" else ".reviewers")) or controls.get(backend)
@@ -832,8 +864,11 @@ class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIn
                 raise
             resumed = self._controlled_workers(c, run_id, "resumed")
             run, controls = self._get(c, "runs", run_id), self._group_controls(c, run_id)
-            groups = {(backend, kind) for backend in BACKENDS for kind in ("ordinary", "review")
-                      if self._group_state(run, controls, backend, kind) == "running"}
+            groups: set[tuple[str | None, str]] = {
+                (backend, kind) for backend in BACKENDS for kind in ("ordinary", "review")
+                if self._group_state(run, controls, backend, kind) == "running"}
+            if self._group_state(run, controls, None, "integrator") == "running":
+                groups.add(INTEGRATOR_GROUP)  # The Integrator resumed with its group: its batches run.
             if not resumed and not groups:
                 raise
         if resumed:
@@ -909,6 +944,12 @@ class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIn
                 raise HubError("INTEGRATION_QUEUED", "An accepted review only answers integrator questions")
         if worker["current_task_id"] and worker["current_task_id"] != task_id and self._get(c, "tasks", worker["current_task_id"])["state"] not in {"done", "retired"}:
             raise HubError("CONTINUATION_RESERVED", "A worker with unfinished work takes no other task")
+        kept = kept_worker_number(c, task_id)
+        if (kept is not None and worker["worker_number"] != kept
+                and not c.execute("SELECT 1 FROM task_members WHERE task_id=? AND executor=1", (task_id,)).fetchone()):
+            raise HubError("WORKER_NUMBER_KEPT", f"Task {kept} had a worker in the instance it was carried from, so "
+                           f"its first executor here is Worker {kept}, a new worker made when the task is first "
+                           "assigned", 409)
         if self.config.repository.enabled:
             # This tiny metadata read preserves failure isolation before taking
             # membership or consuming a ticket; the actual checkout is async.
@@ -1453,8 +1494,9 @@ class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIn
 
     @CORE.handles("group.pause_after_turn", "group.resume")
     def _on_group_control(self, c, name, p, actor):
-        # A group against its run: all of Codex's or Claude's workers and reviewers, or Codex's
-        # workers or reviewers alone (CONTROL_GROUPS). Pause after turn lets each member's turn
+        # A group against its run: all of Codex's or Claude's workers and reviewers, Codex's
+        # workers or reviewers alone, or the Integrator, which no other group includes and which
+        # may be paused before it exists (CONTROL_GROUPS). Pause after turn lets each member's turn
         # under way finish and starts nothing after it, for members old and new. Resume lets
         # them run, new members and new work included, also while the run is paused.
         self._role(actor, Role.OPERATOR)
@@ -1475,7 +1517,10 @@ class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIn
             self._execution_environment(c)
             self._require_choices(c)
         backend, kinds = CONTROL_GROUPS[group]
-        members = "SELECT id FROM workers WHERE backend=? AND kind IN (" + ",".join("?" * len(kinds)) + ")"
+        # The Integrator's group is on any backend (None): its members are its kind's alone.
+        members = ("SELECT id FROM workers WHERE (? IS NULL OR backend=?) AND kind IN ("
+                   + ",".join("?" * len(kinds)) + ")")
+        member_args = (backend, backend, *kinds)
         narrower = [item for item, (other, part) in CONTROL_GROUPS.items() if other == backend and set(part) < set(kinds)]
         wider = [item for item, (other, part) in CONTROL_GROUPS.items() if other == backend and set(kinds) < set(part)]
         # As everyone's do to Pause all and Resume all, the controls of its narrower groups and
@@ -1483,7 +1528,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIn
         # pauses after turns.
         c.executemany("DELETE FROM group_controls WHERE scope=?", [(item,) for item in (group, *narrower)])
         c.execute("DELETE FROM worker_controls WHERE worker_id IN (" + members + ")"
-                  + ("" if wanted == "resumed" else " AND control='resumed'"), (backend, *kinds))
+                  + ("" if wanted == "resumed" else " AND control='resumed'"), member_args)
         # Recorded only where it differs from what applies around it, its wider group's control
         # or else the run; a pause after turns differs from any, as a person's does.
         around = next((control for item, control in self._group_controls(c, run["id"]).items() if item in wider), None)
@@ -1494,7 +1539,7 @@ class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIn
             # As on Resume, a member's claim held before dispatch becomes admissible again.
             c.execute("UPDATE workers SET state='idle' WHERE state='suspended' AND work_intention='working' "
                       "AND active_attempt IS NULL AND id IN (SELECT worker_id FROM attempts WHERE state='preflight_held') "
-                      "AND id IN (" + members + ")", (backend, *kinds))
+                      "AND id IN (" + members + ")", member_args)
             self._restart_ramp()
         self._event(c, name, group, {"run_id": run["id"]})
         return {"group": group, "run_id": run["id"], "run_state": run["state"], "groups": self._groups_view(c, run)}
@@ -1520,17 +1565,28 @@ class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIn
         kind = p.get("kind", "ordinary")
         if not isinstance(kind, str) or kind not in {"ordinary", "review", "integrator", "dispatcher", "waker"}:
             raise HubError("INVALID_INPUT", "Expected ordinary worker or review actor", 422)
-        number = allocate_worker_number(c) if kind == "ordinary" else None
+        kept = p.get("worker_number")
+        if kept is not None:
+            # The first executor of a task that keeps its number (worker_names.kept_worker_number).
+            self._role(actor, Role.RUNNER)
+            if kind != "ordinary" or not isinstance(kept, int) or isinstance(kept, bool) or not c.execute(
+                    "SELECT 1 FROM kept_worker_numbers WHERE worker_number=? AND worker_id IS NULL", (kept,)).fetchone():
+                raise HubError("INVALID_INPUT", "Only a task's kept number, not yet taken, is given to a new worker", 422)
+        number = (kept if kept is not None else allocate_worker_number(c)) if kind == "ordinary" else None
         reviewer_number = allocate_reviewer_number(c) if kind == "review" else None
         # A worker keeps its backend for life: its native session cannot move between them.
         backend = p.get("backend") or self._creation_backend(c, kind, number)
         if backend not in BACKENDS:
             raise HubError("INVALID_INPUT", "Expected the codex or claude backend", 422)
+        if kind != "ordinary" and backend != "codex":
+            raise HubError("INVALID_INPUT", "Reviewers, the Integrator and the decision helpers run on Codex", 422)
         self.workspace(wid)
         c.execute("INSERT INTO workers(id,worker_number,reviewer_number,kind,created_at,backend,work_intention,"
                   "rotation_mode) VALUES(?,?,?,?,?,?,'idle',?)",
                   (wid, number, reviewer_number, kind, self.clock(), backend,
                    self.config.assignment.rotation(kind, number)))
+        if kept is not None:
+            c.execute("UPDATE kept_worker_numbers SET worker_id=? WHERE worker_number=?", (wid, kept))
         return self._get(c, "workers", wid)
 
     @CORE.handles("runtime.select_backend")
@@ -2641,11 +2697,13 @@ class Hub(WorkspacePreparation, WorkspaceRetention, ConversationArchive, BatchIn
 
     def _creation_backend(self, c, kind: str = "ordinary", number: int | None = None) -> str:
         """The backend a new agent of this kind gets. A new worker: the operator's choice, else
-        the assignment plan's, else the project's. A reviewer or the Integrator: the plan's, else
-        the project's; the operator's choice is for workers only. Without a number, that of the
-        next ordinary worker."""
+        the assignment plan's, else the project's. Every other agent (a reviewer, the Integrator,
+        a decision helper) runs on Codex, whatever backend workers take. Until 2026-11-08 a
+        reviewer and the Integrator followed the project's new_worker_backend: a project whose
+        workers were on Claude made Claude reviewers, which no model is chosen for. Without a
+        number, that of the next ordinary worker."""
         if kind != "ordinary":
-            return self.config.assignment.backend(kind, number) or self.config.new_worker_backend
+            return "codex"
         if self._operator_worker_backend(c):
             return self._new_worker_backend(c)
         if number is None:

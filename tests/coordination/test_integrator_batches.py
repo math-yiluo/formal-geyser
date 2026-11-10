@@ -231,6 +231,47 @@ async def test_a_resumed_integrator_receives_the_next_batch_while_the_run_is_pau
     assert batch["worker_id"] == first["worker_id"] and len(batch["items"]) == 1
 
 
+def held_reviewer(c):
+    """A Claude reviewer's id: in no Codex group and not the Integrator's."""
+    return c.execute("INSERT INTO workers(id,kind,backend,created_at,work_intention,reviewer_number) "
+                     "VALUES('claude-reviewer','review','claude',0,'idle',99) RETURNING id").fetchone()[0]
+
+
+async def test_the_integrator_has_its_own_control_apart_from_codex_reviewers(batch_case):
+    hub, run, now = batch_case
+    await ready(hub, run, "Accepted contribution")
+    now[0] += BATCH_DELAY_MS
+    integrators = "SELECT count(*) FROM workers WHERE kind='integrator'"
+    # Paused before it exists: no batch starts and no Integrator is made; reviewers run on.
+    paused = await command(hub, "group.pause_after_turn", {"group": "integrator", "run_id": run["id"]})
+    assert paused["groups"]["integrator"] == {"control": "paused", "state": "paused", "pause_mode": "after_turn"}
+    assert paused["groups"]["codex.reviewers"]["state"] == "running"
+    assert await choose(hub, run) is None
+    assert await hub.db.call(lambda c: c.execute(integrators).fetchone()[0]) == 0
+    # All Codex no longer includes it: pausing Codex leaves a resumed Integrator its batch.
+    await command(hub, "group.resume", {"group": "integrator", "run_id": run["id"]})
+    held = await command(hub, "group.pause_after_turn", {"group": "codex", "run_id": run["id"]})
+    assert held["groups"]["integrator"]["state"] == "running"
+    first = await choose(hub, run)
+    assert first is not None and (await hub.worker(first["worker_id"]))["kind"] == "integrator"
+    # Paused again, the Integrator itself is paused with its group: it starts no further turn.
+    await command(hub, "group.pause_after_turn", {"group": "integrator", "run_id": run["id"]})
+    assert await hub.db.call(lambda c: hub._worker_control(c, run["id"], first["worker_id"])) == "paused"
+    assert await hub.db.call(lambda c: hub._worker_control(c, run["id"], held_reviewer(c))) is None
+
+
+async def test_the_integrator_group_resumed_under_pause_all_runs_its_batch(batch_case):
+    hub, run, now = batch_case
+    await ready(hub, run, "Accepted contribution")
+    now[0] += BATCH_DELAY_MS
+    await command(hub, "run.pause", {"run_id": run["id"]})
+    assert await hub.next_assignment(run["id"]) is None
+    await command(hub, "group.resume", {"group": "integrator", "run_id": run["id"]})
+    assignment = await hub.next_assignment(run["id"])
+    assert (await hub.worker(assignment["worker_id"]))["kind"] == "integrator"
+    assert (await hub.db.call(lambda c: hub._batch(c)))["worker_id"] == assignment["worker_id"]
+
+
 async def test_withdrawn_item_must_be_removed_before_batch_freeze(batch_case):
     hub, run, now = batch_case
     await ready(hub, run, "Withdrawable contribution")

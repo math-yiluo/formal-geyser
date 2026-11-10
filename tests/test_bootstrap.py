@@ -60,6 +60,25 @@ def test_import_in_place_keeps_pairs_and_excludes_runtime_and_build_configuratio
     assert (tmp_path / "Example/Base.lean").read_bytes() == original
 
 
+def test_import_keeps_the_license_and_notice_files_of_ported_code(tmp_path):
+    # The pilot's move left eight behind (licenses/NYLL/NOTICE, Langlands/LocalFactor/FML/LICENSE, ...).
+    source = source_tree(tmp_path / "source")
+    legal = ["licenses/NYLL/LICENSE", "licenses/NYLL/NOTICE", "Example/FML/LICENSE", "third_party/COPYING",
+             "licenses/Other/LICENSE-APACHE", "licenses/Other/NOTICE.txt", "licenses/Other/LICENCE.md"]
+    for path in legal:
+        write(source, path, "Licensed under the Apache License, Version 2.0.\n")
+    for path in ("data/results.json", "Example/notes.txt", "licenses/NYLL/logo.png", ".git/LICENSE"):
+        write(source, path, "not part of a Library\n")
+    hub = SimpleNamespace(root=tmp_path / "project", blobs=BlobStore(tmp_path / "state/blobs"))
+    files = {item["path"] for item in hub.blobs.get_json(bootstrap.capture_library(hub, source))["files"]}
+    assert set(legal) <= files
+    assert not files & {"data/results.json", "Example/notes.txt", "licenses/NYLL/logo.png", ".git/LICENSE"}
+    # Core transfer checks a new instance's Library against its bundle by the same rule.
+    from formal_geyser.coordination.core_transfer import _source
+    assert all(_source(path) for path in legal) and not any(
+        _source(path) for path in ("data/results.json", ".git/LICENSE", "lakefile.lean"))
+
+
 @pytest.mark.parametrize("failure", ["pair", "hole", "toolchain", "mathlib"])
 def test_import_rejects_incomplete_or_incompatible_sources(tmp_path, failure):
     source = source_tree(tmp_path / "source")

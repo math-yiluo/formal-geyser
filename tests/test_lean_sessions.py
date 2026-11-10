@@ -151,8 +151,7 @@ def test_a_suspended_job_suspends_the_session_it_borrows():
             self.sched = type("Sched", (), {"state": "suspended"})()
 
     job = Job()
-    runner = JobRunner.__new__(JobRunner)
-    runner.job = job
+    runner = JobRunner(None, job)  # It needs no service to borrow and give back.
     group = JobGroup()
     try:
         runner.borrow(group)

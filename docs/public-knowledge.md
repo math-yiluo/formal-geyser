@@ -28,7 +28,7 @@ Private notes remain in `.private/notes` and are not exported as public knowledg
    and add or update its entry in the README. Use relative Markdown links, such
    as `[Topic](../notes/topic.md) — What this page helps with.`
 2. Call `wiki_submit` with edited Markdown paths (including an edited README),
-   summary and actual coauthors. The source files are the content, not a manifest
+   summary and optional coauthors. The source files are the content, not a manifest
    body or a database text field. Mathematical Lean/Markdown pairs remain artifacts.
 3. An independent reviewer checks accuracy, citations, reading level and the entry.
    A note cannot establish mathematical acceptance or modify a Lean pair.

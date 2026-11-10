@@ -63,6 +63,9 @@ _LISTING_SCANS = tuple(threading.Lock() for _ in range(64))
 # Timestamps can be coarser than successive edits, so anything changed this recently
 # is always read again rather than trusted by its metadata.
 SETTLED_NANOSECONDS = 2_000_000_000
+# A just-written Library view of this many files waits for its metadata to settle before its
+# pointer moves, so it is read outside the content lock (NativeContentStore._settled_identity).
+SETTLE_WAIT_FILES = 512
 
 
 def settled(modified_ns: int) -> bool:
@@ -548,6 +551,7 @@ class NativeContentStore:
         self.tasks_root = self.project_root / TASK_DIRECTORY
         self._mutex = threading.RLock()
         self._view_lock = threading.Lock()  # One Library view is written at a time.
+        self._pointer_lock = threading.Lock()  # One Library pointer move at a time.
         # Verified task revisions and Library views, with the file identities seen when
         # they were verified.
         self._task_cache: dict[tuple[str, int, str], tuple[list[Path], tuple, dict[str, Any]]] = {}
@@ -692,6 +696,42 @@ class NativeContentStore:
             raise ContentError("Native content tree differs from its immutable manifest")
         verify_references(root, refs)
 
+    @staticmethod
+    def _verify_view(view: PinnedPublicView) -> None:
+        """Read every file of a Library view and its manifest against their hashes."""
+        NativeContentStore._verify_tree(view.root, view.files)
+        if _sha(_read(view.root.parent / "manifest.json")) != view.manifest_sha256:
+            raise ContentError("Pinned public manifest integrity failure")
+
+    @staticmethod
+    def _view_watch(view: NativeFileView) -> list[Path]:
+        """The paths whose identities show a Library view unchanged: manifest, folders, files."""
+        folders = {view.root, *((view.root / item.path).parent for item in view.files)}
+        folders.update(parent for folder in list(folders) for parent in folder.parents
+                       if parent.is_relative_to(view.root))
+        return [view.root.parent / "manifest.json", *sorted(folders),
+                *(view.root / item.path for item in view.files)]
+
+    @staticmethod
+    def _settled_identity(paths: Sequence[Path], files: int) -> tuple | None:
+        """The identity of `paths`. For a view of SETTLE_WAIT_FILES files or more it waits once
+        for just-written metadata to settle (off the coordination thread): reading that view
+        again under the content lock would cost far more. A smaller one is not waited for."""
+        identity = _file_identity(paths)
+        if identity is None and files >= SETTLE_WAIT_FILES:
+            time.sleep(SETTLED_NANOSECONDS / 1e9)
+            identity = _file_identity(paths)
+        return identity
+
+    def _remember_view(self, watched: list[Path], identity: tuple | None,
+                       view: PinnedPublicView) -> None:
+        if identity is None:
+            return
+        with self._mutex:
+            if len(self._views) >= 64:
+                self._views.clear()
+            self._views[view.commit] = (watched, identity, view)
+
     def public_view(self, repository: RepositoryStore, blobs: BlobStore, commit: str
                     ) -> PinnedPublicView:
         """Materialize a caller-authorized accepted commit without moving Lean modules.
@@ -701,7 +741,10 @@ class NativeContentStore:
         no lock is taken. Any change sends the read through full materialization again.
         A new view is written and flushed outside the content lock, which it takes only to
         rename the tree into place: in the Linux pilot writing one under the lock (100 s)
-        after each publication held up archive moves, task files and admission.
+        after each publication held up archive moves, task files and admission. A view that
+        is already in place is verified without the lock: on the pilot on 2026-11-10 reading
+        a 42,985-file view under it held up admission. Its identity is remembered once its
+        files' metadata has settled, so the pointer move that follows reads nothing again.
         """
         if not isinstance(commit, str) or not _COMMIT.fullmatch(commit):
             raise ContentError("An exact public Git commit is required")
@@ -724,20 +767,20 @@ class NativeContentStore:
             staged = self._stage_tree(_path(self.project_root, f"library/{commit}"), files,
                                       {"kind": "public", "commit": commit, "snapshot": snapshot},
                                       commit=commit, bulk=True)
-            with self._locked():
+            if staged.temporary is None:
+                # Already in place: an immutable view is read without the lock. The view at
+                # the repository head is the newest one, which pruning never removes.
+                pending = NativeFileView(staged.directory / "files", staged.refs, _sha(staged.manifest_body))
+                watched = self._view_watch(pending)
+                identity = _file_identity(watched)  # Taken first: a later change cannot be missed.
                 view = self._install_tree(staged)
+            else:
+                with self._locked():
+                    view = self._install_tree(staged)
+                watched = self._view_watch(view)
+                identity = self._settled_identity(watched, len(view.files))
             result = PinnedPublicView(view.root, view.files, view.manifest_sha256, commit, snapshot)
-            folders = {view.root, *((view.root / item.path).parent for item in view.files)}
-            folders.update(parent for folder in list(folders) for parent in folder.parents
-                           if parent.is_relative_to(view.root))
-            watched = [view.root.parent / "manifest.json", *sorted(folders),
-                       *(view.root / item.path for item in view.files)]
-            identity = _file_identity(watched)
-            if identity is not None:
-                with self._mutex:
-                    if len(self._views) >= 64:
-                        self._views.clear()
-                    self._views[commit] = (watched, identity, result)
+            self._remember_view(watched, identity, result)
             return result
 
     def prune_public_views(self, *, now: float | None = None) -> list[str]:
@@ -772,42 +815,82 @@ class NativeContentStore:
 
     def publish_current_view(self, view: PinnedPublicView,
                              *, expected_commit: str | None = None) -> Path:
-        """Update navigation only after accepted publication; this never updates Git."""
+        """Update navigation only after accepted publication; this never updates Git.
+
+        The view's files are read before the content lock is taken, and not at all when
+        `public_view` verified it and every file keeps its identity; under the lock only
+        that identity is checked. Pointer moves run one at a time, and a caller that waited
+        for another one moving the pointer to the same view returns without reading. On
+        the pilot on 2026-11-10 three callers each read the 42,985-file view (272 MB) in
+        turn under the content lock, and admission waited 279 s behind them.
+        """
         if expected_commit is not None and (
                 not isinstance(expected_commit, str) or not _COMMIT.fullmatch(expected_commit)):
             raise ContentError("An exact previous public commit is required")
-        with self._locked():
-            if view.root != _path(self.project_root, f"library/{view.commit}/files"):
-                raise ContentError("Current Library must reference an owned pinned view")
-            self._verify_tree(view.root, view.files)
-            if _sha(_read(view.root.parent / "manifest.json")) != view.manifest_sha256:
-                raise ContentError("Pinned public manifest integrity failure")
-            body = canonical({"schema_version": 1, "commit": view.commit,
-                              "root": f"{view.commit}/files",
-                              "manifest_sha256": view.manifest_sha256}).encode("utf-8")
-            target = _path(self.library_root, "current.json")
-            previous_sha = None
-            if _normal_path(target).exists():
-                previous_body = _read(target)
-                if previous_body == body:
-                    return target
-                if expected_commit is None:
-                    raise ContentConflict("Read the current Library commit before replacing it")
-                try:
-                    previous = json.loads(previous_body)
-                    if (set(previous) != {"schema_version", "commit", "root", "manifest_sha256"}
-                            or previous["schema_version"] != 1
-                            or previous["commit"] != expected_commit
-                            or previous["root"] != f"{expected_commit}/files"):
-                        raise ContentConflict("Current Library changed or has unknown content")
-                    _hash(previous["manifest_sha256"])
-                except (TypeError, KeyError, json.JSONDecodeError) as exc:
-                    raise ContentConflict("Invalid current Library navigation file") from exc
-                previous_sha = _sha(previous_body)
-            elif expected_commit is not None:
-                raise ContentConflict("Expected current Library navigation file is missing")
-            self._replace_file(self.library_root, "current.json", body, previous_sha)
-            return target
+        if view.root != _path(self.project_root, f"library/{view.commit}/files"):
+            raise ContentError("Current Library must reference an owned pinned view")
+        body = canonical({"schema_version": 1, "commit": view.commit,
+                          "root": f"{view.commit}/files",
+                          "manifest_sha256": view.manifest_sha256}).encode("utf-8")
+        target = _path(self.library_root, "current.json")
+        with self._pointer_lock:
+            if self._names_view(target, body):
+                return target
+            watched, identity = self._verified_view(view)
+            with self._locked():
+                if identity is None or _file_identity(watched) != identity:
+                    self._verify_view(view)  # Changed or unsettled since it was read: read it again.
+                return self._move_pointer(target, body, expected_commit)
+
+    @staticmethod
+    def _names_view(target: Path, body: bytes) -> bool:
+        """Whether the Library pointer already names this view (it is replaced atomically)."""
+        try:
+            return _normal_path(target).exists() and _read(target) == body
+        except (OSError, ContentError):
+            return False  # The locked move below reads it again and reports a fault.
+
+    def _verified_view(self, view: PinnedPublicView) -> tuple[list[Path], tuple | None]:
+        """The paths and identity of a view whose files are known to match it, reading them
+        unless `public_view` verified it and none changed since."""
+        cached = self._views.get(view.commit)
+        if cached is not None and (cached[2] is view or cached[2] == view):
+            identity = _file_identity(cached[0])
+            if identity is not None and identity == cached[1]:
+                return cached[0], identity
+        watched = self._view_watch(view)
+        # Taken before the read: a change after it cannot be missed.
+        identity = self._settled_identity(watched, len(view.files))
+        if identity is None:
+            return watched, None  # Just written and small: read once, under the lock.
+        self._verify_view(view)
+        self._remember_view(watched, identity, view)
+        return watched, identity
+
+    def _move_pointer(self, target: Path, body: bytes, expected_commit: str | None) -> Path:
+        """Replace the Library pointer under the content lock."""
+        previous_sha = None
+        if _normal_path(target).exists():
+            previous_body = _read(target)
+            if previous_body == body:
+                return target
+            if expected_commit is None:
+                raise ContentConflict("Read the current Library commit before replacing it")
+            try:
+                previous = json.loads(previous_body)
+                if (set(previous) != {"schema_version", "commit", "root", "manifest_sha256"}
+                        or previous["schema_version"] != 1
+                        or previous["commit"] != expected_commit
+                        or previous["root"] != f"{expected_commit}/files"):
+                    raise ContentConflict("Current Library changed or has unknown content")
+                _hash(previous["manifest_sha256"])
+            except (TypeError, KeyError, json.JSONDecodeError) as exc:
+                raise ContentConflict("Invalid current Library navigation file") from exc
+            previous_sha = _sha(previous_body)
+        elif expected_commit is not None:
+            raise ContentConflict("Expected current Library navigation file is missing")
+        self._replace_file(self.library_root, "current.json", body, previous_sha)
+        return target
 
     def task_files(self, task_id: str, revision: int, contract: Mapping[str, Any]) -> TaskFileView:
         """Install immutable authoritative task files before recording their DB references."""

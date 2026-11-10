@@ -196,6 +196,12 @@ class LeanServiceConfig(StrictModel):
     # stopped and queued again, and they started over first: no check ended for 12 minutes. Of
     # 11,500 checks there that ended, the largest held 13.9 GB in all, all but three less than 9.
     process_memory_gib: float = Field(default=12, ge=0, allow_inf_nan=False)
+    # The most memory the Lean service and every process it starts may hold together, which the
+    # kernel enforces on its scope (MemoryMax): past it the kernel reclaims and then ends one of
+    # the service's own processes, never TaskHub's. Absent: 60% of the machine's memory; 0: no
+    # bound. On the pilot on 2026-11-09 the memory ran out with Lean, TaskHub and the workers'
+    # processes all scored alike, and the kernel ended TaskHub, and with it every worker.
+    service_memory_gib: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     # How long a submission waits for its validation before the validation continues in the
     # background and its result arrives as a notification.
     validation_wait_seconds: float = Field(default=90, ge=0, allow_inf_nan=False)
@@ -243,18 +249,27 @@ class AssignmentConfig(StrictModel):
     """The backend and rotation mode each new agent gets, by role. A list applies by worker
     number and repeats: Worker 0 takes its first entry, Worker 1 the next. What this leaves
     open follows the operator's backend choice and the project's rotation mode; the operator
-    can still change an agent's mode later."""
+    can still change an agent's mode later. Reviewers and the Integrator run on Codex, whatever
+    backend workers use: their models are chosen for Codex only (session_settings), so
+    reviewer_backend and integrator_backend, kept for older project files, may only say so."""
     worker_backends: list[Backend] = Field(default_factory=list, max_length=64)
     worker_rotation: list[RotationMode] = Field(default_factory=list, max_length=64)
     reviewer_backend: Backend | None = None
     reviewer_rotation: RotationMode | None = None
     integrator_backend: Backend | None = None
 
+    @field_validator("reviewer_backend", "integrator_backend")
+    @classmethod
+    def codex_roles(cls, value: Backend | None) -> Backend | None:
+        if value not in (None, "codex"):
+            raise ValueError("Reviewers and the Integrator run on Codex; leave this out or set it to \"codex\"")
+        return value
+
     def backend(self, kind: str, number: int | None) -> Backend | None:
         if kind == "ordinary":
             return self.worker_backends[number % len(self.worker_backends)] if (
                 self.worker_backends and number is not None) else None
-        return {"review": self.reviewer_backend, "integrator": self.integrator_backend}.get(kind)
+        return None
 
     def rotation(self, kind: str, number: int | None) -> RotationMode | None:
         if kind == "review":

@@ -21,9 +21,12 @@ from .errors import HubError
 from .models import Actor, Command, Role, StrictModel, TaskContract
 from .plugins import load_plugin
 from .storage import canonical, digest
+from .text_bounds import shorten
 
 SETUP_COMMAND = "project.setup"
 SETUP_PRINCIPAL = "operator:operator"
+# Task 0's title is the goal's first line, shortened at a word boundary to this many characters.
+ROOT_TITLE_CHARACTERS = 200
 
 
 class SetupStart(StrictModel):
@@ -144,7 +147,10 @@ def validate_selection(catalog: dict, request: SetupStart) -> None:
 
 
 def _contract(hub, request: SetupStart) -> TaskContract:
-    title = "Task 0: " + next(line.strip() for line in request.goal.splitlines() if line.strip())[:120]
+    # The goal's first line, whole when it fits. Until 2026-11-08 this was "Task 0: " and its
+    # first 120 characters, cut mid-word (the pilot's read "... following Henniar"); the task's
+    # name, Task 0, now comes from its number and is shown beside its title.
+    title = shorten(next(line.strip() for line in request.goal.splitlines() if line.strip()), ROOT_TITLE_CHARACTERS)
     result = TaskContract(title=title, objective=request.goal, domain=hub.config.domain,
                           acceptance_policy="lean.peer@1" if hub.config.domain == "lean" else "general.peer@1")
     load_plugin(hub.config.domain).validate_contract(result)

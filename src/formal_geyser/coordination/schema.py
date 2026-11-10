@@ -227,7 +227,7 @@ CREATE TABLE IF NOT EXISTS worker_controls(
  control TEXT NOT NULL CHECK(control IN ('paused','resumed')),created_at INTEGER NOT NULL,
  after_turn INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS group_controls(
- scope TEXT PRIMARY KEY CHECK(scope IN ('codex','codex.workers','codex.reviewers','claude')),
+ scope TEXT PRIMARY KEY CHECK(scope IN ('codex','codex.workers','codex.reviewers','claude','integrator')),
  run_id TEXT NOT NULL REFERENCES runs(id),
  control TEXT NOT NULL CHECK(control IN ('paused','resumed')),created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS native_task_files(

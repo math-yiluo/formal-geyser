@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -37,6 +38,16 @@ _EXCLUDED_DIRECTORIES = frozenset({
 })
 _BUILD_FILES = frozenset({"lakefile.lean", "lakefile.md"})
 _LOCK_NAME = "lean-environment.lock.json"
+# The license, notice and copying files of code ported from other projects, which their licenses
+# require to travel with it (LICENSE, NOTICE, COPYING, LICENCE-MIT, NOTICE.txt, ...). Until
+# 2026-11-08 an initial Library kept only .lean and .md: the pilot's move to the Mac left eight behind.
+_LEGAL_FILE = re.compile(r"(?:licen[cs]e|notice|copying)(?:[-_.][a-z0-9._-]*)?", re.IGNORECASE)
+
+
+def library_source(name: str) -> bool:
+    """Whether a file of this name is part of an initial Library: Lean and Markdown sources, and
+    the license and notice files that travel with ported code."""
+    return name.lower().endswith((".lean", ".md")) or bool(_LEGAL_FILE.fullmatch(name))
 
 
 def initialization_path(root: Path) -> Path:
@@ -75,7 +86,8 @@ def _seed_versions(directory: Path) -> None:
 
 
 def capture_library(hub, directory: Path | None) -> str:
-    """Import source pairs and Markdown, never another project's state or caches.
+    """Import source pairs and Markdown, and the license and notice files that travel with ported
+    code (library_source), never another project's state or caches.
 
     The existing module layout is retained. Lake configuration is replaced by
     the fixed environment metadata; compilation uses registered shared roots.
@@ -95,7 +107,7 @@ def capture_library(hub, directory: Path | None) -> str:
                 if child.is_symlink():
                     raise ValueError(f"Library import does not follow linked directories: {child}")
             for name in sorted(names):
-                if not name.lower().endswith((".lean", ".md")):
+                if not library_source(name):
                     continue
                 path = Path(base) / name
                 relative = path.relative_to(root).as_posix()

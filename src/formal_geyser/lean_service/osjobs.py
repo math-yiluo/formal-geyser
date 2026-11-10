@@ -35,11 +35,23 @@ def process_memory(pid: int) -> int:
 
 
 class JobGroup:
-    """All processes of one service job."""
+    """All processes of one service job.
 
-    def __init__(self) -> None:
+    Its processes are the first the kernel ends when memory runs out (`oom_score_adj`): on
+    the pilot on 2026-11-09 the machine's memory ran out while every process had the same score,
+    and the kernel ended TaskHub, the largest, and with it every worker. `memory_max` and
+    `swap_max` bound what the job's processes may hold together (cgroups.limit_memory)."""
+
+    oom_score_adj = 1000
+
+    def __init__(self, *, memory_max: int | None = None, swap_max: int | None = None) -> None:
         self.path = cgroups.root() / ("job-" + uuid4().hex)
         self.path.mkdir()
+        try:
+            cgroups.limit_memory(self.path, memory_max, swap_max)
+        except BaseException:
+            cgroups.remove(self.path)
+            raise
         self.suspended = False
         self._peak_private = 0
 
@@ -64,6 +76,10 @@ class JobGroup:
     def largest_process(self) -> int:
         """The private memory, resident or swapped out, of the group's largest process."""
         return max((process_memory(pid) for pid in self.pids()), default=0)
+
+    def oom_kills(self) -> int:
+        """How many of the group's processes the kernel has ended for want of memory."""
+        return cgroups.oom_kills(self.path)
 
     def usage(self) -> Usage:
         cpu, private, swapped, peak = cgroups.usage(self.path)
